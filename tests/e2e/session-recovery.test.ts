@@ -130,8 +130,6 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     const sessionDir = join(fixture.home, ".fx", "sessions", id);
     const cachePath = join(sessionDir, "history-cache.bin");
 
-    // Fresh sessions keep the minimal footprint; the first writable resume
-    // builds the cache.
     expect(existsSync(cachePath)).toBe(false);
 
     const continued = await continueSession(fixture, gateway, id);
@@ -143,8 +141,6 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     const baselineSize = statSync(cachePath).size;
     expect(baselineSize).toBeGreaterThan(0);
 
-    // Corrupt one cache payload byte: the next resume must stay correct via
-    // the log fallback (prefix CRC rejection or full rebuild).
     const bytes = readFileSync(cachePath);
     bytes[bytes.byteLength - 4] = bytes[bytes.byteLength - 4]! ^ 0xff;
     writeFileSync(cachePath, bytes, { mode: 0o600 });
@@ -155,7 +151,6 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     expect(gateway.requests[2]!.body).toContain("CACHE_CONTINUED_TURN");
     expect(existsSync(cachePath)).toBe(true);
 
-    // A deleted cache is rebuilt by the next writable resume.
     rmSync(cachePath);
     const rebuilt = await continueSession(fixture, gateway, id);
     expect(rebuilt.code).toBe(0);
@@ -272,7 +267,6 @@ const LEGACY_GATEWAY_OPTIONS = {
   }],
 };
 
-// Entirely synthetic schema-v3 data: no copied sessions, credentials, or child markers.
 function createLegacySession(fixture: ReturnType<typeof createFixture>, version: 2 | 3 | 4) {
   const id = `synthetic-legacy-v${version}`;
   const source = join(fixture.home, ".fx", "sessions", id);
@@ -392,7 +386,6 @@ function expectLegacyArchive(source: string) {
   const results = records.filter((record) => record.event.tool_result?.call_id === LEGACY_TOOL_CALL_ID);
   expect(results).toHaveLength(1);
   const result = results[0].event.tool_result;
-  // Imported inline output has exact retained bytes, but legacy completeness is not trusted.
   expect(result).toMatchObject({
     tool_name: "read_file", status: "success", completeness: "partial",
     output_bytes: Buffer.byteLength(LEGACY_TOOL_EVIDENCE),
@@ -876,8 +869,6 @@ describe("session recovery", () => {
         });
         await tui.waitForComposer(TIMEOUT);
         await tui.waitForText("LATEST_CACHE_HISTORY", TIMEOUT);
-        // The first latest resume classifies every session; once the picker
-        // has saved the index, the untouched legacy row is reused unopened.
         expect(readFileSync(trace, "utf8")).toMatch(iteration === 0
           ? /session catalog cache reused=0 records=\d+/
           : /session catalog cache reused=[1-9]\d* records=\d+/);
@@ -973,7 +964,6 @@ describe("session recovery", () => {
           await tui.waitForText(LEGACY_PARTIAL, TIMEOUT);
           await tui.waitForComposer(TIMEOUT);
           if (blankSessionDir && expectedSessionIds.includes(basename(blankSessionDir))) {
-            // Switching away from the untouched startup session removes it.
             expectedSessionIds.splice(expectedSessionIds.indexOf(basename(blankSessionDir)), 1);
             await tui.waitForPane(() => !existsSync(blankSessionDir!), TIMEOUT);
             expect(sessionEntries()).toEqual(expectedSessionIds);
@@ -985,7 +975,6 @@ describe("session recovery", () => {
           expect(gateway.requests).toHaveLength(Math.max(0, index - 1));
           expect(gateway.classifierRequests).toHaveLength(0);
 
-          // First close without a prompt; reopening must not resurrect recovery work.
           if (index > 0) {
             const reply = index === 1 ? "LEGACY_CONTINUE_SAVED" : "LEGACY_EXACT_REOPEN_SAVED";
             await tui.sendText(`Continue the migrated conversation after reopen ${index}.`);
@@ -1089,7 +1078,6 @@ describe("session recovery", () => {
         };
         const appended = JSON.stringify(event) + "\n";
         appendFileSync(eventsPath, appended);
-        // Leave the derived manifest stale; the committed watermark owns the replay boundary.
         writeFileSync(legacy.watermarkPath, JSON.stringify({
           ...watermark, through_seq: event.seq, through_event_id: event.event_id,
           through_event_log_bytes: Buffer.byteLength(events + appended),
@@ -1169,8 +1157,6 @@ describe("session recovery", () => {
         expect(result.killSent).toBe(false);
         expect(result.code).toBe(1);
         expect(result.elapsedMs).toBeLessThan(5_000);
-        // The unreadable session is skipped exactly as every listing skips it,
-        // and the error says unreadable sessions exist, as `fx session last` does.
         expect(result.stdout + result.stderr).toContain("NoReadableSessions");
         expect(gateway.requests).toHaveLength(fenced ? 0 : 1);
         expect(gateway.classifierRequests).toHaveLength(0);
@@ -1179,11 +1165,9 @@ describe("session recovery", () => {
         expect(fifoAfter.isFIFO()).toBe(true);
         expect([fifoAfter.ino, fifoAfter.size, fifoAfter.mtimeMs, fifoAfter.ctimeMs])
           .toEqual([fifoBefore.ino, fifoBefore.size, fifoBefore.mtimeMs, fifoBefore.ctimeMs]);
-        // Never hash/read the FIFO: retain the regular-file and directory evidence separately.
         for (const [path, digest] of Object.entries(before)) {
           expect(createHash("sha256").update(readFileSync(join(source, path))).digest("hex")).toBe(digest);
         }
-        // Only the derived session index may appear beside the untouched session.
         expect(readdirSync(join(fixture.home, ".fx", "sessions")).filter((name) => name !== ".resume-catalog"))
           .toEqual([id]);
       } finally {
@@ -1234,7 +1218,6 @@ describe("session recovery", () => {
         .sort();
       expect(files).toEqual([
         "events.jsonl",
-        // Replay cache built by the writable resume; derived from events.jsonl.
         "history-cache.bin",
         "permissions.json",
         "session.json",

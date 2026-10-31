@@ -440,7 +440,6 @@ test "attachPath keeps image ids stable across turns" {
     try std.testing.expectEqualStrings("[Image #1][Image #2]", app.input_runtime.edit_state.input.items);
     try expectBadgeProjection(alloc, &app, "[Image 1][Image 2]");
 
-    // Submitting the turn releases the draft; the session id counter survives it.
     app.clearPendingImages();
     app.input_runtime.edit_state.input.clearRetainingCapacity();
     app.input_runtime.edit_state.cursor = 0;

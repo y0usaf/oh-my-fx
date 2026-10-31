@@ -1,8 +1,3 @@
-// U03 stdio connection, step 6: the real I/O layer (src/mcp/io/process.zig),
-// run by tests/tla/drivers/mcp/labs/stdio_lab.zig against the scripted fake server, must
-// produce stdio traces that TLC accepts as behaviors of spec/StdioConn.tla.
-// The planted case is a known-bad control: the lab allows three failures
-// while the model is told two, so TLC must reject the trace.
 
 import { expectFinal, labScenario, type LabCase, messages, PING, PING2 } from "../lab";
 import type { Scenario } from "../scenario";

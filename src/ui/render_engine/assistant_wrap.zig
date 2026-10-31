@@ -126,7 +126,6 @@ fn wrapAssistantTextWithBaseGutter(
         if (ch == 0x1b) {
             const end = display_width.ansiSequenceEnd(text, i);
             if (end <= i) {
-                // Preserve an incomplete trailing escape without stalling the loop.
                 try out.appendSlice(alloc, text[i..]);
                 break;
             }
@@ -928,7 +927,6 @@ fn proseIndent(text: []const u8, line_start: usize) ?usize {
                 i += 1;
             },
             0x1b => {
-                // Bound control parsing to this logical line, including incomplete tails.
                 if (line_end == null) {
                     var end = i;
                     while (end < text.len and text[end] != '\r' and text[end] != '\n') : (end += 1) {}
@@ -1118,8 +1116,6 @@ fn dimTaskMarkerWidth(text: []const u8, start: usize) ?usize {
 
 fn taskMarkerWidth(text: []const u8, start: usize) ?usize {
     const dim_open = "\x1b[2m";
-    // Recognize both builtin variants plus whatever the active theme set, so
-    // completed markers keep measuring correctly under custom themes.
     const completed_opens = [_][]const u8{ "\x1b[38;5;252m", "\x1b[38;5;238m", shared_theme.current().task_completed_open };
     const completed_close = "\x1b[39m";
     const completed = "\xe2\x9c\x93";
@@ -1773,8 +1769,6 @@ test "a link opening a guttered row keeps its theme color" {
     defer alloc.free(input);
     const out = try wrapAssistantTextWithBaseGutter(alloc, input, 40, 2, false, false, null, null, null);
     defer alloc.free(out);
-    // Pre-content escapes are not copied verbatim into a guttered row; the
-    // row-start restore must re-emit the link color with the underline.
     try std.testing.expect(std.mem.find(u8, out, link_style) != null);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[4m") != null);
     try std.testing.expect(std.mem.find(u8, out, "docs") != null);

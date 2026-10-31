@@ -339,9 +339,6 @@ pub const CanonicalOutput = struct {
             .output = self,
             .stream = stream,
         };
-        // Reserve source ownership before decoding. A callback may contain
-        // only a partial UTF-8/escape sequence, but a later callback on the
-        // other stream must not overtake its eventual visible record.
         if (raw.len > 0) try sink.beginRecord();
         try self.decoders[streamIndex(stream)].append(raw, &sink);
     }

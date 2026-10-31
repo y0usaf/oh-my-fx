@@ -54,7 +54,6 @@ pub const ToolFallbackDisposition = enum {
 
 pub const ToolDetailRecord = struct {
     entry_id: u32,
-    // Recorded identities are archival and cannot pin live output.
     origin: enum { live, recorded } = .live,
     created_at_ms: i64 = 0,
     tool_name: []u8,
@@ -75,8 +74,6 @@ pub const ToolDetailRecord = struct {
     command_output_entry_id: ?u32 = null,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
-        // Hand-built details and restored records may predate the explicit
-        // classifier. Preserve their historical presentation contract.
         return self.captured_command or std.mem.eql(u8, self.tool_name, "run_command");
     }
 
@@ -339,8 +336,6 @@ pub const TranscriptEntry = union(enum) {
         tone: types.NoticeTone,
         body: []const u8,
         visibility: types.NoticeVisibility,
-        // The producer will replace this entry in place; its bytes are not
-        // final and must not be released into terminal history.
         pending_replacement: bool = false,
     };
 
@@ -1067,13 +1062,8 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
         floor_total += @min(measure.natural, table_min_column_width);
     }
     if (natural_total <= available) return true;
-    // This is the only reason to stack. A column settles below only while its
-    // natural width fits an even share, so the open floors always fit.
     if (floor_total > available) return false;
 
-    // Settle every column that fits on one line within an even share of what
-    // remains. A settled column takes no more than that share, so the share
-    // only grows for the columns still open.
     @memset(widths, table_column_open);
     var settled_total: usize = 0;
     var open_count = measures.len;
@@ -1096,8 +1086,6 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
     }
     const break_words = word_total > available;
 
-    // Find the largest shared scale that fits. At `high` every open column
-    // reaches its target, which overflows `available`, so the answer is lower.
     var low: u64 = 0;
     var high: u64 = (@as(u64, available) + 1) << table_scale_bits;
     while (high - low > 1) {
@@ -1114,8 +1102,6 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
         width.* = scaledColumnWidth(measure, break_words, low);
         assigned += width.*;
     }
-    // Settled columns already sit at or above their span target, and the open
-    // targets sum above `available`, so every pass finds room.
     while (assigned < available) {
         for (measures, widths) |measure, *width| {
             if (assigned == available) break;
@@ -1523,9 +1509,6 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
     while (firstCodeGlyph(remaining)) |glyph| {
         var text = tableCellCut(remaining, width);
         if (!hasTableCellText(text)) {
-            // A leading space is a break like any other, not a line of its own.
-            // Skipping from the space itself always consumes input, even when
-            // zero-width units precede it.
             if (remaining[glyph.start] == ' ') {
                 _ = trackTableCellEscapes(remaining[0..glyph.start], &style, &hyperlink);
                 const next = skipTableCellBreak(remaining[glyph.start..], &style, &hyperlink);
@@ -1839,7 +1822,6 @@ pub fn renderSemanticNotice(
     defer logical.deinit(alloc);
     try logical.appendSlice(alloc, types.noticeGlyph(notice.tone));
     try logical.append(alloc, ' ');
-    // An empty topic drops the "topic:" label and renders the body alone.
     if (notice.topic.len > 0) {
         try logical.appendSlice(alloc, notice.topic);
         try logical.append(alloc, ':');
@@ -3174,8 +3156,6 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
         try grid.rowTextTrimmed(1, &row);
         try std.testing.expectEqualStrings(case.row_text, row.items);
 
-        // The glyph and lowercase topic carry the tone color; the body is grey.
-        // Columns are 1-based: glyph, space, topic cells, then the colon.
         const colon_col: u16 = @intCast(3 + case.topic.len);
         const fg_index = struct {
             fn get(cell: vt_emulator.Cell) u8 {
@@ -3912,8 +3892,6 @@ test "full tool status drops a continuation prefix that leaves no room" {
 
 test "full tool status reopens a bounded style on every continuation row" {
     const alloc = std.testing.allocator;
-    // A long highlighted command: replaying every earlier sequence on each
-    // row would grow quadratically with its length.
     const source = "├ Ran " ++ text_utils.repeat("\x1b[38;5;250m'quoted token'\x1b[39m ", 400);
     const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
     defer alloc.free(out);
@@ -4860,7 +4838,6 @@ test "renderTableForTranscript wraps long cells inside the grid instead of stack
     try std.testing.expect(std.mem.startsWith(u8, out, "┌───┬"));
     try std.testing.expect(std.mem.find(u8, out, "Choice: ") == null);
     try std.testing.expect(std.mem.find(u8, out, "#: ") == null);
-    // Borders, header, and two rows need seven lines; wrapped cells add more.
     try std.testing.expect(try expectGridLines(out, cols) > 7);
     try std.testing.expect(std.mem.find(u8, out, "\n│ 1 │ ") != null);
     try std.testing.expect(std.mem.find(u8, out, "\n│   │ ") != null);
@@ -4925,7 +4902,6 @@ test "wrapTableCell breaks at the column edge and never emits a blank line" {
     try std.testing.expectEqualStrings("header that", lines.items[1].text);
     try std.testing.expectEqualStrings("wraps", lines.items[2].text);
 
-    // A code span ending in a space breaks after its last word.
     const cell = try alloc.print("{s}foo \x1b[39m bar", .{shared_theme.current().inline_code_open});
     defer alloc.free(cell);
     try wrapTableCell(alloc, cell, 3, &lines);
@@ -4934,8 +4910,6 @@ test "wrapTableCell breaks at the column edge and never emits a blank line" {
     try std.testing.expectEqualStrings("bar", lines.items[1].text);
     try std.testing.expect(!lines.items[1].style.isActive());
 
-    // A code span that starts with spaces drops them at the first break and
-    // keeps its style on every line.
     const leading = try alloc.print("{s}  configuration\x1b[39m", .{shared_theme.current().inline_code_open});
     defer alloc.free(leading);
     try wrapTableCell(alloc, leading, 7, &lines);
@@ -4994,15 +4968,12 @@ test "fitTableColumnWidths keeps short columns whole and gives longer text more 
     try std.testing.expect(fitTableColumnWidths(&wide, 70, &widths));
     try std.testing.expectEqualSlices(usize, &.{ 1, 20, 30 }, &widths);
 
-    // Proportional shares are 31 and 58 of the 89 open cells.
     try std.testing.expect(fitTableColumnWidths(&measures, 100, &widths));
     try std.testing.expectEqualSlices(usize, &.{ 1, 31, 58 }, &widths);
 
-    // The proportional share of the second column is below its longest word.
     try std.testing.expect(fitTableColumnWidths(&measures, 60, &widths));
     try std.testing.expectEqualSlices(usize, &.{ 1, 24, 25 }, &widths);
 
-    // Whole words no longer fit, so both wrapped columns break words.
     try std.testing.expect(fitTableColumnWidths(&measures, 30, &widths));
     try std.testing.expectEqualSlices(usize, &.{ 1, 6, 13 }, &widths);
 
@@ -5016,7 +4987,6 @@ test "renderTableForTranscript keeps a grid at every width that fits minimum col
     var table = try assistant_presentation.parseTablePayload(alloc, decision_table_source);
     defer table.deinit(alloc);
 
-    // Borders take ten cells; "#" needs one and each wrapped column three.
     for (3..121) |width| {
         const cols: u16 = @intCast(width);
         const out = try renderTableForTranscript(alloc, table, cols);

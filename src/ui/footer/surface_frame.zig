@@ -395,8 +395,6 @@ fn buildFooterSurfaceProjection(
     };
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
-    // The provider flow's inline API-key field is rendered in the composer column,
-    // not as the legacy auth panel.
     const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
     const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
@@ -1879,7 +1877,6 @@ test "surface footer measurement reserves capped picker rows for active list pic
     var file_ctx = surfaceTestContext(&file_input);
     file_ctx.file_query_active = true;
     file_ctx.file_completions = &.{.{ .path = "src/main.zig", .kind = .file, .matched_spans = &.{} }};
-    // The file picker grows to ten rows on a 24-row terminal.
     const file_rows: u16 = 10;
     try expectMeasuredPickerRows(alloc, &file_shell, approval.projection(), file_ctx, .file, file_rows);
 

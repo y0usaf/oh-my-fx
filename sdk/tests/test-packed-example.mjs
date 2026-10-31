@@ -107,8 +107,6 @@ if (process.argv[2] !== "--installed") {
     assert.ok((await agent.checkpoint()).length > 48);
     await agent.close();
 
-    // A durable agent from the package: the local World it bundles keeps the
-    // session in files, then memory() opts out.
     const sessionsDir = await mkdtemp(resolve(tmpdir(), "libfx-packed-sessions-"));
     process.env.FX_SESSIONS_DIR = sessionsDir;
     try {

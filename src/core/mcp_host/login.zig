@@ -74,13 +74,11 @@ fn answer(stream: std.Io.net.Stream, io: std.Io, alloc: Allocator, port: u16, br
     var parts = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, first, "\r\n"), ' ');
     const method_view = parts.next() orelse return null;
     const target_view = parts.next() orelse return null;
-    // Both are copied: the reads below reuse `in`.
     var line: [max_head_bytes]u8 = undefined;
     const method = line[0..method_view.len];
     @memcpy(method, method_view);
     const target = line[method.len..][0..target_view.len];
     @memcpy(target, target_view);
-    // The rest of the head is read first, so closing doesn't reset the connection.
     var head: Head = .{};
     while (true) {
         const header = std.mem.trimEnd(u8, reader.interface.takeDelimiterInclusive('\n') catch return null, "\r\n");
@@ -92,8 +90,6 @@ fn answer(stream: std.Io.net.Stream, io: std.Io, alloc: Allocator, port: u16, br
     const path = target[0 .. query_at orelse target.len];
     const query = if (query_at) |q| target[q + 1 ..] else "";
     const ours = std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/callback");
-    // The same page fx's other sign-ins show. A refusal comes back with an
-    // `error` (RFC 6749 §4.1.2.1); MCP-v2 reads the rest from the address.
     const outcome: browser_callback.Response = if (!ours) .unrelated else if (hasParam(query, "error")) .failed else .ok;
     browser_callback.writeResponse(stream, outcome, null) catch {};
     if (!ours) return null;

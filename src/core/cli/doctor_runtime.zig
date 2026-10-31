@@ -92,7 +92,6 @@ pub fn collect(
     }
 
     var detailed = config_runtime.loadMergedSettingsDetailed(alloc, snapshot.workspace_root) catch |err| {
-        // Settings are unreadable, so no remembered choice is available to honour.
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
@@ -227,7 +226,6 @@ fn appendResolvedStartupCheck(
     if (snapshot.owned_model) |model| alloc.free(model);
     snapshot.owned_model = null;
     const selected = selection catch |err| {
-        // Startup refuses this provider, so no model would run.
         snapshot.model = "";
         try appendCheck(checks, alloc, "startup", .fail, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
         return;

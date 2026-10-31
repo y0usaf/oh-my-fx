@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// `libfx/grok` against a fake xAI: device code sign-in, the paste-the-address
-// sign-in and refresh, with the error each mistake produces. No network.
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import {
@@ -54,7 +52,6 @@ const rejectsWith = (promise, code) => assert.rejects(promise, (error) => {
 });
 const formOf = (entry) => Object.fromEntries(new URLSearchParams(entry.body));
 
-// startSignIn: the CLI's own authorize request, with an S256 challenge of the secret verifier.
 const signIn = await startSignIn();
 {
   const url = new URL(signIn.url);
@@ -74,7 +71,6 @@ const signIn = await startSignIn();
   assert.notEqual((await startSignIn()).verifier, signIn.verifier, "every sign-in has its own secret");
 }
 
-// finishSignIn: every paste style yields the account's credentials.
 for (const pasted of [
   `${signIn.redirectUri}?code=auth-code&state=${signIn.state}`,
   `code=auth-code&state=${signIn.state}`,
@@ -93,7 +89,6 @@ for (const pasted of [
   assert.equal(userinfo.headers.get("authorization"), "Bearer at-authorization_code");
 }
 
-// finishSignIn: each mistake has its own error.
 await rejectsWith(finishSignIn(signIn, `code=auth-code&state=other`, { fetch: xai().fetch }), "LIBFX_GROK_SIGN_IN_STATE_MISMATCH");
 await rejectsWith(finishSignIn(signIn, "localhost", { fetch: xai().fetch }), "LIBFX_GROK_SIGN_IN_INVALID_ADDRESS");
 await rejectsWith(finishSignIn(signIn, `${signIn.redirectUri}?error=access_denied&state=${signIn.state}`, { fetch: xai().fetch }), "LIBFX_GROK_SIGN_IN_DENIED");
@@ -102,7 +97,6 @@ await rejectsWith(finishSignIn(signIn, `code=c&state=${signIn.state}`, { fetch: 
 await rejectsWith(finishSignIn(signIn, `code=c&state=${signIn.state}`, { fetch: xai({ userinfoStatus: 401 }).fetch }), "LIBFX_GROK_ACCOUNT_UNAVAILABLE");
 await assert.rejects(finishSignIn({ url: signIn.url }, `code=c&state=${signIn.state}`), TypeError);
 
-// Device code: start, pending, slow down, then signed in.
 {
   const server = xai({ pollAnswers: ["authorization_pending", "slow_down", 200] });
   const device = await startDeviceSignIn({ fetch: server.fetch });
@@ -139,7 +133,6 @@ await rejectsWith(pollDeviceSignIn(await startDeviceSignIn({ fetch: xai().fetch 
 await rejectsWith(pollDeviceSignIn({ ...(await startDeviceSignIn({ fetch: xai().fetch })), expiresAt: Date.now() - 1 }, { fetch: xai().fetch }), "LIBFX_GROK_DEVICE_CODE_EXPIRED");
 await rejectsWith(startDeviceSignIn({ fetch: async () => new Response("no", { status: 403 }) }), "LIBFX_GROK_DEVICE_CODE_UNAVAILABLE");
 
-// Refresh: form request, rotation kept, and the account must not change.
 {
   const server = xai();
   const next = await refreshCredentials({ accessToken: "at-old", refreshToken: "rt-1", accountId }, { fetch: server.fetch });
@@ -151,7 +144,6 @@ await rejectsWith(startDeviceSignIn({ fetch: async () => new Response("no", { st
 await rejectsWith(refreshCredentials({ accessToken: "at-old", refreshToken: "rt-1", accountId }, { fetch: xai({ account: "someone-else" }).fetch }), "LIBFX_GROK_ACCOUNT_CHANGED");
 await rejectsWith(refreshCredentials({ accessToken: "at-old", refreshToken: "rt-1", accountId }, { fetch: xai({ tokenStatus: 400 }).fetch }), "LIBFX_GROK_REFRESH_FAILED");
 
-// Credentials: an opaque token needs an accountId; a JWT's `sub` supplies one.
 assert.throws(() => normalizeGrokCredentials({ accessToken: "opaque" }), /Grok credentials need an accountId/);
 {
   const part = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");

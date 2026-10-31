@@ -310,9 +310,7 @@ pub const Runtime = struct {
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
         }, r.resolved.engine);
         errdefer r.engine.deinit();
-        // The engine has its own copies now.
         for (r.resolved.engine) |c| if (c.auth.saved) |s| std.crypto.secureZero(u8, @constCast(s));
-        // The rest may point into `configs`, which the caller may free now.
         r.resolved.engine = &.{};
         try r.publish();
         r.thread = try std.Thread.spawn(.{}, run, .{r});
@@ -325,7 +323,6 @@ pub const Runtime = struct {
         r.mutex.unlock(r.io);
         r.engine.wake();
         if (r.thread) |t| t.join();
-        // The owner ended every request; let their callers leave first.
         while (r.active.load(.acquire) != 0) std.Io.sleep(r.io, .fromMilliseconds(1), .awake) catch {};
         r.queue.deinit(r.gpa);
         r.calls.deinit(r.gpa);
@@ -469,7 +466,6 @@ pub const Runtime = struct {
             if (req.asker) |asker| r.askWaiting(req, asker);
             if (!cancel_tried) if (cancel) |flag| if (flag.load(.acquire)) {
                 cancel_tried = true;
-                // When stopping, the owner ends the request itself.
                 cancel_sent = if (r.post(&cancel_req)) |_| true else |_| false;
             };
         }
@@ -510,8 +506,6 @@ pub const Runtime = struct {
         try r.queue.append(r.gpa, req);
         r.engine.wake();
     }
-
-    // ---- the owner thread ----
 
     fn run(r: *Runtime) void {
         while (true) {
@@ -584,7 +578,6 @@ pub const Runtime = struct {
             .call => |c| {
                 const i = r.serverIndex(c.server) orelse return r.finish(req, .{ .call = .unknown_server });
                 if (r.resolved.servers[i].held != null) return r.finish(req, .{ .failed = error.Held });
-                // Room first: a call the engine took must have its waiter.
                 try r.calls.ensureUnusedCapacity(r.gpa, 1);
                 const handle_ = try r.engine.call(r.resolved.servers[i].name, c.tool, c.arguments);
                 if (req.observation) |call_| call_.engineRequest(handle_);
@@ -596,13 +589,11 @@ pub const Runtime = struct {
                     try r.engine.cancel(entry.key_ptr.*);
                     break;
                 };
-                // A tools waiter just stops waiting; the list still arrives.
                 for (r.tool_waiters.items, 0..) |w, k| if (w.request == target) {
                     _ = r.tool_waiters.swapRemove(k);
                     r.finish(target, .{ .failed = error.Cancelled });
                     break;
                 };
-                // A logout is done locally; only the wait for the revocation stops.
                 for (r.logouts.items, 0..) |l, k| if (l.request == target) {
                     _ = r.logouts.swapRemove(k);
                     r.finish(target, .ok);
@@ -622,7 +613,6 @@ pub const Runtime = struct {
                 r.finish(req, .ok);
             },
             .answer => |a| {
-                // `finish` frees the pending question and the answer.
                 defer r.finish(req, .ok);
                 const name = r.resolved.servers[a.pending.server].name;
                 var scratch: std.heap.ArenaAllocator = .init(r.gpa);
@@ -654,8 +644,6 @@ pub const Runtime = struct {
                     debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
                 };
                 r.flags[i] = .{};
-                // A program that exits next would lose a revocation still on
-                // its way, so the logout ends when it's answered.
                 if (!r.engine.revoking(s.name)) return r.finish(req, .ok);
                 try r.logouts.append(r.gpa, .{ .server = i, .request = req, .deadline_ms = r.nowMs() + revoke_wait_ms });
             },
@@ -667,7 +655,6 @@ pub const Runtime = struct {
         const s = r.resolved.servers[i];
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
         r.endLogin(i);
-        // The bridge passes the port on, so any free one does.
         var listener = try loopback.Listener.open(r.io, if (s.bridge) null else s.callback_port);
         const l = r.gpa.create(Login) catch |err| {
             listener.close(r.io);
@@ -786,8 +773,6 @@ pub const Runtime = struct {
     fn onEvent(r: *Runtime, event: engine.Event) !void {
         const i = r.serverIndex(event.server) orelse return;
         switch (event.kind) {
-            // A failed attempt ends the waits for tools with its reason; the
-            // engine keeps trying, so a later request may still get them.
             .phase => |phase| if (phase == .backoff or phase == .failed) r.endToolWaiters(i, .failed),
             .called => |c| {
                 const entry = r.calls.fetchRemove(c.call) orelse return;
@@ -839,17 +824,14 @@ pub const Runtime = struct {
             .auth_required => {
                 r.flags[i].needs_login = true;
                 r.notify(.{ .needs_login = name });
-                // Nothing comes until someone logs in.
                 r.endToolWaiters(i, .needs_login);
             },
             .authorize => |authorize| {
-                // A bridged sign-in starts at the bridge, which goes on to the server's page.
                 const bridged = r.bridgeStart(i, authorize);
                 defer if (bridged) |owned| r.gpa.free(owned);
                 const url = bridged orelse authorize;
                 r.notify(.{ .authorize = .{ .server = name, .url = url } });
                 for (r.logins.items) |l| if (l.server == i and l.open_browser) {
-                    // The URL went out in the notice either way.
                     const opened = url_opener.native_opener.open(r.gpa, url) catch false;
                     if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
                 };
@@ -860,8 +842,6 @@ pub const Runtime = struct {
                 r.notify(.{ .signed_in = name });
             },
             .sign_in_failed => |f| {
-                // The message can point into the callback address the login
-                // holds, so it is put in words before the login goes.
                 var buffer: [512]u8 = undefined;
                 const reason = signInFailure(&buffer, f.why, f.message);
                 r.endLogin(i);
@@ -901,7 +881,6 @@ pub const Runtime = struct {
         defer parsed.deinit();
         const id = try r.gpa.dupe(u8, parsed.value);
         errdefer r.gpa.free(id);
-        // A slot used again holds a new question.
         r.endUrl(i, slot, false);
         try r.url_questions.append(r.gpa, .{ .server = i, .slot = slot, .id = id });
     }
@@ -950,7 +929,6 @@ pub const Runtime = struct {
         r.tool_waiters.clearRetainingCapacity();
         for (r.logouts.items) |l| r.finish(l.request, .ok);
         r.logouts.clearRetainingCapacity();
-        // Requests queued after the last drain.
         _ = r.drain();
         r.flush();
         r.engine.deinit();
@@ -985,8 +963,6 @@ pub const Runtime = struct {
             };
             o.version = if (st.version) |v| try a.dupe(u8, v) else null;
             o.tools = st.tools;
-            // The engine keeps its last failure; it explains a server that is
-            // down, not one that is back or stopped to wait for a sign-in.
             o.last_error = switch (o.state) {
                 .failed, .retrying => if (st.last_error) |e| try a.dupe(u8, describeFailure(e)) else null,
                 else => null,
@@ -1027,7 +1003,6 @@ pub const Runtime = struct {
             }
             return r.gpa.destroy(req);
         }
-        // A question the caller hadn't taken goes with the call.
         r.mutex.lockUncancelable(r.io);
         var question = req.question;
         req.question = null;
@@ -1067,7 +1042,6 @@ pub const Runtime = struct {
         }
         var out: std.Io.Writer.Allocating = .init(r.gpa);
         defer out.deinit();
-        // An allocating writer fails only when allocation does.
         out.writer.writeByte('{') catch return error.OutOfMemory;
         for (requests, keys, 0..) |request, *key, n| {
             key.* = try r.gpa.dupe(u8, request.key);
@@ -1204,7 +1178,6 @@ fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u
     };
     var said = std.mem.trimEnd(u8, message orelse return what, ". \t\r\n");
     if (said.len == 0) return what;
-    // At most 300 bytes of it, never inside a character.
     if (said.len > 300) {
         var end: usize = 300;
         while (end > 0 and said[end] & 0xC0 == 0x80) end -= 1;
@@ -1278,7 +1251,6 @@ fn copyCall(alloc: Allocator, c: anytype) Allocator.Error!CallResult {
             .is_error = res.is_error,
         } },
         .failure => |f| .{ .failure = .{ .code = f.code, .message = try alloc.dupe(u8, f.message) } },
-        // An answer that isn't a result ended the call: say how the engine ended it.
         .input_required, .invalid => .{ .ended = .{
             .outcome = if (c.outcome == .result) .malformed else c.outcome,
             .maybe_ran = true,

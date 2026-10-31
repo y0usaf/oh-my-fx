@@ -697,8 +697,6 @@ fn matchTemplateFrom(
         return false;
     }
 
-    // Catalog parsing rejects adjacent expressions because they have no literal
-    // boundary for deterministic bounded matching.
     return false;
 }
 

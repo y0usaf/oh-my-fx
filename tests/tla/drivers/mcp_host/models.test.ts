@@ -1,7 +1,3 @@
-// The fx-layer models through TLC (smoke with liveness, stress, every
-// planted bug, the stated properties the code breaks, repair witnesses), and
-// the trace bridge qualified both ways: a known-good trace per model is
-// ACCEPTED and a known-bad one REJECTED at the record that breaks it.
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { artifacts } from "../lib/context";
@@ -14,17 +10,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins joined the four.
   expect(count("smoke", "PASS")).toBe(5);
   expect(count("stress", "PASS")).toBe(5);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
-  // Credentials' two findings and its repair witness became the code.
-  // HostLifecycle's OneProcessPerServer did too: it
-  // is now an invariant its smoke and stress configs check, leases included,
-  // so it is no longer an expected finding and needs no separate witness.
-  // SignIn's three did too, with the hold while another host is alive: its smoke and stress
-  // configs now check IndicatorImpliesListener, OneSignInPerServer and
-  // IndicatorClears.
   expect(count("finding", "FINDING")).toBe(2);
   expect(count("repair", "PASS")).toBe(1);
 }, 1_800_000);
@@ -38,7 +26,6 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "get", server: "" } },
       { event: "observe", data: { kind: "ok", entries: ["web"], imported: true, marked: true, v1: ["web"] } },
     ],
-    // A read that took over v1's login but didn't save the flag.
     bad: [
       { event: "observe", data: { kind: "absent", entries: [], imported: false, marked: false, v1: ["web"] } },
       { event: "run", data: { cmd: "get", server: "" } },
@@ -56,7 +43,6 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "quit" },
       { event: "term", data: { server: "a" } },
     ],
-    // The project server waiting for approval starts anyway.
     bad: [
       { event: "spawn", data: { server: "a" } },
       { event: "spawn", data: { server: "p" } },
@@ -71,7 +57,6 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "callback", data: { login: 1, state: 1, kind: "get" } }, { event: "redeem", data: { login: 1 } },
       { event: "signed_in", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "closed" } },
     ],
-    // A code redeemed for a callback whose state fx never made.
     bad: [
       { event: "login" }, { event: "authorize", data: { login: 1 } },
       { event: "callback", data: { login: 1, state: 0, kind: "get" } }, { event: "redeem", data: { login: 1 } },
@@ -85,7 +70,6 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "ask", data: { q: 1 } }, { event: "shown", data: { q: 1 } }, { event: "answer", data: { q: 1 } },
       { event: "delivered", data: { target: 1, from: 1 } }, { event: "call_end" },
     ],
-    // A 2026 answer reaching another round: handles aren't reused, so no match.
     bad: [
       { event: "ask", data: { q: 1 } }, { event: "shown", data: { q: 1 } }, { event: "ask", data: { q: 2 } },
       { event: "answer", data: { q: 1 } }, { event: "delivered", data: { target: 2, from: 1 } },

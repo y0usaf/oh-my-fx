@@ -229,8 +229,6 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
-        // Chat completions sends images as inline base64 content parts, so
-        // vision support implies file input through the same path.
         .has_vision = vision,
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,

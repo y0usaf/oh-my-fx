@@ -1,7 +1,3 @@
-// Loopback fakes for /usage and `fx usage`. One handler answers every usage
-// read fx makes, so a single fake gateway serves chat, models, and usage:
-// AI Gateway's /v1/report, the Vercel usage-report budget, ChatGPT's Codex
-// usage, and the Grok CLI proxy. Every name and token here is synthetic.
 
 import { chmodSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";

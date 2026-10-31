@@ -1,12 +1,3 @@
-// Connects behavior observed from the real fx binary to TLC.
-//
-// The observations become LaunchObserved.tla. LaunchTrace replays them through
-// LaunchSelection's own actions for one design. ACCEPTED requires TLC exit 12
-// on the NotAllMatched sentinel, reachable only after every observation
-// matched. A completed search is REJECTED; then each observation is replayed
-// alone to name the first one the design cannot produce.
-//
-// Strict verdicts: unreadable or missing evidence is never acceptance.
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";

@@ -183,7 +183,6 @@ const PendingReload = struct {
     }
 
     fn quiesceSupersededWork(self: *PendingReload) void {
-        // Authentication can hold the lease that a retiring reload is waiting for.
         if (self.superseded_authentication) |task| {
             self.superseded_authentication = null;
             cancelAndDeinitAuthentication(task, "authority_reduction");
@@ -1847,13 +1846,9 @@ pub const State = struct {
     fn destroyHost(self: *State) void {
         self.host_closing.store(true, .release);
         if (self.process_exiting.load(.acquire)) {
-            // Nothing is waited for: the servers get
-            // SIGTERM, and the host and `/mcp` threads are left to the
-            // exiting process.
             mcp_host.signalServersForExit();
             return;
         }
-        // `/mcp` commands still running end first, so none outlives the state.
         self.closeHostMenu();
         var waited: usize = 0;
         while (self.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
@@ -1862,7 +1857,6 @@ pub const State = struct {
         if (self.host_completion_arena) |*arena| arena.deinit();
         self.host_completion_arena = null;
         self.host_completion = &.{};
-        // No host is left to notify, and no `/mcp` thread to push.
         if (self.host_sink) |sink| {
             sink.deinit();
             std.heap.c_allocator.destroy(sink);
@@ -1917,7 +1911,6 @@ pub const State = struct {
             switch (notice) {
                 .authorize => |n| {
                     sink.waitForSignIn(n.server, n.url);
-                    // The menu shows the address; a typed login prints it.
                     if (!sink.isTyped(n.server)) return;
                     const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
                     sink.pushLocked(text, false);
@@ -1930,7 +1923,6 @@ pub const State = struct {
                     sink.endSignIn(n.server);
                     sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
                 },
-                // The status line says so for as long as it's true.
                 .needs_login => {},
             }
         }
@@ -1950,7 +1942,6 @@ pub const State = struct {
             defer sink.mutex.unlock(io_mod.getIo());
             if (sink.isTyped(server)) return;
             const a = std.heap.c_allocator;
-            // Out of memory, its outcome goes to the status line instead.
             const name = a.dupe(u8, server) catch return;
             sink.typed.append(a, name) catch a.free(name);
         }
@@ -2251,10 +2242,8 @@ pub const State = struct {
             .open => |name| try self.startMenuTools(name),
             .back => self.stopMenuTools(),
             .run => |run| {
-                // A confirmed Remove went back to the list already.
                 if (self.host_menu.screen == .list) self.stopMenuTools();
                 try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server });
-                // The status follows sooner than the next refresh would show it.
                 self.host_menu_at_ms = 0;
             },
         }
@@ -2288,9 +2277,6 @@ pub const State = struct {
             self.stopMenuTools();
             return true;
         }
-        // A server that became usable since its tools failed to load, by
-        // logging in or being approved, loads them again. Only then: a
-        // failing server moving between retrying and failed is left alone.
         const open = view.open orelse return changed;
         if (self.host_menu_tools == .ready or self.host_menu_tools == .loading) return changed;
         if (open.status.needs_login or (open.status.state != .ready and open.status.state != .idle)) return changed;
@@ -2345,7 +2331,6 @@ pub const State = struct {
         errdefer a.free(job.name);
         _ = self.host_verbs.fetchAdd(1, .acq_rel);
         errdefer _ = self.host_verbs.fetchSub(1, .acq_rel);
-        // Registered before it starts, so it can't finish unseen.
         sink.mutex.lockUncancelable(io_mod.getIo());
         sink.menu_job = job;
         sink.mutex.unlock(io_mod.getIo());
@@ -2414,7 +2399,6 @@ pub const State = struct {
             const sink = self.host_sink orelse return arena.deinit();
             sink.mutex.lockUncancelable(io_mod.getIo());
             defer sink.mutex.unlock(io_mod.getIo());
-            // Left or replaced while it ran: nobody wants these.
             if (sink.menu_job != job) return arena.deinit();
             sink.menu_job = null;
             if (sink.menu_tools) |*old| old.arena.deinit();
@@ -2480,13 +2464,10 @@ pub const State = struct {
     }
 
     pub fn startDiscovery(self: *State, registry: tool_dispatch.Registry) void {
-        // MCP-v2 starts each server when the model first needs it.
         if (self.host != null) return;
         var lease = self.acquire() orelse return;
         defer lease.deinit();
         lease.runtime.startDiscovery(registry);
-        // Main-thread only, like the menu fields: post one summary notice once
-        // startup discovery settles with servers that need attention.
         self.startup_health_notice_pending = true;
     }
 
@@ -2727,9 +2708,6 @@ pub const State = struct {
         baseline_alloc: Allocator,
         current: []const mcp_model_catalog.ServerSummary,
     ) !?[]u8 {
-        // A discovery pass that is still settling is not a model-visible
-        // change; wait for a stable listing before teaching the model about
-        // availability deltas so session startup never renders a notice.
         for (current) |server| {
             if (server.availability == .discovering) return null;
         }
@@ -2779,7 +2757,6 @@ pub const State = struct {
         cancel_flag: ?*std.atomic.Value(bool),
         captured_at_ms: u64,
     ) !?[]u8 {
-        // MCP-v2 servers start on demand, so startup waits for none.
         if (self.host != null) return null;
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
@@ -3394,24 +3371,17 @@ pub const State = struct {
     /// Teardown immediately followed by process exit: stdio servers are
     /// killed without grace and remote sessions are left to expire.
     pub fn deinitForProcessExit(self: *State, alloc: Allocator) void {
-        // A reload still in flight must see this before its children die,
-        // and `destroyHost` waits for nothing once it is set.
         self.process_exiting.store(true, .release);
         self.destroyHost();
         if (!mcp_runtime.killAllStdioChildrenForProcessExit()) {
             return self.deinitWithMode(alloc, .process_exit);
         }
-        // Every stdio child is dead. Work the user started is still cancelled
-        // and logged, but runtimes, pending reloads, and their threads are
-        // left to the exiting process: joining them would only wait for each
-        // killed child to be reaped.
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingMenuOperation("shutdown");
     }
 
     fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {
         if (mode == .process_exit) {
-            // A reload still in flight must see this before it is joined.
             self.process_exiting.store(true, .release);
             self.lock.lockSharedUncancelable(io_mod.getIo());
             if (self.runtime) |runtime| runtime.prepareForProcessExit();
@@ -4276,7 +4246,6 @@ test "startup health notice is held during discovery and consumed once" {
     state.startDiscovery(.{});
     try std.testing.expect(state.startup_health_notice_pending);
 
-    // Zero configured servers settle quickly; until then the notice is held.
     const deadline = io_mod.milliTimestamp() + 5_000;
     var notice: ?[]u8 = null;
     while (io_mod.milliTimestamp() < deadline) {
@@ -4299,14 +4268,12 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
     try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
     try std.testing.expect(sink.news == null);
-    // Once reported, the next sign-in to it isn't typed.
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
     try std.testing.expect(sink.sign_in != null);
     notify.notice(notify.context, .{ .sign_in_failed = .{ .server = "docs", .reason = "it said no" } });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
     try std.testing.expectEqualStrings("Couldn't sign in to docs: it said no.", sink.news.?);
     try std.testing.expect(sink.sign_in == null);
-    // Needing a login is the status line's to say.
     notify.notice(notify.context, .{ .needs_login = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
 }

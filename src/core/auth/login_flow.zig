@@ -616,8 +616,6 @@ pub const SignInRuntime = struct {
         if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
     }
 
-    // Notify once after persistence, outside the state lock. A disconnected
-    // browser cannot turn a committed credential into a failed sign-in.
     fn finishAttempt(self: *Self, alloc: Allocator) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.state == .polling) {

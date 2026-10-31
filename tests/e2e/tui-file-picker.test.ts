@@ -130,7 +130,6 @@ function processRssKb(pid: number): number {
   return rss;
 }
 
-// The @ menu rows: the lines between the two rules below the composer.
 function pickerRows(grid: string[]): string[] {
   const composer = grid.findIndex(isComposerLine);
   const rules = grid.flatMap((line, index) =>
@@ -455,13 +454,11 @@ describe("@ file picker", () => {
       expect(await composerPlainText(active)).toBe("Review @notes/");
       expect(pickerRows(await active.capturePaneGrid())).toEqual(["notes/", "notes/drafts/", "notes/todo.md"]);
 
-      // Enter on the first row selects the opened folder itself.
       await active.sendKeys("Enter");
       await active.sendLiteral("please");
       await active.waitForPane((pane) => composerTextFromPane(pane) === "Review @notes/ please", TIMEOUT);
       expect(pickerRows(await active.capturePaneGrid())).toEqual([]);
 
-      // Enter on a listed child folder selects that folder.
       await clearComposer(active);
       await active.sendLiteral("@notes/");
       await active.waitForText("notes/drafts/", TIMEOUT);
@@ -495,9 +492,6 @@ describe("@ file picker", () => {
       await active.sendLiteral("@item-");
       await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 10).join("|"), TIMEOUT);
 
-      // A short terminal keeps six rows, and navigation scrolls those six:
-      // moving back up leaves the window in place until the selection passes
-      // its top row.
       await active.resizeWindow(112, 16);
       await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 6).join("|"), TIMEOUT);
       for (let i = 0; i < 7; i++) await active.sendKeys("Down");
@@ -539,7 +533,6 @@ describe("@ file picker", () => {
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
 
-      // Every frame fx wrote, interleaved with the keystrokes that caused them.
       const framesDir = join(current.root, "frames");
       const replay = await runFx(["replay", current.tapePath, "--frames-dir", framesDir], {
         cwd: current.workspace, env: { HOME: current.home }, timeoutMs: TIMEOUT,
@@ -561,16 +554,12 @@ describe("@ file picker", () => {
           continue;
         }
         if (frame.kind !== "stdout") continue;
-        // Grid files frame each terminal row as |row|.
         const grid = readFileSync(
           join(framesDir, "frames", `${String(frame.index).padStart(4, "0")}.grid.txt`),
           "utf8",
         ).split("\n").map((line) => line.replace(/^\|(.*)\|$/, "$1"));
         if (!composerTextFromPane(grid.join("\n")).startsWith("@./tree/")) continue;
         if (pickerRows(grid).includes("./tree/inner/leaf-a.txt")) folderRowsPainted = true;
-        // A folder that lists within one 8 ms tick paints together with its
-        // keystroke. A loading frame is allowed only once that wait has run
-        // out; 7 allows for millisecond rounding between the tape and the wait.
         if (grid.some((line) => line.includes("indexing files..."))) {
           expect(frame.elapsed_ms - lastInputMs).toBeGreaterThanOrEqual(7);
         }
@@ -832,10 +821,6 @@ describe("@ file picker", () => {
         }
       })();
 
-      // A refresh of an unchanged tree reuses the saved listing in a few
-      // milliseconds. Touching the git index, as `git add` would, makes each
-      // refresh rescan every file without changing the result, so frames can
-      // observe a replacement in flight.
       const gitIndexPath = join(current.workspace, ".git", "index");
       const injectCycle = () => {
         const now = new Date();
@@ -998,10 +983,6 @@ describe("@ file picker", () => {
       for (const snapshot of activeQueryFrames) {
         expect(snapshot.pane).not.toContain("indexing files...");
       }
-      // A replacement finishes in tens of milliseconds, close to one frame
-      // capture, so a frame inside it is luck. What must hold is that
-      // replacements began while the query was on screen and every frame
-      // around them kept the completed result.
       expect(
         activeQueryFrames.some((snapshot) =>
           traceGenerationNumbers(snapshot.trace, "file index generation started")
@@ -1785,7 +1766,6 @@ describe("@ file picker", () => {
       });
       const active = session;
       await active.waitForComposer(TIMEOUT);
-      // One input batch arrives before any directory rowset can be presented.
       active.sendLiteralImmediate("@./first/\t\t\r");
       await active.waitForText("./first/alpha.txt", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./first/");
@@ -1803,7 +1783,6 @@ describe("@ file picker", () => {
       expect(await composerPlainText(active)).toBe("@./second/");
       expect(starts()).toBe(2);
       expect(gateway.requests).toHaveLength(0);
-      // The first row is the opened folder itself; its file follows.
       await active.sendKeys("Down Tab");
       expect(await composerPlainText(active)).toBe("@./second/beta.txt");
       await clearComposer(active);
@@ -1843,7 +1822,6 @@ describe("@ file picker", () => {
       await active.waitForComposer(TIMEOUT);
       await active.sendLiteral("@./");
       await active.waitForText("./c.txt", TIMEOUT);
-      // .git is also listed by explicit completion. Select c from the end.
       await active.sendKeys("Up");
       const prepared = () => readFileSync(current.tracePath, "utf8").split("file picker prepared revision=").length - 1;
       const before = prepared();
@@ -1875,7 +1853,6 @@ describe("@ file picker", () => {
       await active.waitForText("Selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./retry/");
       expect(gateway?.requests).toHaveLength(0);
-      // The rows are now the folder and b.txt; move from the stale slot to b.txt.
       await active.sendKeys("Down Down Enter");
       expect(await composerPlainText(active)).toBe("@./retry/b.txt");
 
@@ -1890,7 +1867,6 @@ describe("@ file picker", () => {
       await active.sendKeys("Tab");
       await active.waitForText("./missing/recovered.txt", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./missing/");
-      // The recovered folder lists itself first; its file follows.
       await active.sendKeys("Down Tab");
       expect(await composerPlainText(active)).toBe("@./missing/recovered.txt");
       await active.sendLiteral(" Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
@@ -2018,7 +1994,6 @@ describe("@ file picker", () => {
       await clearComposer(active);
       await active.sendLiteral("@~");
       await active.waitForText("~/home-target.txt", TIMEOUT);
-      // Rows: the home folder itself, ~/.fx/, then ~/home-target.txt.
       await active.sendKeys("Down Down Enter");
       expect(await composerPlainText(active)).toBe("@~/home-target.txt");
       expect(gateway?.requests).toHaveLength(0);
@@ -2090,7 +2065,6 @@ describe("@ file picker", () => {
       await active.waitForText("empty-workspace/", TIMEOUT);
       await active.sendKeys("Tab");
       expect(await composerPlainText(active)).toBe("@empty-workspace/");
-      // An opened empty folder still lists itself, so it can be selected.
       await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "empty-workspace/", TIMEOUT);
       await active.sendLiteral("zzz");
       await active.waitForText("no matching files", TIMEOUT);

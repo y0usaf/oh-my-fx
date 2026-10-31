@@ -79,8 +79,6 @@ pub fn parseOsc11Response(bytes: []const u8) ?Background {
     };
 }
 
-// Terminal.app is the one mainstream terminal that quantizes 38;2 colors
-// itself; every other target either sets COLORTERM or renders RGB exactly.
 pub fn truecolorSupportedForValues(colorterm: ?[]const u8, term_program: ?[]const u8) bool {
     if (colorterm) |value| {
         if (std.mem.find(u8, value, "truecolor") != null) return true;

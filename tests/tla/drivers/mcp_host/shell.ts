@@ -1,5 +1,3 @@
-// The real fx shell in tmux for the mcp-v2-model scenarios: start it with a
-// fake gateway, read its status line once it settles, type `/mcp` verbs, quit.
 import { join } from "node:path";
 import { binary, shellQuote, targetHelpers } from "../lib/context";
 import { fxEnv, save, type Fixture, type ServerEvent } from "./driver";

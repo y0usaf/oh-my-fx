@@ -200,9 +200,6 @@ pub fn inspectDoctorSession(
     };
     const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
     candidate.deinit(alloc);
-    // A stale schema-v3 session resumes from its committed log, so a log that
-    // cannot be replayed leaves the session unreadable even though its
-    // manifest is valid; latest resume skips it for the same reason.
     if (stale_schema_v3) {
         if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
             var replay = value;
@@ -629,8 +626,6 @@ fn classifyLegacySnapshot(
     if (try entryExistsRelative(session_dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
-    // Opening a FIFO or device for reading can block, so the helper checks
-    // the entry and opens it without blocking.
     var file = io_mod.openExistingRegularFile(session_dir.dir, name, .read_only) catch |err| switch (err) {
         error.DurablePathUnsafe => return error.SessionPathUnsafe,
         else => return err,

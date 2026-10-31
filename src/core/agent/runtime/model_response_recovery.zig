@@ -69,8 +69,6 @@ pub const RetryPacingState = union(enum) {
         cause: FailureCause,
         retry_after_seconds: ?u64,
     ) RetryPacingState {
-        // A zero or missing server hint carries no useful information; a
-        // failing endpoint saying "retry instantly" must not disable backoff.
         if (retry_after_seconds != null and retry_after_seconds.? > 0) return .idle;
         return switch (self) {
             .idle => .{ .implicit = .{ .cause = cause, .attempt = 1 } },
@@ -155,8 +153,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
             .strategy = .stop,
             .required_action = .change_request,
         },
-        // The provider's own request limit does not recover by retrying within
-        // this turn. Stop honestly instead of pausing for a manual /continue.
         .request_limit_reached => return .{
             .strategy = .stop,
             .required_action = .continue_later,
@@ -164,9 +160,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
         else => {},
     }
 
-    // Connectivity loss waits indefinitely; probes transmit nothing, so there
-    // is nothing to budget and nothing to bill. The cadence ramps 1s, 2s, then
-    // a 5s cap so a down network is polled gently, not hammered.
     if (evidence.cause == .connectivity_lost) {
         const next_pacing = evidence.pacing.afterFailure(.connectivity_lost, null);
         const probe_attempt = switch (next_pacing) {
@@ -181,12 +174,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
         };
     }
 
-    // A stalled exchange (identical failure, identical progress, repeatedly) is
-    // a broken response, not a flaky network. Stop instead of restarting the
-    // same failure forever. Scoped to stream evidence: bare status failures
-    // (5xx) carry no progress information and keep retrying patiently. Checked
-    // before the silence probe: repeated hangs at the same byte offset are not
-    // ambiguous, so probing them forever would defeat the stall detector.
     if (evidence.progress == .stalled) {
         return .{
             .strategy = .stop,
@@ -194,8 +181,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
         };
     }
 
-    // Silence is never a retry trigger. Probe the liveness channel first, on a
-    // paced cadence so a provider that always times out cannot hot-loop.
     if (evidence.cause == .provider_stream_timeout) {
         const next_pacing = evidence.pacing.afterFailure(.provider_stream_timeout, null);
         const probe_attempt = switch (next_pacing) {
@@ -229,9 +214,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
         evidence.retry_after_seconds,
     );
     const throttled = evidence.recovery_elapsed_ns orelse 0 > billable_retry_window_ns;
-    // A positive server hint bounds the wait from below, but never below the
-    // throttled floor: a misbehaving endpoint retrying "in 1s" forever must
-    // not defeat the billable-spend throttle.
     const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
         if (seconds == 0) break :blk switch (next_pacing) {
             .idle => unreachable,
@@ -326,8 +308,6 @@ test "model response recovery policy is deterministic and never pauses transient
     definitely_unsent.delivery = .definitely_unsent;
     try std.testing.expectEqual(Strategy.retry_request, decide(definitely_unsent).strategy);
 
-    // Exhaustion no longer pauses the turn: the strategy keeps retrying with
-    // the same pacing discipline.
     var exhausted = base;
     exhausted.attempts.consumed = exhausted.attempts.limit;
     const kept = decide(exhausted);
@@ -374,7 +354,6 @@ test "connectivity loss waits without consuming the attempt budget" {
     });
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), waiting_steady.delay_ns);
 
-    // Even an "exhausted" budget still waits: connectivity probes are free.
     const still_waiting = decide(.{
         .cause = .connectivity_lost,
         .delivery = .possibly_sent,
@@ -438,8 +417,6 @@ test "stalled progress stops instead of restarting forever" {
     advancing_evidence.progress = .advancing;
     try std.testing.expectEqual(Strategy.retry_request, decide(advancing_evidence).strategy);
 
-    // A stream that times out repeatedly at the same byte offset is stalled,
-    // not merely silent: stop instead of probing liveness forever.
     var stalled_timeout = stalled_evidence;
     stalled_timeout.cause = .provider_stream_timeout;
     const stopped = decide(stalled_timeout);
@@ -525,9 +502,6 @@ test "billable retries throttle past the recovery window without dying" {
     try std.testing.expectEqual(throttled_retry_delay_ns, throttled.delay_ns);
     try std.testing.expectEqual(Strategy.retry_request, throttled.strategy);
 
-    // A positive Retry-After hint bounds the wait from below but never below
-    // the throttled floor: a misbehaving endpoint saying "in 1s" forever must
-    // not pin the turn at 60 billable requests per minute.
     var hinted = past_window;
     hinted.retry_after_seconds = 1;
     const hinted_throttled = decide(hinted);
@@ -570,9 +544,6 @@ test "implicit retry pacing is independent from the shared attempt budget" {
         provider_failure.delay_ns,
     );
 
-    // A zero server hint carries no timing information: implicit pacing keeps
-    // backing off instead of an instant retry. An endpoint failing with
-    // retry-after: 0 must not produce a zero-delay request flood.
     const zero_hinted = decide(.{
         .cause = .provider_unavailable,
         .delivery = .possibly_sent,
@@ -592,7 +563,6 @@ test "implicit retry pacing is independent from the shared attempt budget" {
     });
     try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), zero_hinted_again.delay_ns);
 
-    // A positive server hint still wins and resets pacing, as before.
     const explicitly_timed = decide(.{
         .cause = .provider_unavailable,
         .delivery = .possibly_sent,

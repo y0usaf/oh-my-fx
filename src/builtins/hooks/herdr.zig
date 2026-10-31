@@ -11,12 +11,10 @@ const jsonrpc = @import("../../acp/jsonrpc.zig");
 
 pub const State = enum { idle, working, blocked };
 
-// herdr protocol limits custom status to 32 bytes.
 const custom_status_max = 32;
 /// Maximum wait for herdr's one-line reply.
 const response_timeout = std.posix.timeval{ .sec = 0, .usec = 250_000 };
 
-// Third-party reporters use the `custom:` source prefix.
 const source = "custom:fx";
 const agent_name = "fx";
 
@@ -77,8 +75,6 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        // Clear herdr's pane before freeing paths so exit does not leave a
-        // stale idle "fx" label behind.
         self.release();
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);

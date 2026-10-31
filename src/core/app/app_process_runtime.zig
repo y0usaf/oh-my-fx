@@ -204,7 +204,6 @@ test "compaction activity error routing requires exact operation and turn proven
     } };
     try std.testing.expect(compactionErrorHandled(prompt, provenance, provenance.err));
     try std.testing.expect(!compactionErrorHandled(prompt, stale, provenance.err));
-    // An unrelated error of even the same error set has no call-scoped provenance.
     try std.testing.expect(!compactionErrorHandled(prompt, null, provenance.err));
 }
 

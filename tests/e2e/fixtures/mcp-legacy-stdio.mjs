@@ -15,9 +15,6 @@ const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.te
 const urlRequiredOperation = process.env.FX_MCP_URL_REQUIRED_OPERATION ?? "tools";
 let buffer = Buffer.alloc(0);
 let messageCount = 0;
-// By default this fixture also checks v1's own wire choices: `initialize`
-// opens a fresh process after a discovery probe, and `tools/list` carries no
-// `_meta`. FX_MCP_SPEC_CLIENT=1 accepts any client the spec allows instead.
 const specClient = process.env.FX_MCP_SPEC_CLIENT === "1";
 let sawDiscovery = false;
 let toolsListCalls = 0;
@@ -28,8 +25,6 @@ let completionStage = 0;
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
 
-// Startup failure modes model a package runner that exits before the server
-// answers initialize, printing npm-style diagnostics to stderr.
 const startupFailure = mode === "startup_exit" || mode === "startup_exit_after_delay";
 if (startupFailure) {
   const fail = () => process.stderr.write(
@@ -240,7 +235,6 @@ function handle(message) {
   }
   if (message.method === "initialize") {
     if (startupFailure) return;
-    // Answer with output fx must reject; the process itself stays up.
     if (mode === "startup_garbage") {
       process.stdout.write("not json\n");
       return;

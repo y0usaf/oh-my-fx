@@ -1655,7 +1655,6 @@ function startLocalGatewayFixture(expectedPromptTail: string): LocalGatewayFixtu
     idleTimeout: 0,
     async fetch(request) {
       const url = new URL(request.url);
-      // Title generation side calls never count as scenario gateway traffic.
       if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
         const bodyPeek = await request.clone().text();
         if (bodyPeek.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
@@ -2124,7 +2123,6 @@ class RenderLabTmux {
       `SHELL_A_BETWEEN_LAUNCHES=${shQuote(opts.manifest.markers.shell[1] ?? "")}`,
       `SHELL_A_BEFORE_THIRD=${shQuote(opts.manifest.markers.shell[2] ?? "")}`,
       shQuote(zshPath()),
-      // The fixture owns ZDOTDIR, so runner-global startup files must not run.
       "-d",
       "-i",
     ].join(" ");

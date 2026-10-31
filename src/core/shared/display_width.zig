@@ -131,8 +131,6 @@ pub noinline fn visibleWidth(text: []const u8) usize {
     return width;
 }
 
-// Same as visibleWidth, but skips over ANSI escape sequences so callers can
-// measure the rendered cell width of text that already contains styling.
 pub noinline fn visibleWidthIgnoringAnsi(text: []const u8) usize {
     var width: usize = 0;
     var i: usize = 0;
@@ -148,8 +146,6 @@ pub noinline fn visibleWidthIgnoringAnsi(text: []const u8) usize {
     return width;
 }
 
-// Returns the first variant whose visible width fits max_width, falling back
-// to the last (shortest) variant so callers always get something to clip.
 pub noinline fn widestFitting(variants: []const []const u8, max_width: usize) []const u8 {
     std.debug.assert(variants.len > 0);
     for (variants) |variant| {
@@ -172,9 +168,6 @@ pub noinline fn prefixByWidth(text: []const u8, max_width: usize) []const u8 {
     return text[0..i];
 }
 
-// Same as prefixByWidth, but skips ANSI escape sequences so callers can clip
-// text that already carries styling bytes without the escape sequences eating
-// into the width budget.
 pub noinline fn prefixByWidthIgnoringAnsi(text: []const u8, max_width: usize) []const u8 {
     if (max_width == 0) return "";
 
@@ -208,9 +201,6 @@ pub noinline fn suffixByWidth(text: []const u8, max_width: usize) []const u8 {
     return text[i..];
 }
 
-// Same as suffixByWidth, but ANSI-aware. Walks forward so escape sequences
-// stay attached to the visible rune that follows them; splitting an OSC-8
-// open/close pair would leak a dangling hyperlink into the terminal.
 pub noinline fn suffixByWidthIgnoringAnsi(text: []const u8, max_width: usize) []const u8 {
     if (max_width == 0) return text[text.len..];
 
@@ -376,7 +366,6 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
     var last_space: ?usize = null;
     var index: usize = 0;
     while (index < prefix.len) {
-        // A space inside an escape, such as an OSC 8 URL, is not a break.
         if (prefix[index] == 0x1b) {
             index = ansiSequenceEnd(prefix, index);
             continue;
@@ -516,8 +505,6 @@ test "decodeUtf8Sequence decodes one sequence and rejects malformed input" {
     try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc0\x80"));
     try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xed\xa0\x80"));
     try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("😀a"));
-    // A lead byte that disagrees with the slice length, as when a caller
-    // walks back over continuation bytes in malformed text.
     try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xe4\x80"));
     try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\x80\x80\x80\x80"));
 }
@@ -547,8 +534,6 @@ test "shouldWrapAt is strictly overflow-based" {
     try std.testing.expect(shouldWrapAt(10, 2, 10));
     try std.testing.expect(!shouldWrapAt(1, 1, 1));
 
-    // Start at c = 2 so c - 1 stays >= 1; cols = 0 is excluded by the
-    // helper precondition and guarded by current callers.
     var c: u16 = 2;
     while (c <= 256) : (c += 1) {
         try std.testing.expect(!shouldWrapAt(c, 1, c));
@@ -569,8 +554,6 @@ test "nextTabStopColumn uses absolute stops and clamps safely" {
 }
 
 test "prefixByWidthIgnoringAnsi keeps opening OSC-8 attached to visible bytes" {
-    // OSC-8 open does not consume any visible cells; the first two bytes of
-    // the hyperlink body do. Budget of 2 keeps the open + 2 cells.
     const text = "\x1b]8;;file:///x\x1b\\ab\x1b]8;;\x1b\\";
     const out = prefixByWidthIgnoringAnsi(text, 2);
     try std.testing.expectEqual(@as(usize, 2), visibleWidthIgnoringAnsi(out));

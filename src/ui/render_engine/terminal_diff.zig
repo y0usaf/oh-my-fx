@@ -607,7 +607,6 @@ fn composeWireFrame(
     full_repaint: bool,
     movement: *const PreparedTerminalMovement,
 ) !usize {
-    // RIS and startup modes precede synchronization; document bytes follow it.
     try wire_frame.writer.writeAll(movement.bytes[0..movement.sync_prefix_offset]);
     const prefix_start = wire_frame.written().len;
     if (input.synchronized_update) try wire_frame.writer.writeAll("\x1b[?2026h");
@@ -1392,8 +1391,6 @@ fn appendDocumentMovement(
     );
     switch (document_append.clear) {
         .remainder => {
-            // Ordinary appends replace everything after the transcript endpoint.
-            // Clear it before append rows can promote footer cells into scrollback.
             try writeDocumentAppendClear(
                 &bytes.writer,
                 document_append.start_row,
@@ -1775,8 +1772,6 @@ test "append pending wrap sink boundary controls and accepted prefixes" {
         try physical.feed(sink.bytes.items);
         try std.testing.expectEqualStrings(expected, physical.history.items);
 
-        // Every cut in the append segment is terminal, not a retryable suffix.
-        // After the segment, the receipt must prevent a second publication.
         const prefix_len = "\x1b[?2026h\x1b[?25l".len;
         const range = movement.documentAppendWireRange(prefix_len);
         for (range.start + 1..range.end + 1) |cut| {

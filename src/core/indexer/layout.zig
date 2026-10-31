@@ -237,8 +237,6 @@ test "layout discovery rejects bad gitdir files and skips non-git .git directori
     const outer = (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "outer/inner" }))).?;
     try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "outer" }), outer.worktree_root);
     try std.testing.expectEqualStrings("inner", outer.prefix);
-    // The test directory may itself sit inside a checkout, so only require
-    // that discovery does not stop inside it.
     if (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "plain/sub" }))) |enclosing| {
         try std.testing.expect(!std.mem.startsWith(u8, enclosing.worktree_root, root));
     }
@@ -251,7 +249,6 @@ test "layout discovery accepts exactly the git directories git accepts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try makeTestRepo(tmp.dir, "outer/.git");
-    // Without `refs`, git skips the inner directory and uses the outer one.
     try writeTestFile(tmp.dir, "outer/no-refs/.git/HEAD", "ref: refs/heads/main\n");
     try tmp.dir.createDirPath(std.testing.io, "outer/no-refs/.git/objects");
     try makeTestRepo(tmp.dir, "outer/bad-head/.git");

@@ -62,8 +62,6 @@ try {
   addon.destroyCore(core);
 }
 
-// Delay native publication until after the first abort and ACP cancellation
-// until after publication, making the cancelled-turn race deterministic.
 let delayedPrompt;
 let delayedCancel;
 let lateCore;

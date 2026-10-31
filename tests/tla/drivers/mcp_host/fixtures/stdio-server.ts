@@ -1,12 +1,3 @@
-// A 2025-11-25 stdio MCP server for the mcp-v2-model case. It logs every
-// lifecycle event to FIXTURE_LOG as JSONL ({t, name, pid, ev, ...}):
-//   start, listed (answered tools/list), eof (stdin ended), sigterm, recv, sent.
-// Env:
-//   FIXTURE_NAME          the server's name in its log lines
-//   FIXTURE_LOG           the JSONL log (appended synchronously)
-//   FIXTURE_INIT_DELAY_MS hold initialize's answer this long (a slow server)
-//   FIXTURE_CONTROL       a folder; the elicit tool waits for "go" in it
-// Tools: echo (answers at once), elicit (2025 elicitations, see below).
 import { appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -39,8 +30,6 @@ const form = (n: number) => ({
 const waiters = new Map<string, (message: { result?: { action?: string; content?: { answer?: string } } }) => void>();
 
 async function elicit(callId: unknown) {
-  // Question 1, then (once the harness says go) its withdrawal and question 2,
-  // which the client's slot table puts where question 1 was.
   const answers: Record<string, unknown> = {};
   const answered = (id: string) => new Promise<void>((resolve) => waiters.set(id, (m) => { answers[id] = m.result ?? null; resolve(); }));
   const first = answered("e1");
@@ -58,7 +47,6 @@ async function elicit(callId: unknown) {
     send({ id: "e2", method: "elicitation/create", params: form(2) });
     log("ask", { q: 2, id: "e2" });
     await Promise.race([second, Bun.sleep(30_000)]);
-    // Long enough for fx to show what it holds next.
     await Bun.sleep(Number(process.env.FIXTURE_AFTER_MS ?? "2500"));
   }
   send({ id: callId, result: { content: [{ type: "text", text: `ELICIT_DONE ${JSON.stringify(answers)}` }] } });
@@ -90,7 +78,7 @@ async function handle(m: { id?: unknown; method?: string; params?: { name?: stri
     }
     return;
   }
-  if (m.id === undefined) return; // a notification
+  if (m.id === undefined) return;
   switch (m.method) {
     case "initialize":
       if (initDelay > 0) await Bun.sleep(initDelay);

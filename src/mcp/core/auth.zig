@@ -15,9 +15,6 @@
 const std = @import("std");
 const trace = @import("../io/trace.zig");
 
-// ---------------------------------------------------------------------------
-// Gate
-
 /// Requests the gate tracks at once: more than the HTTP layer has in flight
 /// plus those waiting for a refresh.
 pub const max_requests = 64;
@@ -113,8 +110,6 @@ pub const Gate = struct {
                 out.action = "send";
                 out.expiring = s.expiring;
                 g.subject(s.key, out);
-                // A key is sent once; remote never has more than
-                // max_requests at a time.
                 if (g.find(s.key) != null or g.count == max_requests) return g.ignore(out);
                 g.entries[g.count] = .{ .key = s.key };
                 g.count += 1;
@@ -143,7 +138,6 @@ pub const Gate = struct {
                 if (e.again) {
                     g.giveUp(e, .needs_sign_in, out);
                 } else if (g.token() > e.g) {
-                    // A newer token arrived since it went out.
                     e.g = g.token();
                     e.again = true;
                     out.push(.{ .post = .{ .key = key, .token = e.g } });
@@ -172,7 +166,6 @@ pub const Gate = struct {
                     .failed => "refresh_failed",
                 };
                 out.rotate = r == .rotated;
-                // A sign-in or sign-out replaced this refresh.
                 if (!g.refreshing) return g.ignore(out);
                 g.refreshing = false;
                 switch (r) {
@@ -196,7 +189,6 @@ pub const Gate = struct {
                 g.held = true;
                 g.refreshable = s.refreshable;
                 g.rt = g.gen;
-                // The new token replaces the refresh in flight.
                 g.refreshing = false;
                 g.release(out);
             },
@@ -302,9 +294,6 @@ pub fn writeGateTrace(writer: *trace.Writer, instance: []const u8, g: *const Gat
     });
 }
 
-// ---------------------------------------------------------------------------
-// Flow
-
 pub const FlowConfig = struct {
     /// Authorization requests since the server last accepted a request.
     max_authorizations: u8 = 3,
@@ -407,7 +396,6 @@ pub const Flow = struct {
                 }
                 f.phase = .discovering;
                 f.flows += 1;
-                // The scopes held and those challenged.
                 f.flow_scopes = f.granted | f.challenge;
                 out.push(.discover);
             },
@@ -439,8 +427,6 @@ pub const Flow = struct {
             },
             .responded => |r| {
                 if (f.phase != .authorizing) return f.ignore(out);
-                // State, then iss by RFC 9207 §2.4, before
-                // anything in the response is used.
                 const accept = r.state_ok and switch (r.iss) {
                     .match => true,
                     .wrong => false,
@@ -538,10 +524,6 @@ pub fn writeFlowTrace(writer: *trace.Writer, instance: []const u8, f: *const Flo
     });
 }
 
-// ---------------------------------------------------------------------------
-// Tests. Each machine's model invariants are checked after every step of
-// every event sequence to a small depth, with the models' ghosts kept beside.
-
 const testing = std.testing;
 
 const GateWorld = struct {
@@ -554,7 +536,6 @@ const GateWorld = struct {
     rejected_g: [3]u32 = .{ 0, 0, 0 },
 
     fn check(w: *GateWorld, g: *const Gate, before_rt: u32, event: GateEvent, out: *const GateOutput) !void {
-        // A key sent anew is a new request.
         if (event == .send and !out.ignored) {
             w.sends[@intCast(event.send.key)] = 0;
             w.rejected_g[@intCast(event.send.key)] = 0;
@@ -579,16 +560,16 @@ const GateWorld = struct {
             .signed_out => w.refreshes = 0,
             else => {},
         }
-        try testing.expect(w.refreshes <= 1); // SingleFlightRefresh
+        try testing.expect(w.refreshes <= 1);
         try testing.expect(w.refreshes == @intFromBool(g.refreshing));
-        if (g.refreshing) try testing.expectEqual(w.server_rt, w.used_rt); // RefreshUsesLatest
-        for (w.sends) |n| try testing.expect(n <= 2); // SendsBound
+        if (g.refreshing) try testing.expectEqual(w.server_rt, w.used_rt);
+        for (w.sends) |n| try testing.expect(n <= 2);
         var waiting = false;
         for (g.entries[0..g.count]) |e| {
             waiting = waiting or e.phase == .waiting;
-            if (e.phase == .sent and e.again) try testing.expect(e.g > w.rejected_g[@intCast(e.key)]); // NewerOnResend
+            if (e.phase == .sent and e.again) try testing.expect(e.g > w.rejected_g[@intCast(e.key)]);
         }
-        if (waiting) try testing.expect(g.refreshing); // WaitingHasRefresh
+        if (waiting) try testing.expect(g.refreshing);
     }
 };
 
@@ -606,7 +587,6 @@ fn exploreGate(g: Gate, w: GateWorld, depth: u8) !void {
         var next = g;
         var nw = w;
         const before_rt = next.rt;
-        // The rejected send's token, for NewerOnResend.
         const prior: ?u32 = switch (event) {
             .rejected => |k| if (next.find(k)) |e| e.g else null,
             else => null,
@@ -636,13 +616,11 @@ test "a rejected request waits for one refresh and goes out again with its token
     try testing.expectEqualSlices(GateEffect, &.{.{ .post = .{ .key = 2, .token = 1 } }}, out.effects());
     out = gateSteps(&g, &.{.{ .rejected = 1 }});
     try testing.expectEqualSlices(GateEffect, &.{.refresh}, out.effects());
-    // A second rejection during the refresh waits for the same one.
     out = gateSteps(&g, &.{.{ .rejected = 2 }});
     try testing.expectEqual(@as(usize, 0), out.effects().len);
     out = gateSteps(&g, &.{.{ .refreshed = .rotated }});
     try testing.expectEqualSlices(GateEffect, &.{ .{ .post = .{ .key = 1, .token = 2 } }, .{ .post = .{ .key = 2, .token = 2 } } }, out.effects());
     try testing.expectEqual(@as(u32, 2), g.rt);
-    // Rejected again: it ends.
     out = gateSteps(&g, &.{.{ .rejected = 1 }});
     try testing.expectEqualSlices(GateEffect, &.{.{ .give_up = .{ .key = 1, .why = .needs_sign_in } }}, out.effects());
 }
@@ -701,16 +679,16 @@ const FlowWorld = struct {
             w.cross = true;
         };
         switch (f.phase) {
-            .registering, .authorizing, .redeeming => try testing.expect(w.validated), // MetaValidated
+            .registering, .authorizing, .redeeming => try testing.expect(w.validated),
             else => {},
         }
-        if (f.phase == .redeeming) try testing.expect(w.checked); // RedeemGuard
-        for (w.redemptions) |n| try testing.expect(n <= 1); // VerifierOnce
-        try testing.expect(!w.shown); // ErrSuppress
-        try testing.expect(!w.cross); // CredIsolation
-        try testing.expect(f.token_issuer == 0 or f.token_issuer == w.known); // TokenAudience
-        if (f.phase != .idle) try testing.expect(w.asked & ~f.flow_scopes == 0); // ScopeUnion
-        try testing.expect(f.auths <= f.config.max_authorizations); // StepUpBound
+        if (f.phase == .redeeming) try testing.expect(w.checked);
+        for (w.redemptions) |n| try testing.expect(n <= 1);
+        try testing.expect(!w.shown);
+        try testing.expect(!w.cross);
+        try testing.expect(f.token_issuer == 0 or f.token_issuer == w.known);
+        if (f.phase != .idle) try testing.expect(w.asked & ~f.flow_scopes == 0);
+        try testing.expect(f.auths <= f.config.max_authorizations);
     }
 };
 
@@ -760,11 +738,9 @@ test "a sign-in registers once per issuer, and a new issuer drops the token and 
     try testing.expectEqualSlices(FlowEffect, &.{.{ .authorize = 1 }}, out.effects());
     out = flowSteps(&f, &.{ .{ .responded = .{ .state_ok = true, .iss = .match, .advertised = true, .err = false } }, .{ .redeemed = true } });
     try testing.expectEqualSlices(FlowEffect, &.{.{ .signed_in = 1 }}, out.effects());
-    // The same issuer again: no registration.
     out = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 1 } } });
     try testing.expectEqualSlices(FlowEffect, &.{.{ .authorize = 1 }}, out.effects());
     _ = flowSteps(&f, &.{.cancel});
-    // Another issuer: the token goes, and a new registration.
     out = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 2, .scopes = 1 } } });
     try testing.expectEqualSlices(FlowEffect, &.{ .drop_token, .register }, out.effects());
 }
@@ -802,7 +778,6 @@ test "a step-up asks for the scopes held and challenged, and stops after three a
     try testing.expectEqual(@as(u8, 3), f.auths);
     out = flowSteps(&f, &.{.sign_in});
     try testing.expectEqualSlices(FlowEffect, &.{.refused}, out.effects());
-    // An accepted request starts the count over.
     _ = flowSteps(&f, &.{.accepted});
     out = flowSteps(&f, &.{.sign_in});
     try testing.expectEqualSlices(FlowEffect, &.{.discover}, out.effects());

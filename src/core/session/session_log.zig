@@ -184,10 +184,6 @@ pub const ConversationWriter = struct {
                     if (open_turn_offset != null) return error.InvalidConversationFrame;
                     open_turn_offset = frame.log_offset;
                     open_turn_prior_seq = writer.last_seq;
-                    // Cache position of this open turn's first frame: the
-                    // truncation mirror for an unfinished tail turn. Frames
-                    // served from a verified prefix point at their own offset;
-                    // frames teed now point at the writer's pre-append length.
                     open_turn_snapshot_len = frames.last_frame_snapshot_file_offset orelse
                         if (snapshot_tee) |tee| tee.len else null;
                 },
@@ -208,8 +204,6 @@ pub const ConversationWriter = struct {
             }
             try writer.applyReplayedEvent(envelope.seq, envelope.event);
             if (replay_scan) |scan| try scan.observe(frame.log_offset, envelope.seq, envelope.event);
-            // Tee only frames read from the log. Cache-sourced frames are
-            // already in the cache; re-appending them would duplicate it.
             if (snapshot_tee) |tee| {
                 if (frames.last_frame_snapshot_file_offset == null) tee.append(envelope, frame.log_offset, frame.log_bytes, frame.line_crc);
             }
@@ -233,8 +227,6 @@ pub const ConversationWriter = struct {
                 scan.last_seq = writer.last_seq;
                 if (!writer.turn_open) scan.active_user_offset = null;
             }
-            // The open turn's frames were already mirrored into the cache;
-            // truncate the cache to the same logical point.
             if (snapshot_tee) |tee| {
                 if (open_turn_snapshot_len) |snapshot_len| tee.truncateTo(snapshot_len);
             }
@@ -380,9 +372,6 @@ pub const ConversationWriter = struct {
     ) !void {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer mem_utils.deinit_arena(arena);
-        // A checkpoint can have already committed the recent execution prefix.
-        // Finalization supplies that prefix for model history; append only its
-        // not-yet-written suffix to the conversation log.
         const unwritten = if (self.turn_open) blk: {
             var progress: ConversationProgress = .{};
             try self.scanContext(alloc, &progress, null);
@@ -649,8 +638,6 @@ fn createConversationStorage(
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
-    // Fresh sessions keep the minimal durable footprint; the replay cache is
-    // built lazily by the first writable resume (see openConversationWritableSession).
     return ConversationWriter.init(alloc, file);
 }
 
@@ -743,9 +730,6 @@ fn writeConversationRecoveryState(
             alloc,
             projected,
         ) catch |err| switch (err) {
-            // The durable checkpoint is a resume aid, not turn-critical
-            // state. An oversized checkpoint keeps the previously persisted
-            // file and the turn continues; in-memory state still advances.
             error.RecoveryCheckpointTooLarge => {
                 debug_trace.logf(
                     "session",
@@ -768,8 +752,6 @@ fn writeConversationRecoveryState(
             recovery_checkpoint_file,
             bound_bytes,
         );
-        // A fresh checkpoint is a new recovery state; any prior suppression
-        // belonged to the turn it replaces.
         clearRecoveryAsked(dir);
     } else {
         dir.dir.deleteFile(io_mod.getIo(), recovery_checkpoint_file) catch |err| switch (err) {
@@ -1037,9 +1019,6 @@ fn projectRecoveryResult(
     result: types.PersistedToolResult,
 ) !types.PersistedToolResult {
     var projected = result;
-    // Only spill output the restore path can read back; larger inline output
-    // stays put and the oversize guard in writeConversationRecoveryState
-    // covers the checkpoint as a whole.
     if (projected.output_handle == null and
         projected.output.len > recovery_checkpoint_inline_output_max_bytes and
         projected.output.len <= result_store.stored_text_max_bytes)
@@ -1211,8 +1190,6 @@ fn load_conversation_state_at_boundary(
         var event_file = try openManagedFile(dir, events_file, .read_only);
         defer event_file.close(io_mod.getIo());
         const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
-        // Recovery boundaries keep the raw-log path; the snapshot cache covers
-        // only full loads, where a prefix replay splices into the live log.
         if (recovery != null) {
             var pure_log = HistoryFrameSource{ .log_file = event_file, .log_length = length, .limit = length };
             break :blk try replayConversationHistory(alloc, &pure_log, &conversation_seq, &open_work_id, replay_window);
@@ -1225,10 +1202,6 @@ fn load_conversation_state_at_boundary(
         defer if (history_source == null) frames.deinit(alloc);
         const result = replayConversationHistory(alloc, frames, &conversation_seq, &open_work_id, replay_window) catch |err| retry: {
             if (err == error.OutOfMemory or frames.verified == null) return err;
-            // A cache-sourced replay failure is a cache problem, not a log
-            // problem: retry once from the raw log so the cache can never fail
-            // a load. The writable caller owns rebuild decisions; read-only
-            // loads just fall back.
             debug_trace.logf("session", "history cache replay rejected id={s} err={s}; reading log", .{ expected_session_id, @errorName(err) });
             conversation_seq = 0;
             open_work_id = null;
@@ -1387,7 +1360,6 @@ fn scan_conversation_recovery(
         }, decoded.value) catch break;
         if (decoded.value.event == .context_checkpoint) {
             const coverage = decoded.value.event.context_checkpoint.covers_through_seq;
-            // Coverage is monotone, so historical cuts need only one extra scan.
             while (coverage_seq < coverage) {
                 const covered = (try session_replay.readBufferedLine(alloc, &coverage_lines, offset, null)) orelse
                     return error.SessionRecoveryBoundaryInvalid;
@@ -1403,7 +1375,6 @@ fn scan_conversation_recovery(
             error.InvalidConversationFrame => break :scan,
             else => return err,
         };
-        // A valid frame must also be replayable before it can extend the copy.
         reader.length = line.next_offset;
         if (reader.next() catch |err| switch (err) {
             error.InvalidConversationFrame, error.ConversationSizeOverflow => break :scan,
@@ -1641,9 +1612,6 @@ fn openConversationWritableSession(
     var event_file = try openManagedFile(&writable.dir, events_file, .read_write);
     const log_length = try event_file.length(io_mod.getIo());
 
-    // Verify the replay cache against the log, then scan from it. Any
-    // cache-origin failure discards the cache and retries from the raw log, so
-    // a bad cache can never block a resume.
     var source: ?HistoryFrameSource = null;
     var replay_scan: ConversationReplayScan = .{};
     var conversation_writer: ConversationWriter = undefined;
@@ -1658,8 +1626,6 @@ fn openConversationWritableSession(
                 break :blk null;
             }
         else if (log_length == 0)
-            // A brand-new conversation keeps the minimal durable footprint; the
-            // cache is built by the first resume with real content.
             null
         else
             history_snapshot.Writer.beginReplace(alloc, &writable.dir, writable.session_id) catch |err| blk: {
@@ -1682,12 +1648,6 @@ fn openConversationWritableSession(
                 return err;
             }
             if (used_cache) {
-                // A cache-backed scan failure is a cache problem, not a log
-                // problem: drop the cache and retry from the raw log once.
-                // The scan state observed partial cache frames, so it must be
-                // reset or the retry's first log frame fails seq continuity.
-                // The spent flag makes termination structural even when the
-                // delete itself fails and the next open verifies again.
                 debug_trace.logf("session", "history cache scan rejected id={s} err={s}; rebuilding from log", .{ writable.session_id, @errorName(err) });
                 history_snapshot.deleteForRebuild(&writable.dir);
                 replay_scan = .{};
@@ -1701,9 +1661,6 @@ fn openConversationWritableSession(
     }
     var frames = &source.?;
     errdefer frames.deinit(alloc);
-    // The cache is written only by the open-time scan tee; nothing appends at
-    // commit time, so the tee writer is finalized here and no writer state
-    // leaks into the session writer.
     if (snapshot_writer) |*writer| writer.finalize();
     snapshot_writer = null;
     errdefer conversation_writer.deinit();
@@ -1736,10 +1693,6 @@ fn openConversationWritableSession(
     errdefer state.deinit(alloc);
     if (state.recovery_checkpoint) |checkpoint| {
         if (checkpoint.cause == .compaction_prepared) {
-            // This checkpoint records completed source, not permission to run
-            // captured work. Make it ordinary interrupted history before a new
-            // prompt can replace the recovery slot. Sequence binding makes a
-            // crash after this append safe even if sidecar cleanup did not run.
             const timestamp = io_mod.milliTimestamp();
             try appendPersistedHistoryTurn(
                 alloc,
@@ -2020,9 +1973,6 @@ fn replayConversationHistory(
         }
         _ = frame_arena.reset(.retain_capacity);
     }
-    // A concurrent writer may have exposed a complete-record prefix of its
-    // final batched turn before sync. The next writable open truncates that
-    // incomplete turn; read-only replay returns the preceding complete turns.
     const completed = try history.toOwnedSlice(alloc);
     if (checkpoint_turn_open) {
         if (turn.user) |*user| {
@@ -2153,7 +2103,6 @@ pub fn loadConversationArchive(
         };
         if (opened) |with_cache| {
             if (with_cache.verified != null) {
-                // Keep the load bounded at open time, matching the raw-log path.
                 var bounded = with_cache;
                 bounded.limit = length;
                 source = bounded;
@@ -2304,8 +2253,6 @@ const ConversationReplayScan = struct {
 
     fn finish(self: *const ConversationReplayScan, alloc: Allocator, source: *HistoryFrameSource) !ConversationReplayWindow {
         var window = self.window;
-        // Coverage can precede the checkpoint: retain the recent exchanges
-        // between those boundaries rather than replaying only after the record.
         if (window.checkpoint_offset != null) {
             window.offset = 0;
             window.active_user_offset = null;
@@ -3464,8 +3411,6 @@ pub const LoadedWritableSession = struct {
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
         if (!self.freshly_started) return;
-        // A generated title (or a user rename) that landed before the first
-        // commit wins; the derived title only names an untitled session.
         const persisted = self.conversationTitle(alloc) catch |err| {
             debug_trace.logf(
                 "session",
@@ -3479,8 +3424,6 @@ pub const LoadedWritableSession = struct {
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
-        // The fallback placeholder is not a title: persisting it would block
-        // background title generation, which never overwrites a named session.
         if (std.mem.eql(u8, display.title, session_display_metadata.fallback_title)) return;
         _ = self.renameConversation(alloc, display.title) catch |err| {
             debug_trace.logf(
@@ -3742,8 +3685,6 @@ fn importLegacySnapshotStateWithOps(
     defer if (writer_owned) writer.deinit();
     for (converted.history, 0..) |turn, index| {
         if (turn == .compacted_summary) {
-            // Legacy archives can retain raw turns before the active summary.
-            // Earlier summaries stay archived without advancing that cut.
             const coverage = if (index > 0 and index == converted.context_history_start)
                 try writer.contextCoverage(alloc, .{ .turns = turn.compacted_summary.removed_turn_count }, &.{})
             else
@@ -3820,8 +3761,6 @@ fn importLegacySnapshotStateWithOps(
         metadata_bytes,
         metadata_ops,
     ) catch |err| {
-        // A failed directory sync can leave the new metadata visible. Keep
-        // both logs so recovery can select the metadata that survived.
         if (err == error.DurableReplacePostRenameFailed) metadata_published = true;
         return err;
     };
@@ -3853,8 +3792,6 @@ fn importLegacySnapshotStateWithOps(
         .{ writable.session_id, @errorName(err) },
     );
 
-    // Tee the freshly migrated log into a replay cache during the writer's
-    // open scan so legacy sessions are cache-backed from their first resume.
     var import_source = HistoryFrameSource{
         .log_file = event_file,
         .log_length = try event_file.length(io_mod.getIo()),
@@ -4128,11 +4065,6 @@ pub const Root = struct {
         if (!try hasConversationMetadata(alloc, &writable.dir)) {
             return error.SessionMigrationRequired;
         }
-        // Compact legacy fat logs (inline diff snapshots) before the open
-        // scan replays them. Pre-rename failures keep the original log intact
-        // and do not block resume. A post-rename directory-sync failure is
-        // persistence-uncertain and must stop the writer from appending to an
-        // inode whose directory entry is not known durable.
         if (session_compaction.compactIfNeeded(alloc, &writable.dir, writable.session_id, .{
             .test_controls = options.test_controls.compaction,
         })) |_| {} else |err| {
@@ -4250,10 +4182,6 @@ fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []co
     if (comptime @import("builtin").target.os.tag != .macos) {
         return parent.renamePreserve(staging, parent, target, io_mod.getIo());
     }
-    // Zig 0.16's Darwin preserve-rename used hard links, which cannot publish
-    // directories. Zig 0.17 calls renameatx_np as this does, but treats
-    // ENOTEMPTY as a programmer bug: a panic in Debug builds and
-    // error.Unexpected otherwise. fx keeps its own error mapping.
     const Darwin = struct {
         extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
     };
@@ -4789,20 +4717,17 @@ test "owner liveness marker reports unclean exit and clears on clean close" {
     var initial = try testState(alloc, "owner-liveness", 10);
     defer initial.deinit(alloc);
 
-    // A fresh start sees no leftover marker and writes its own while open.
     {
         var started = try temp.root.startConversationSession(alloc, initial, .{});
         try std.testing.expect(!started.log.previous_owner_died);
         try std.testing.expect(try entryExists(&started.log.dir, owner_live_file));
         started.deinit(alloc);
     }
-    // The clean close removed the marker, so the next open sees no death.
     {
         var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
         try std.testing.expect(!resumed.log.previous_owner_died);
         resumed.deinit(alloc);
     }
-    // A leftover marker simulates an owner that never reached deinit.
     {
         var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .writable);
         defer dir.close();
@@ -4813,7 +4738,6 @@ test "owner liveness marker reports unclean exit and clears on clean close" {
         try std.testing.expect(resumed.log.previous_owner_died);
         resumed.deinit(alloc);
     }
-    // A clean close after the detection clears the signal again.
     var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
     try std.testing.expect(!reopened.log.previous_owner_died);
     reopened.deinit(alloc);
@@ -4900,15 +4824,11 @@ test "writable resume degrades before rename and blocks post-rename uncertainty"
         }
     };
 
-    // A pre-rename failure leaves the original log authoritative, so resume
-    // proceeds through the normal scan.
     var degraded = try temp.root.resumeForWrite(alloc, initial.id, .{
         .test_controls = .{ .compaction = .{ .before_rename_fn = Faults.beforeRename } },
     });
     degraded.deinit(alloc);
 
-    // A post-rename sync failure blocks the writer. The next resume resolves
-    // the durable pending fence before opening the compacted log for append.
     try std.testing.expectError(
         error.SessionPersistenceUncertain,
         temp.root.resumeForWrite(alloc, initial.id, .{
@@ -4947,9 +4867,6 @@ test "first commit never persists the fallback placeholder as a title" {
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
 
-    // An unusable first prompt (a bare path reads as slash-command-only) must
-    // not persist the fallback title, or later title generation could never
-    // name the session.
     var initial = try testState(alloc, "fallback-title-skipped", 10);
     defer initial.deinit(alloc);
     {
@@ -4966,7 +4883,6 @@ test "first commit never persists the fallback placeholder as a title" {
         try std.testing.expect(title == null);
     }
 
-    // A usable first prompt still derives and persists a title.
     var second = try testState(alloc, "derived-title-kept", 10);
     defer second.deinit(alloc);
     {
@@ -4997,8 +4913,6 @@ test "an old session's usage file, readable or broken, is left alone and does no
         loaded.deinit(alloc);
         var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
         defer dir.close();
-        // Sessions saved before /usage read provider reports kept their
-        // usage in this file.
         const old_usage_file = "usage-v2.json";
         const contents = if (readable) "{\"schema_version\":2}" else "{broken accounting";
         try io_mod.durableReplaceVerified(alloc, &dir, old_usage_file, contents);
@@ -5293,8 +5207,6 @@ test "legacy import recovery restores old authority or keeps published current d
         ));
     }
 
-    // Recreate a current-format session to prove that a crash after metadata
-    // publication keeps the new log and only removes the old backup.
     try temp.root.sessions.?.dir.deleteTree(io_mod.getIo(), initial.id);
     {
         var loaded = try temp.root.startConversationSession(alloc, initial, .{});
@@ -5835,7 +5747,6 @@ test "root session creation allocation failures leave no published state" {
             return error.ExpectedAllocationFailure;
         } else |err| {
             try std.testing.expect(failing.has_induced_failure);
-            // Existing allocating JSON writers surface allocation loss as WriteFailed.
             try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
         }
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
@@ -6348,17 +6259,14 @@ test "recovery ask marker stays sticky across resumes and follows the checkpoint
         markRecoveryAsked(alloc, &loaded.log.dir);
         try std.testing.expect(recoveryWasAsked(&loaded.log.dir));
     }
-    // The marker survives a clean close: a later resume still sees it.
     {
         var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
         defer resumed.deinit(alloc);
         try std.testing.expect(recoveryWasAsked(&resumed.log.dir));
-        // A fresh checkpoint resets the suppression.
         _ = try resumed.appendEvent(alloc, .{
             .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
         }, 30);
         try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
-        // Clearing the checkpoint clears the marker.
         markRecoveryAsked(alloc, &resumed.log.dir);
         _ = try resumed.appendEvent(alloc, .{
             .recovery_checkpoint_cleared = .{},
@@ -6440,7 +6348,6 @@ test "recovery checkpoint spills oversized tool outputs and reload restores them
             session_codec.max_recovery_checkpoint_bytes + 128,
         );
         defer alloc.free(bytes);
-        // The spilled body and the truncated inline body stay out of the file.
         try std.testing.expect(std.mem.find(u8, bytes, "ENDMARKER") == null);
         try std.testing.expect(std.mem.find(u8, bytes, "TRUNCATED-INLINE") == null);
         try std.testing.expect(std.mem.find(u8, bytes, "result-command-") != null);
@@ -6455,7 +6362,6 @@ test "recovery checkpoint spills oversized tool outputs and reload restores them
         try std.testing.expectEqual(big.len, restored_results[0].output.len);
         try std.testing.expect(std.mem.endsWith(u8, restored_results[0].output, "ENDMARKER"));
         try std.testing.expectEqualStrings("tiny output", restored_results[1].output);
-        // Truncated results restore as their stored-result placeholder.
         try std.testing.expect(std.mem.find(u8, restored_results[2].output, "read_tool_result") != null);
     }
 }
@@ -6490,11 +6396,9 @@ test "oversized recovery checkpoint keeps the previous durable checkpoint" {
         _ = try loaded.appendEvent(alloc, .{
             .recovery_checkpoint_set = .{ .checkpoint = first },
         }, 20);
-        // The oversized checkpoint must not fail the session update.
         _ = try loaded.appendEvent(alloc, .{
             .recovery_checkpoint_set = .{ .checkpoint = oversized },
         }, 21);
-        // In-memory state still advances to the freshest checkpoint.
         try std.testing.expectEqual(@as(u64, 9), loaded.state.recovery_checkpoint.?.turn_id);
         const bytes = try readManagedFileAlloc(
             alloc,
@@ -6503,7 +6407,6 @@ test "oversized recovery checkpoint keeps the previous durable checkpoint" {
             session_codec.max_recovery_checkpoint_bytes + 128,
         );
         defer alloc.free(bytes);
-        // The durable file keeps the last persistable checkpoint.
         try std.testing.expect(std.mem.find(u8, bytes, "\"turn_id\":7") != null);
         try std.testing.expect(std.mem.find(u8, bytes, "\"turn_id\":9") == null);
     }
@@ -6521,7 +6424,6 @@ test "tool-result spill keeps an over-cap checkpoint persistable and resumable" 
     var initial = try testState(alloc, "conversation-recovery-rescue", 10);
     defer initial.deinit(alloc);
 
-    // Seventeen 4 MiB results would serialize past the 64 MiB cap if kept inline.
     const result_count = 17;
     const output_len = 4 * 1024 * 1024;
     var outputs: [result_count][]u8 = undefined;
@@ -6647,7 +6549,6 @@ test "committed edit diff snapshots spill out of the conversation log" {
             .turn = turn,
         } }, 20);
 
-        // The log frame references the artifact; the snapshots stay out of it.
         const log_bytes = try readManagedFileAlloc(alloc, &loaded.log.dir, events_file, 1024 * 1024);
         defer alloc.free(log_bytes);
         try std.testing.expect(std.mem.find(u8, log_bytes, "\"content_handle\":\"diff-") != null);
@@ -6655,7 +6556,6 @@ test "committed edit diff snapshots spill out of the conversation log" {
         try std.testing.expect(std.mem.find(u8, log_bytes, "NEWMARKER") == null);
     }
 
-    // Resume restores the handle, not the inline contents.
     var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
     defer resumed.deinit(alloc);
     const restored = resumed.state.history[0].assistant.execution.tool_steps[0].tool_results[0];
@@ -6667,7 +6567,6 @@ test "committed edit diff snapshots spill out of the conversation log" {
     try std.testing.expect(presentation.after_content == null);
     try std.testing.expectEqual(@as(usize, 2), presentation.lines.len);
 
-    // The artifact resolves back to the exact snapshots.
     const session_base = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
     defer alloc.free(session_base);
     const result_dir = try std.Io.Dir.path.join(alloc, &.{ session_base, "tool-results" });
@@ -7008,7 +6907,6 @@ test "recovery checkpoint spill failure keeps the result inline" {
     var loaded = try temp.root.startConversationSession(alloc, initial, .{});
     defer loaded.deinit(alloc);
 
-    // Block the result store: tool-results exists as a regular file.
     const session_path = try std.Io.Dir.path.join(alloc, &.{ temp.home, ".fx", "sessions", initial.id });
     defer alloc.free(session_path);
     var session_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), session_path, .{});
@@ -7016,7 +6914,6 @@ test "recovery checkpoint spill failure keeps the result inline" {
     var bogus = try session_dir.createFile(io_mod.getIo(), "tool-results", .{});
     bogus.close(io_mod.getIo());
 
-    // The store failure must not block the checkpoint write.
     _ = try loaded.appendEvent(alloc, .{
         .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
     }, 20);
@@ -7054,8 +6951,6 @@ test "committed conversation supersedes recovery after interrupted cleanup" {
         _ = try loaded.appendEvent(alloc, .{
             .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
         }, 20);
-        // Model a process death after the durable conversation append but
-        // before recovery cleanup by using the writer at that boundary.
         try loaded.conversation_writer.appendHistoryTurn(alloc, 30, .{ .assistant = .{
             .user = checkpoint.user,
             .assistant = @constCast("finished answer"),
@@ -7196,15 +7091,12 @@ test "history snapshot cache builds on writable resume and replays identically" 
     try buildTwoTurnSession(alloc, &temp, id);
     try std.testing.expect(!try cacheFileExists(alloc, &temp, id));
 
-    // First resume builds the cache during the writable-open scan.
     var first = try temp.root.resumeForWrite(alloc, id, .{});
     const cached_history = try dupeHistory(alloc, first.state.history);
     defer session.freeHistoryTurnSlice(alloc, cached_history);
     first.deinit(alloc);
     try std.testing.expect(try cacheFileExists(alloc, &temp, id));
 
-    // Second resume reads the cache. Verify via the source that the snapshot
-    // verifies against the log, then compare history content.
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
@@ -7223,8 +7115,6 @@ test "history snapshot cache builds on writable resume and replays identically" 
     var second = try temp.root.resumeForWrite(alloc, id, .{});
     const snapshot_history = try dupeHistory(alloc, second.state.history);
     defer session.freeHistoryTurnSlice(alloc, snapshot_history);
-    // A new turn commits only to the log; the next resume splices the log
-    // suffix onto the cached prefix and re-tees the cache forward.
     const cache_size_before = try cacheFileSize(alloc, &temp, id);
     var third_state = try testState(alloc, id, 40);
     defer third_state.deinit(alloc);
@@ -7242,15 +7132,12 @@ test "history snapshot cache builds on writable resume and replays identically" 
     try expectSameHistory(cached_history, snapshot_history);
 
     var third = try temp.root.resumeForWrite(alloc, id, .{});
-    // The suffix replay sees the appended turn without a rebuild.
     try expectSameHistory(snapshot_history, third.state.history[0..2]);
     try std.testing.expectEqual(@as(usize, 3), third.state.history.len);
     try std.testing.expectEqualStrings("mirror question", third.state.history[2].assistant.user.text);
     try std.testing.expect(try cacheFileSize(alloc, &temp, id) > cache_size_before);
     third.deinit(alloc);
 
-    // Deleting the cache falls back to the full log replay with identical
-    // content, and the writable resume rebuilds the cache.
     try deleteCacheFileForTest(alloc, &temp, id);
     var fourth = try temp.root.resumeForWrite(alloc, id, .{});
     defer fourth.deinit(alloc);
@@ -7270,9 +7157,6 @@ test "history snapshot resume reads cached content over a middle-rewritten log" 
     first.deinit(alloc);
     try std.testing.expect(try cacheFileExists(alloc, &temp, id));
 
-    // Rewrite a middle log line in place, preserving total length and the
-    // final line: the watermark cannot see it, and this test pins that a
-    // verified cache serves its own content for the covered prefix.
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
@@ -7307,8 +7191,6 @@ test "history snapshot tolerates torn cache tails and spliced log growth" {
     first.deinit(alloc);
     try std.testing.expect(try cacheFileExists(alloc, &temp, id));
 
-    // Tear the cache tail mid-frame: the valid prefix shortens and the resume
-    // splices the uncovered log suffix.
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
@@ -7325,9 +7207,6 @@ test "history snapshot tolerates torn cache tails and spliced log growth" {
     torn.deinit(alloc);
     try expectSameHistory(baseline, torn_history);
 
-    // A third turn committed through the live session lands only in the log
-    // (nothing mirrors at commit time); the next resume replays it as a log
-    // suffix over the cached prefix and re-tees the cache forward.
     {
         var loaded = try temp.root.resumeForWrite(alloc, id, .{});
         var initial = try testState(alloc, id, 40);
@@ -7351,8 +7230,6 @@ test "history snapshot tolerates torn cache tails and spliced log growth" {
     try expectSameHistory(baseline, rebuilt_history[0..2]);
     try std.testing.expectEqualStrings("third question", rebuilt_history[2].assistant.user.text);
 
-    // Corrupt the last cache frame's payload: CRC mismatch shortens the
-    // prefix, the log suffix covers the rest.
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);

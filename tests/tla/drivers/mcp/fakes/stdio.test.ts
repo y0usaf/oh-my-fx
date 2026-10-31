@@ -1,6 +1,3 @@
-// Tests for the scripted fake stdio server.
-//
-//   bun test ./tests/tla/drivers/mcp/fakes/stdio.test.ts
 
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -30,7 +27,7 @@ async function exchange(rules: Rule[], lines: string[], flags: string[] = []) {
     try {
       return JSON.parse(l);
     } catch {
-      return l; // deliberately malformed output from a `raw` rule
+      return l;
     }
   };
   const out = (await new Response(proc.stdout).text()).split("\n").filter(Boolean).map(parse);

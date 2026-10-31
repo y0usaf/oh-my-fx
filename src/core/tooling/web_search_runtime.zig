@@ -50,7 +50,6 @@ const OwnedInputs = struct {
     worker_model: []u8,
     gateway_retry_count: usize,
     gateway_chat_url: []u8,
-    // The usage pointer and allocator borrow the parent session's lifetime.
 
     fn deinit(self: *OwnedInputs, alloc: Allocator) void {
         alloc.free(self.api_key);

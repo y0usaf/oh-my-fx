@@ -19,7 +19,6 @@ if (scenario) {
   assert(scenarios.includes(scenario));
   await runScenario(scenario);
 } else {
-  // A blocked cooperative loop must fail the test, not hang the entire SDK lane.
   for (const name of scenarios) {
     const child = spawn(process.execPath, ["--experimental-wasm-jspi", script, wasmPath, name], {
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", FX_SOUND: "0", FX_E2E_DISABLE_DOTENV: "1" },
@@ -98,10 +97,6 @@ async function runScenario(name) {
   const wasm = await readFile(wasmPath);
   const head = "HOST_HISTORY_HEAD_73b4", tail = "HOST_HISTORY_TAIL_b149";
   let handoff;
-  // Each ordinary reply is larger than the turns kept unchanged, so older turns
-  // compact. Plain turns need no model call, but the first message sets a rule,
-  // so compacting asks the model to file it. Three of them stay below the
-  // automatic threshold, even with a cancelled attempt's followup.
   const automatic = name === "auto-cancel-headers";
   const seedTurns = automatic ? 1 : 3;
   const seedRule = "Always keep the history markers.";
@@ -138,12 +133,9 @@ async function runScenario(name) {
     }
     const body = JSON.parse(typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body));
     requests.push(body);
-    // A compaction request writes the turns out without tools, or follows the
-    // conversation with the notes request.
     const notesAfterConversation = JSON.stringify(body.messages?.at(-1) ?? "").includes("Write the compaction notes for the turns of the conversation above");
     if ((body.toolChoice?.type === "none" && body.tools?.length === 0) || notesAfterConversation) {
       summaries++;
-      // Retained windows vary by model; summarize only markers actually supplied.
       const source = JSON.stringify(body);
       const markers = [head, tail].filter((marker) => source.includes(marker));
       handoff = `Rules:\n- R1 (M1): "${seedRule}"\n\nFacts:\n- F1 (M1): HOST_INTERNAL_HANDOFF_268a: preserve ${markers.join(" and ")}; follow the latest request.`;
@@ -239,7 +231,6 @@ async function runScenario(name) {
     await stop();
     phase = "attempt";
     await start(["--resume", sessionId]);
-    // A known context window bounds the turns kept unchanged, so older turns compact.
     active.runtime.write("/model\r");
     await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("tab provider"), "model capabilities loaded");
     active.runtime.write("\x1b");

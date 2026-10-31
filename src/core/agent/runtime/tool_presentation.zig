@@ -49,8 +49,6 @@ fn fallbackToolDisplay(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
 ) []const u8 {
-    // Provider-executed search backends are never registered locally; their
-    // stream names (exa_search, ...) are internal identifiers, not display copy.
     if (tooling_presentation.isProviderSearchAlias(tool_name)) return "web search";
     const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
         "shell"
@@ -1456,7 +1454,6 @@ pub fn formatToolStatusWithStats(
     const accent = "\x1b[38;5;252m";
     const dim = "\x1b[38;5;245m";
     const reset = "\x1b[0m";
-    // Fall back to the neutral accent when no marker color is supplied.
     const add_style = if (markers.added.len != 0) markers.added else accent;
     const rem_style = if (markers.removed.len != 0) markers.removed else accent;
     if (additions > 0 and deletions > 0) {
@@ -3033,8 +3030,6 @@ test "cancelled shell wait names the observation instead of the process" {
     ) != null);
 }
 
-// Secret-shaped test needles are written as concatenated fragments so
-// interactive tool-result masking never rewrites the literal in flight.
 test "failure status detail masks secret-shaped failure output" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -48,7 +48,6 @@ fn exchange(raw_state: *anyopaque, alloc: Allocator, request: message_carrier.Re
     };
     var phase: enum { unsent, sent, settled } = .unsent;
     errdefer switch (phase) {
-        // The client never saw this request, so there is nothing to cancel.
         .unsent => server.discardOutboundRequest(state, outbound_id),
         .sent => abandon(state, outbound_id),
         .settled => {},

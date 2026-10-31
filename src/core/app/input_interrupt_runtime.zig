@@ -89,8 +89,6 @@ pub fn InterruptRuntime(comptime App: type) type {
                 return;
             }
             if (!app.stream.active) return;
-            // Pending approval keeps the stream active until resolution.
-            // Avoid duplicate cancellation notices once the worker is cancelled.
             if (app.worker.isCancelRequested()) return;
             const compacting = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) blk: {
                 const observed = app.worker.compactionActivitySnapshot();

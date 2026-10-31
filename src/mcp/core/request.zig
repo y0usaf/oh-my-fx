@@ -537,7 +537,6 @@ test "a paused idle timer never fires, and resuming arms a full one; the hard ti
     try table.step(.{ .idle_paused = 1 }, &out);
     try testing.expectEqual(@as(usize, 0), out.effects().len);
     try testing.expect(out.transition == null);
-    // The idle timer armed at send is stale, and progress arms none.
     try table.step(.{ .timer_fired = .{ .id = 1, .kind = .idle, .generation = 1 } }, &out);
     try testing.expectEqual(Status.inflight, table.status(1));
     try table.step(.{ .progress_received = .{ .token = 1, .value = 1 } }, &out);
@@ -550,7 +549,6 @@ test "a paused idle timer never fires, and resuming arms a full one; the hard ti
     try testing.expectEqual(@as(u32, 60_000), armed.after_ms);
     try table.step(.{ .timer_fired = armed.timer }, &out);
     try testing.expectEqual(Status.done, table.status(1));
-    // While paused, the hard timer still ends a request.
     try table.step(.{ .send = .normal }, &out);
     try table.step(.{ .idle_paused = 2 }, &out);
     try table.step(.{ .timer_fired = .{ .id = 2, .kind = .hard, .generation = 0 } }, &out);
@@ -573,7 +571,6 @@ test "progress counts only in flight and only when it increases; it re-arms only
         try testing.expectEqual(@as(u32, 1), out.transition.?.state.?.progress);
     }
 
-    // The idle timer from before the progress is stale; the current one counts.
     try table.step(.{ .timer_fired = .{ .id = 1, .kind = .idle, .generation = 1 } }, &out);
     try testing.expectEqual(Status.inflight, table.status(1));
     try table.step(.{ .progress_received = .{ .token = 1, .value = 0.7 } }, &out);
@@ -616,7 +613,6 @@ const Observed = struct {
     fn check(observed: *Observed, table: *const Table, event: Event, before: Status, out: *const Output) !void {
         for (out.effects()) |effect| switch (effect) {
             .write_request => |w| {
-                // IdsNeverReused: every new id is above all earlier ones.
                 try testing.expect(w.id > observed.highest_sent);
                 observed.highest_sent = w.id;
                 observed.initialize[at(w.id)] = w.kind == .initialize;
@@ -624,13 +620,7 @@ const Observed = struct {
             },
             .deliver => |d| {
                 observed.delivered[at(d.id)] += 1;
-                // AtMostOneOutcome.
                 try testing.expect(observed.delivered[at(d.id)] <= 1);
-                // Each outcome comes only from its own event. This covers
-                // PeerOutcomesFromPeer (results and peer errors only from a
-                // response) and CancelledByClientOnly (cancelled only from the
-                // client's cancel), and sends, progress, and server cancels
-                // never end a request.
                 const allowed: Outcome = switch (event) {
                     .response_received => |r| switch (r.response) {
                         .result => .result,
@@ -639,30 +629,22 @@ const Observed = struct {
                     .cancel_requested => .cancelled,
                     .timer_fired => .timed_out,
                     .transport_lost => .lost,
-                    // EndedOnlyListen: a server ends only a listen.
                     .server_cancel_received => |id| if (observed.listen[at(id)]) .ended else .none,
-                    // Pausing and resuming the idle timer end nothing.
                     .send, .progress_received, .idle_paused, .idle_resumed => .none,
                 };
                 try testing.expectEqual(allowed, d.outcome);
-                // ListenNeverTimesOut.
                 if (observed.listen[at(d.id)]) try testing.expect(d.outcome != .timed_out);
             },
             .send_cancel => |id| {
-                // CancelValid and NeverCancelInitialize.
                 try testing.expect(before == .inflight);
                 try testing.expect(!observed.initialize[at(id)]);
                 const outcome = deliveredOutcome(out).?;
                 try testing.expect(outcome == .cancelled or outcome == .timed_out);
                 observed.cancelled_signal[at(id)] = true;
             },
-            // A listen arms no timer.
             .arm_timer => |a| try testing.expect(!observed.listen[at(a.timer.id)]),
             .disarm_timers => {},
         };
-        // Where the model has no choice, the core must act: a request in
-        // flight ends on its response, a transport loss, a cancel (unless it
-        // is initialize), or its hard timeout.
         if (before == .inflight) {
             const expected: ?Outcome = switch (event) {
                 .response_received => |r| switch (r.response) {
@@ -677,11 +659,9 @@ const Observed = struct {
             };
             if (expected) |outcome| try testing.expectEqual(outcome, deliveredOutcome(out).?);
         }
-        // The reported transition agrees with the table.
         if (out.transition) |t| {
             try testing.expectEqual(before, t.from);
             try testing.expectEqual(table.status(t.id), t.to);
-            // OutcomeIffDone: a request is done exactly when it was delivered once.
             if (t.id < max_ids) try testing.expectEqual(t.to == .done, observed.delivered[at(t.id)] == 1);
         }
     }
@@ -727,7 +707,6 @@ fn explore(slots: [2]Slot, next_id: Id, observed: Observed, depth: usize, steps:
         var out: Output = .{};
         table.step(event, &out) catch |err| switch (err) {
             error.TooManyInFlight, error.InitializeNotCancellable => {
-                // A refused step must change nothing.
                 for (slots, child_slots) |a, b| try testing.expect(std.meta.eql(a, b));
                 continue;
             },

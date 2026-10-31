@@ -158,7 +158,6 @@ pub const Payload = struct {
 pub fn highestIds(payload: Payload) [entry_kinds.len]usize {
     var highest = payload.highest;
     for (payload.entries) |entry| {
-        // A saved checkpoint is read back from disk, where an ID may be malformed.
         if (!isEntryId(entry.id)) continue;
         const kind = std.mem.findScalar(u8, entry_kinds, entry.id[0]).?;
         const number = std.fmt.parseUnsigned(usize, entry.id[1..], 10) catch continue;
@@ -265,8 +264,6 @@ pub fn parse(arena: Allocator, summary: []const u8) Allocator.Error!?Payload {
 }
 
 fn unreadable(summary: []const u8, reason: []const u8) ?Payload {
-    // Every prompt parses the checkpoint, so this stays out of the bounded
-    // /trace ring.
     debug_trace.logf("context_compaction", "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, reason });
     return null;
 }
@@ -639,7 +636,6 @@ test "payload checkpoints round trip and render each turn in order, then the ent
 
 test "the turn in progress shows its summary, added messages and tools" {
     const alloc = testing.allocator;
-    // Written before tool lines, so its tools show as a range.
     const text = try render(alloc, .{
         .turns = &.{},
         .open = .{ .users = &.{"use the staging db"}, .work = "Ran the migration dry run (T1).", .text = "exact text", .first_tool = 1, .last_tool = 1 },
@@ -712,7 +708,6 @@ test "the shape check passes what compaction builds and names what breaks it" {
     bad.entries = &.{ earlier.entries[0], .{ .id = "S1", .text = "tests pass" } };
     try testing.expectEqualStrings("an entry does not start with its ID", shapeProblem(earlier, bad).?);
 
-    // A folded compaction keeps its ledgers and the numbers used so far.
     var folded = earlier;
     folded.ledger_count = 2;
     folded.highest = .{ 0, 4, 0, 0, 0 };
@@ -780,7 +775,6 @@ test "older checkpoints yield their exact users from the named state file" {
     try testing.expectEqualStrings("Earlier work.", payload.earlier);
     try testing.expectEqual(@as(usize, 0), payload.tool_count);
     try testing.expectEqual(@as(usize, 0), payload.turn_count);
-    // Bytes that do not match the checkpoint are not trusted.
     try testing.expect(try parseLegacyState(arena, ref, state[0 .. state.len - 1]) == null);
     try testing.expect(legacyStateRef(legacy_handoff_open ++ "no state here") == null);
     try testing.expect(legacyStateRef(marker ++ "{}") == null);

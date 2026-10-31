@@ -66,7 +66,6 @@ pub const Reader = struct {
                     }
                     if (value.len > self.max_event_bytes - self.data.items.len) return error.EventTooLarge;
                     if (!saw_data and self.line.items.len > 0) {
-                        // Reuse owned split-line storage instead of retaining a second large payload.
                         @memmove(self.line.items[0..value.len], value);
                         self.line.items.len = value.len;
                         std.mem.swap(std.ArrayList(u8), &self.line, &self.data);
@@ -75,7 +74,6 @@ pub const Reader = struct {
                 },
             }
         }
-        // EOF is not an event delimiter; consumers still require terminal proof.
         return null;
     }
 

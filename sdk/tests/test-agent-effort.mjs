@@ -66,7 +66,6 @@ async function runPrompt(agent) {
   return turn.result;
 }
 
-// An advertised effort is validated at creation and applied to the turn request.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: { id: "sdk/core-model", effort: "high" } });
@@ -78,7 +77,6 @@ async function runPrompt(agent) {
   await agent.close();
 }
 
-// An effort the model does not advertise rejects with the supported set.
 {
   const gateway = mockGateway();
   await assert.rejects(
@@ -96,7 +94,6 @@ async function runPrompt(agent) {
   assert.equal(gateway.state.catalogFetches, 1);
 }
 
-// A model without reasoning effort options rejects any named effort.
 {
   const gateway = mockGateway();
   await assert.rejects(
@@ -112,7 +109,6 @@ async function runPrompt(agent) {
   assert.equal(gateway.state.catalogFetches, 1);
 }
 
-// Malformed effort values are rejected before any runtime or network work.
 {
   const gateway = mockGateway();
   await assert.rejects(
@@ -131,7 +127,6 @@ async function runPrompt(agent) {
   assert.equal(gateway.state.chatBodies.length, 0);
 }
 
-// Model-object options must not silently override legacy top-level settings.
 {
   const gateway = mockGateway();
   for (const options of [
@@ -154,7 +149,6 @@ async function runPrompt(agent) {
   assert.equal(gateway.state.catalogFetches, 0);
 }
 
-// The model default needs no validation fetch and sends no reasoning field.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/core-model", effort: "default" });
@@ -164,7 +158,6 @@ async function runPrompt(agent) {
   await agent.close();
 }
 
-// Without the option, creation and prompts behave exactly as before.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/core-model" });

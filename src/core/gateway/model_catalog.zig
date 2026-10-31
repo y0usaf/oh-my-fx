@@ -454,8 +454,6 @@ const FeaturedPickerFamily = struct {
     count: usize,
 };
 
-// These are product preferences, but the model version in each slot always
-// comes from the live Gateway catalog instead of a pinned model ID.
 const featured_picker_families = [_]FeaturedPickerFamily{
     .{ .family = "anthropic/claude-fable", .count = 1 },
     .{ .family = "openai/gpt", .count = 1 },
@@ -489,9 +487,6 @@ pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const M
     }
     sort_utils.sort([]const u8, providers.items, {}, lessThanStrings);
 
-    // After the product highlights, scan providers alphabetically. Each
-    // provider contributes its current models, rather than inheriting the
-    // Gateway's global quality ranking.
     for (providers.items) |provider| {
         while (pickerProviderSelectionCount(selected.items, provider) < pickerProviderLimit(provider)) {
             const candidate = newestUnselectedPickerProviderCandidate(candidates, provider, selected.items) orelse break;
@@ -499,7 +494,6 @@ pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const M
         }
     }
 
-    // Highlights stay on top; the rest of the catalog follows so any model is selectable.
     for (candidates) |candidate| {
         if (pickerCatalogContains(selected.items, candidate.id)) continue;
         try appendClonedModelCatalogEntry(alloc, &selected, candidate);
@@ -619,7 +613,6 @@ fn isPickerProviderCandidate(provider: []const u8, candidate: ModelCatalogEntry,
 }
 
 fn pickerFamilyLimit(family: []const u8) usize {
-    // Let the picker show two general models next to one coding-focused model.
     if (std.mem.eql(u8, family, "openai/gpt")) return 2;
     if (std.mem.eql(u8, family, "openai/gpt-codex")) return 1;
     return extended_picker_provider_limit;

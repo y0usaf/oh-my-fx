@@ -94,8 +94,6 @@ pub const AutoUpgrade = struct {
 
     fn requestStop(self: *AutoUpgrade) void {
         self.should_stop.store(true, .release);
-        // Wake a thread blocked in a transfer read so it can observe the
-        // cancel flag instead of stalling on the socket.
         self.transfer_interrupt.interrupt();
     }
 
@@ -118,9 +116,6 @@ pub const AutoUpgrade = struct {
         if (self.stopped.load(.acquire)) {
             t.join();
         } else {
-            // The thread is stuck in a network read; process exit reaps it.
-            // downloadAndInstall rechecks should_stop before touching the
-            // executable, so a late wake-up cannot install.
             debug_trace.logf("upgrade", "stop detaching upgrade thread mid-transfer", .{});
         }
         self.thread = null;
@@ -390,7 +385,6 @@ test "download sweep removes only stale upgrade directories" {
     sweepStaleDownloadDirs(base, created_ns + stale_download_dir_ns - 1);
     _ = try tmp.dir.statFile(zio, download_dir_prefix ++ "abandoned", .{});
 
-    // Far past every entry's age limit, only prefixed directories go.
     sweepStaleDownloadDirs(base, created_ns + 10 * stale_download_dir_ns);
     try std.testing.expectError(
         error.FileNotFound,
@@ -422,8 +416,6 @@ test "process-exit stop waits out an install already under way" {
 test "no install starts after a process-exit stop" {
     var au = AutoUpgrade{};
     au.stopForProcessExit();
-    // Without the stop check, the copy of these missing paths would fail
-    // with InstallFailed instead.
     try std.testing.expectError(
         error.Cancelled,
         au.installUnlessStopped(std.testing.allocator, "/nonexistent/fx-extracted", "/nonexistent/fx"),
@@ -458,8 +450,6 @@ test "stop detaches instead of blocking on a stuck upgrade thread" {
     var blocker = std.atomic.Value(bool).init(false);
     const t = try std.Thread.spawn(.{}, struct {
         fn run(block: *std.atomic.Value(bool)) void {
-            // Never reports stopped; simulates a thread wedged in a network
-            // read. The blocker keeps it alive until the test process moves on.
             while (!block.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
         }
     }.run, .{&blocker});

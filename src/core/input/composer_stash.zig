@@ -100,7 +100,6 @@ test "composer stash round trip preserves draft text, cursor, and selection" {
     try std.testing.expectEqual(@as(?usize, null), edit.selection_anchor);
     try std.testing.expectEqual(@as(?usize, null), vertical.preferred_column);
 
-    // The borrowing flow runs on the fresh composer.
     try edit.input.appendSlice(alloc, "query");
     edit.cursor = 5;
 
@@ -159,7 +158,6 @@ test "composer stash round trip preserves registered entities" {
     try std.testing.expectEqual(@as(usize, 0), entities.skill_tokens.items.len);
     try std.testing.expectEqual(@as(usize, 1), entities.next_paste_id);
 
-    // Flow-era registrations (e.g. a paste into the menu query) are torn down.
     try entities.pasted_blocks.append(alloc, .{
         .id = 99,
         .text = try alloc.dupe(u8, "flow"),
@@ -209,7 +207,6 @@ test "composer stash round trip preserves undo history and drops flow edits" {
     defer stash.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), history.undo_stack.items.len);
 
-    // Flow-era edits record their own undo entries, all discarded on restore.
     try edit.input.appendSlice(alloc, "x");
     var flow_edit = try history.prepare(alloc, 0, "", "x", 0, 1);
     history.commit(alloc, &flow_edit);

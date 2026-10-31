@@ -239,8 +239,6 @@ fn parseJevDecision(alloc: Allocator, body: []const u8) error{ Malformed, OutOfM
         return error.Malformed;
     var result = JevDecision{ .decision = if (choice.len == 5) "clear" else "caution" };
     if (decision_answer.object.get("confidence")) |confidence| result.confidence = numberValue(confidence);
-    // The gateway envelope carries per-question confidence under
-    // providerMetadata instead of inside the answer.
     if (result.confidence == null) {
         if (root.object.get("providerMetadata")) |metadata| {
             if (metadata == .object) {
@@ -264,8 +262,6 @@ fn parseJevDecision(alloc: Allocator, body: []const u8) error{ Malformed, OutOfM
     }
     if (root.object.get("usage")) |usage| {
         if (usage == .object) {
-            // TypeSafe direct uses snake_case; the gateway envelope uses
-            // camelCase.
             if (usage.object.get("input_tokens") orelse usage.object.get("inputTokens")) |value| {
                 if (value == .integer) result.input_tokens = @intCast(value.integer);
             }
@@ -598,7 +594,6 @@ const FakeJevServer = struct {
         const zio = self.io_backend.io();
         var stream = try self.server.accept(zio);
         defer stream.close(zio);
-        // Read the request head (captured for assertions) and discard the body.
         var socket_buffer: [4096]u8 = undefined;
         var reader = stream.reader(zio, &socket_buffer);
         var head_bytes: usize = 0;

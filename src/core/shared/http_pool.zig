@@ -86,8 +86,6 @@ pub const HttpPool = struct {
         const uri = std.Uri.parse(url) catch return;
         const protocol = std.http.Client.Protocol.fromUri(uri) orelse return;
         if (protocol == .tls) {
-            // Client.connect skips the TLS preamble that Client.request
-            // performs; Tls.create requires ca_bundle loaded and now set.
             self.ensureTlsReady() catch |err| {
                 debug_trace.logf("gateway", "pool_warm result=error stage=tls_init err={s}", .{@errorName(err)});
                 return;
@@ -126,7 +124,7 @@ pub const HttpPool = struct {
         bundle.rescan(client.allocator, io, now) catch return error.CertificateBundleLoadFailure;
         try client.ca_bundle_lock.lock(io);
         defer client.ca_bundle_lock.unlock(io);
-        if (client.now != null) return; // a concurrent request loaded it first
+        if (client.now != null) return;
         client.now = now;
         std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
     }
@@ -184,7 +182,6 @@ pub const HttpPool = struct {
         defer self.setup_lock.unlock(io);
         client.ca_bundle_lock.lockUncancelable(io);
         defer client.ca_bundle_lock.unlock(io);
-        // Unloaded: std's request preamble sets the clock with the bundle.
         if (client.now == null) return;
         client.now = std.Io.Clock.real.now(io);
     }
@@ -208,22 +205,18 @@ pub const HttpPool = struct {
         };
         var drained: usize = 0;
         while (true) {
-            // A cancelled drain stops early and leaves the cancellation pending.
             const conn = (self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
                 error.Canceled => {
                     io.recancel();
                     break;
                 },
             }) orelse break;
-            // findConnection moves the connection to the used list; unlink it
-            // there before destroying, since destroy does not touch the lists.
             self.client.connection_pool.mutex.lockUncancelable(io);
             self.client.connection_pool.used.remove(&conn.pool_node);
             self.client.connection_pool.mutex.unlock(io);
             conn.destroy(io);
             drained += 1;
         }
-        // Refresh the stamp so a run of misses does not re-drain every call.
         self.last_activity_ms.store(now, .release);
         if (drained > 0) {
             debug_trace.logf("gateway", "pool_drain_stale count={d} idle_ms={d} ttl_ms={d}", .{ drained, idle_ms, self.ttl_ms });
@@ -254,7 +247,7 @@ test "drainIfStale skips within-ttl and never-active pools" {
     _ = pool.clientFor("https://ai-gateway.vercel.sh/v4/ai/language-model");
     const stamp = pool.last_activity_ms.load(.acquire);
     try std.testing.expect(stamp > 0);
-    pool.ttl_ms = 0; // force stale on next call; empty pool drains zero
+    pool.ttl_ms = 0;
     _ = pool.clientFor("https://ai-gateway.vercel.sh/v4/ai/language-model");
     try std.testing.expect(pool.last_activity_ms.load(.acquire) >= stamp);
 }
@@ -277,7 +270,6 @@ test "TLS clock refresh skips while a connection setup reads the clock" {
     var pool = HttpPool.init(std.testing.allocator);
     defer _ = pool.deinit();
     const io = pool.client.io;
-    // As though the bundle loaded when the process started, long ago.
     const stale = std.Io.Timestamp.fromNanoseconds(1);
     pool.client.now = stale;
 
@@ -304,7 +296,6 @@ test "openRequest advances a stale clock before connection setup" {
     pool.client.now = std.Io.Timestamp.fromNanoseconds(1);
     const before = std.Io.Clock.real.now(zio);
 
-    // The listen backlog completes the connect without any server accept.
     var req = try pool.openRequest(.POST, try std.Uri.parse(url), .{});
     defer req.deinit();
     try std.testing.expect(pool.client.now.?.nanoseconds >= before.nanoseconds);
@@ -321,11 +312,10 @@ test "drain evicts a real parked connection past the TTL" {
     var pool = HttpPool.init(std.testing.allocator);
     defer _ = pool.deinit();
 
-    // The listen backlog completes the connect without any server accept.
     pool.warm(url);
     try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
 
-    pool.ttl_ms = 0; // every parked connection is stale immediately
+    pool.ttl_ms = 0;
     pool.last_activity_ms.store(io_mod.milliTimestamp() - 1000, .release);
     _ = pool.clientFor(url);
     try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());

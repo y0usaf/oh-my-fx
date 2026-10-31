@@ -46,11 +46,6 @@ fn reviewGateway(
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
-    // The review_model setting (or FX_REVIEW_MODEL) overrides the reviewer
-    // model. typesafeai/jev selects the TypeSafe System One reviewer; any
-    // other value stays on this gateway chat path with that model id. Every
-    // composition site selects this provider, so the override covers
-    // interactive, ask, and subagent reviews uniformly.
     const selected = if (input.reviewer_model.len > 0) input.reviewer_model else reviewer_model;
     if (typesafe_permission_reviewer.isJevModelId(selected)) {
         debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
@@ -438,7 +433,6 @@ test "permission reviewer retries one transport failure with a fresh deadline" {
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(outcome),
     );
-    // One transport retry, then one malformed-completion retry.
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);
     try std.testing.expect(fake.deadlines[0] != null);
@@ -451,7 +445,6 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
     const transient_config = testConfig(&transient_fake, null);
     var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest(), reviewer_model);
     defer transient.deinit(std.testing.allocator);
-    // Transient failures retry once and can recover.
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).valid,
         std.meta.activeTag(transient),
@@ -526,7 +519,6 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
         permission_auto_classifier.InvalidReason.transport_timed_out,
         timed_out.invalid,
     );
-    // The timeout is retried once before the review is declared unavailable.
     try std.testing.expectEqual(@as(usize, 2), timeout_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_error, .valid } };

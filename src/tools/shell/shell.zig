@@ -185,7 +185,6 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
     return @min(requested_ms, managed_contract.max_yield_time_ms);
 }
 
-// Advisory only: none of these values enters the executable decode path.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(arena_state);
@@ -256,7 +255,6 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
                 "request.{s} is not accepted for {s}.",
                 .{ text_utils.utf8PrefixByBytes(name, 64), @tagName(action) },
             ));
-            // A non-null unknown field can express intent that cannot be reconstructed.
             if (object.get(name).? != .null) repairable = false;
             _ = object.orderedRemove(name);
         }
@@ -538,8 +536,6 @@ fn callRun(
         else => return unavailable(ctx),
     };
     const command = input.command orelse return unavailable(ctx);
-    // Admission never lets a remembered grant authorize a reload, so the
-    // command runs under the startup files its approval was given for.
     if (input.reload) shell_snapshot.processOwner().markDirty(.agent_reload);
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(request_arena_state);
@@ -1653,9 +1649,6 @@ fn isShellParseErrorOutput(output: []const u8) bool {
     return false;
 }
 
-// Shell error prefixes may carry an absolute argv[0] path (fx spawns the
-// resolved login shell as /bin/bash, /bin/zsh, ...), so match the basename
-// of the token before the first colon rather than a raw line prefix.
 fn hasShellErrorPrefix(line: []const u8) bool {
     const colon = std.mem.findScalar(u8, line, ':') orelse return false;
     const token = line[0..colon];
@@ -2491,9 +2484,6 @@ test "failure guidance detectors match only their signatures" {
         shell_parse_retry_guidance,
         failureRetryGuidance(1, "zsh:1: unmatched '\n"),
     );
-    // fx spawns the resolved login shell with an absolute argv[0], so bash
-    // errors carry a /bin/bash prefix; bare-basename forms also occur when a
-    // command spawns a shell subprocess itself.
     try std.testing.expectEqual(
         shell_parse_retry_guidance,
         failureRetryGuidance(2, "/bin/bash: -c: line 1: syntax error: unexpected end of file\n"),
@@ -2523,17 +2513,12 @@ test "failure guidance detectors match only their signatures" {
         failureRetryGuidance(2, "grep: unknown option\nusage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
     );
 
-    // Exit zero never carries failure guidance.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(0, "usage: grep\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(null, "zsh:1: unmatched '\n"));
-    // A compiler-style syntax error without a shell prefix is not a shell parse error.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "main.c:4:5: error: expected ';' after expression (syntax error)\n"));
-    // A non-shell token before the colon is not a shell prefix even when a shell name appears later.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "error: bash: syntax error\n"));
-    // Ordinary failures keep null guidance.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, ""));
-    // A usage-looking line deep in output is not an argument rejection banner.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "line one\nline two\nline three\nline four\nusage: not a banner\n"));
 }
 

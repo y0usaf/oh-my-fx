@@ -152,7 +152,6 @@ pub fn writeTaskListMarker(alloc: Allocator, out: *std.ArrayList(u8), task: bp.P
     try out.appendSlice(alloc, ansi.dim_close);
 }
 
-// Width excludes ANSI escape bytes so table dividers stay aligned.
 const RenderedCell = struct {
     bytes: std.ArrayList(u8),
     width: usize,
@@ -275,7 +274,6 @@ fn maxRowLen(rows: []const RenderedRow) usize {
     return max;
 }
 
-// ANSI escape bytes do not contribute to table column width.
 fn writeTableRow(
     alloc: Allocator,
     cells: []const RenderedCell,

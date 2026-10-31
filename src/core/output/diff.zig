@@ -784,8 +784,6 @@ pub const FormatStyles = struct {
     added_fg: []const u8 = "\x1b[38;5;252m",
     removed_fg: []const u8 = "\x1b[38;5;252m",
     context_fg: []const u8 = "\x1b[38;5;245m",
-    // Optional accent for the line number and +/- sign only. Empty means the
-    // marker stays in the line color (fully monochrome, the historical look).
     added_marker_fg: []const u8 = "",
     removed_marker_fg: []const u8 = "",
     reset: []const u8 = "\x1b[0m",
@@ -1075,8 +1073,6 @@ fn appendDiffRenderLine(
 
     try out.appendSlice(alloc, line_style);
     try out.appendSlice(alloc, "  │ ");
-    // The number and sign carry the accent; the text falls back to the line
-    // color so only the marker is colored.
     if (accent) try out.appendSlice(alloc, marker_style);
     try appendDiffLineNumber(alloc, out, line.line_number, line.gutter_width);
     try out.append(alloc, ' ');
@@ -1968,13 +1964,10 @@ test "formatUnified: marker accent colors only the number and sign" {
     const out = try formatUnified(alloc, diff, styles, null, .edited);
     defer alloc.free(out);
 
-    // The accent wraps the number and sign, then the line color is reasserted
-    // before the text, so the text stays neutral.
     try std.testing.expect(std.mem.find(u8, out, "[G]2 +") != null);
     try std.testing.expect(std.mem.find(u8, out, "[R]2 -") != null);
     try std.testing.expect(std.mem.find(u8, out, "+\x1b[38;5;252m new") != null);
     try std.testing.expect(std.mem.find(u8, out, "-\x1b[38;5;252m old") != null);
-    // The text is never inside the accent run.
     try std.testing.expect(std.mem.find(u8, out, "[G]2 + new") == null);
 }
 

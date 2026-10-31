@@ -1008,10 +1008,6 @@ def _measure_microbenchmark(
     candidate_samples: list[float] = []
     for round_index in range(samples):
         export_path = logs / f"round-{round_index}-samples.json"
-        # The benchmark reports why it failed, such as a timing breach, on
-        # its own stdout and stderr. Pass them through so the round log keeps
-        # them; they are two short lines on success. Hyperfine rejects
-        # `--show-output` with `--style`, so use the equivalent `--output`.
         benchmark_argv: list[str] = [
             str(hyperfine_binary),
             "--shell=none",

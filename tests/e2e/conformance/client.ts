@@ -246,7 +246,6 @@ async function startLegacyProbeProxy(
             return;
           }
         } catch {
-          // Let the conformance server report malformed payloads.
         }
       }
 

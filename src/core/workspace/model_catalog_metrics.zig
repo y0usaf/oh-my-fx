@@ -68,7 +68,6 @@ const Ring = struct {
 };
 
 var mutex: std.Io.Mutex = .init;
-// Zero-initialized storage stays in .bss; unused slots are never read.
 var ring: Ring = std.mem.zeroes(Ring);
 
 /// Records one catalog event. Consecutive identical events collapse into the

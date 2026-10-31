@@ -1,6 +1,3 @@
-// Pure core for the durable libfx harnesses (bench-durable.mjs,
-// crash-matrix.mjs, bench-parallel.mjs). Everything here is data in, data
-// out: no I/O, clocks, timers or hidden randomness. The drivers own effects.
 
 export const durableModel = "durable/model";
 
@@ -9,8 +6,6 @@ export const durableCatalog = {
   data: [{ id: durableModel, type: "language", tags: ["tool-use"], context_window: 1_000_000, max_tokens: 4096 }],
 };
 
-// Tool behavior as data: whether each tool writes. send_email is the effect a
-// crash must not repeat.
 export const durableTools = {
   read_item: { writes: false },
   list_files: { writes: false },
@@ -20,8 +15,6 @@ export const durableTools = {
   send_email: { writes: true },
 };
 
-// A libfx journal record: one append's events as UTF-8 JSON. Only libfx and
-// its harnesses read one; a store keeps the bytes as they are.
 export function journalRecord(events) {
   return new TextEncoder().encode(JSON.stringify({ format: "libfx-journal-v1", events }));
 }
@@ -32,8 +25,6 @@ export function recordEvents(data) {
 
 const integers = Array.from({ length: 200 }, (_, index) => String(index + 1));
 
-// Each workload is the model's scripted side of one turn: steps run in
-// order, and a step with calls waits for every call's result.
 export const durableWorkloads = {
   "no-tool": [{ text: ["done"] }],
   "one-safe": [{ calls: [{ name: "read_item", input: { key: "alpha" } }] }, { text: ["done"] }],
@@ -57,8 +48,6 @@ function textOf(message) {
   return message.content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("");
 }
 
-// Index of the message that started the current turn: the last user
-// message that is not mid-turn steering.
 export function turnStartIndex(prompt) {
   for (let index = prompt.length - 1; index >= 0; index -= 1) {
     const message = prompt[index];
@@ -67,12 +56,10 @@ export function turnStartIndex(prompt) {
   return -1;
 }
 
-// Number of turns so far, counted as non-steering user messages.
 export function turnNumber(prompt) {
   return prompt.filter((message) => message?.role === "user" && !textOf(message).includes(steeringMarker)).length;
 }
 
-// The tool results the current turn has produced, in request order.
 export function toolResultIds(prompt) {
   const start = turnStartIndex(prompt);
   const ids = [];
@@ -83,9 +70,6 @@ export function toolResultIds(prompt) {
   return ids;
 }
 
-// Directives travel in the prompt text as `key=value` words, so the
-// scripted gateway is a function of the request body alone and answers the
-// same way after a restore.
 export function promptDirectives(prompt) {
   const text = textOf(prompt[turnStartIndex(prompt)]);
   const directives = {};
@@ -100,7 +84,6 @@ export function callId(turn, step, index) {
   return `t${turn}_s${step}_c${index}`;
 }
 
-// Which scripted step answers this request, given the results so far.
 export function stepFor(steps, resultCount) {
   let remaining = resultCount;
   let step = 0;
@@ -115,7 +98,6 @@ export function stepFor(steps, resultCount) {
 
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 
-// The SSE frames for one model request.
 export function framesFor(steps, prompt) {
   const turn = turnNumber(prompt);
   const step = stepFor(steps, toolResultIds(prompt).length);
@@ -141,8 +123,6 @@ export function sseBody(frames) {
   return frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n";
 }
 
-// Deterministic PRNG (mulberry32): the seed goes in, a value and the next
-// seed come out.
 export function nextRandom(seed) {
   const next = (seed + 0x6d2b79f5) >>> 0;
   let t = next;
@@ -151,7 +131,6 @@ export function nextRandom(seed) {
   return { value: ((t ^ (t >>> 14)) >>> 0) / 4294967296, seed: next };
 }
 
-// A random batch of 2 to 8 calls with writer flags, latencies and faults.
 export function randomBatch(seed, { writerRate = 0.3, throwRate = 0.1, maxLatencyMs = 4 } = {}) {
   let state = seed >>> 0;
   const draw = () => {
@@ -172,7 +151,6 @@ export function randomBatch(seed, { writerRate = 0.3, throwRate = 0.1, maxLatenc
   return { calls, seed: state };
 }
 
-// The scripted turn for a batch: one step with every call, then text.
 export function batchSteps(batch) {
   return [
     { calls: batch.calls.map((call, index) => ({ name: call.name, input: { call: index, latencyMs: call.latencyMs, fault: call.fault } })) },
@@ -180,8 +158,6 @@ export function batchSteps(batch) {
   ];
 }
 
-// Start and end positions of each call in an observed trace of
-// { call, kind: "start" | "end" } entries in real-time order.
 function intervals(trace, size) {
   const spans = Array.from({ length: size }, () => ({ start: null, end: null, starts: 0, ends: 0 }));
   trace.forEach((entry, position) => {
@@ -198,9 +174,6 @@ function intervals(trace, size) {
   return spans;
 }
 
-// A parallel batch's rules, checked on a real run: a writer runs alone,
-// and results reach the model in call order. `resultOrder`
-// is the tool call ids in the order the next model request carried them.
 export function checkBatch({ writes, trace, resultOrder, expectedOrder }) {
   const violations = [];
   if (expectedOrder.length !== writes.length) {
@@ -226,7 +199,6 @@ export function checkBatch({ writes, trace, resultOrder, expectedOrder }) {
   return violations;
 }
 
-// Highest number of calls running at once in a trace.
 export function maxConcurrency(trace) {
   let running = 0;
   let peak = 0;
@@ -237,7 +209,6 @@ export function maxConcurrency(trace) {
   return peak;
 }
 
-// What must hold after a crash and restore, for one crash-matrix cell.
 export function checkCrashCell({ workload, sendEffects, completed, rememberedSetup, resultCounts }) {
   const violations = [];
   const steps = durableWorkloads[workload];
@@ -251,8 +222,6 @@ export function checkCrashCell({ workload, sendEffects, completed, rememberedSet
   return violations;
 }
 
-// What a host that makes libfx durable from outside pays today: four sequential
-// acknowledged writes per tool call, plus the checkpoint after each turn.
 export function todayAdapterWrites(toolCalls) {
   return { perToolBefore: 2, perToolAfter: 2, perTurn: 1, awaited: 4 * toolCalls + 1 };
 }

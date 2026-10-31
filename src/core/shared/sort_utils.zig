@@ -1,9 +1,5 @@
 const std = @import("std");
 
-// Share one stable sort across element types to avoid duplicating generic code.
-// Uses insertion-sorted runs and in-place SymMerge (Kim and Kutzner, 2004):
-// O(n log n) comparisons and O(n log^2 n) swaps.
-
 /// Drop-in replacement for std.mem.sort: stable, in place, same signature.
 pub fn sort(
     comptime T: type,
@@ -25,8 +21,6 @@ pub fn sort(
             return lessThanFn(ctx.*, lhs_elem.*, rhs_elem.*);
         }
     };
-    // Zero-bit contexts have no address to smuggle through anyopaque; the
-    // thunk reconstructs the value instead.
     const view = ErasedView{
         .base = @ptrCast(items.ptr),
         .elem_size = @sizeOf(T),
@@ -96,12 +90,9 @@ fn insertionSortRange(view: *const ErasedView, a: usize, b: usize) void {
     }
 }
 
-// Merges the sorted ranges [a, m) and [m, b) in place, keeping equal
-// elements in their original relative order.
 fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
     std.debug.assert(a < m and m < b);
     if (m - a == 1) {
-        // Insert the single left element into the right range.
         var lo = m;
         var hi = b;
         while (lo < hi) {
@@ -113,7 +104,6 @@ fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
         return;
     }
     if (b - m == 1) {
-        // Insert the single right element into the left range.
         var lo = a;
         var hi = m;
         while (lo < hi) {
@@ -146,8 +136,6 @@ fn symMerge(view: *const ErasedView, a: usize, m: usize, b: usize) void {
     if (mid < end and end < b) symMerge(view, mid, end, b);
 }
 
-// Rotates [a, b) so that the block starting at m becomes the front,
-// using only pairwise swaps (gcd block-exchange).
 fn rotate(view: *const ErasedView, a: usize, m: usize, b: usize) void {
     var i = m - a;
     var j = b - m;
@@ -175,8 +163,6 @@ fn testElemKeyLess(_: void, lhs: TestElem, rhs: TestElem) bool {
     return lhs.key < rhs.key;
 }
 
-// A stable sort's output is uniquely determined by its input, so comparing
-// against std.mem.sort element-for-element is an exact oracle.
 fn expectMatchesStd(alloc: std.mem.Allocator, items: []const TestElem) !void {
     const expected = try alloc.dupe(TestElem, items);
     defer alloc.free(expected);

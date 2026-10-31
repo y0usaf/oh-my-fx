@@ -1185,7 +1185,6 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
         if (!permissionPatternMatchesTool(grant.tool_name, permission, tool_name)) continue;
         if (std.mem.eql(u8, permission, "bash")) {
             if (!std.mem.eql(u8, grant.target_path, pattern)) continue;
-            // A shell refresh resets remembered command approvals.
             if (!shell_snapshot.processOwner().shellGrantCurrent(grant.target_path)) continue;
         } else if (!permissionPatternMatchesTarget(grant.target_path, pattern)) continue;
         return true;
@@ -2020,8 +2019,6 @@ test "isToolAllowed remains exact match only" {
 }
 
 test "sessionGrantAllowed maps tool categories and matches command grants exactly" {
-    // Command grants are current only in the snapshot epoch they were made
-    // in, so start from a fresh process owner.
     shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
@@ -3373,7 +3370,6 @@ test "a shell refresh resets remembered command grants only" {
     try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
 
-    // Listings and counts show only the grants that still apply.
     try std.testing.expectEqual(@as(usize, 1), liveSessionGrantCount(&grants));
     const listing = try formatPermissionsStatus(std.testing.allocator, "/tmp/workspace", .ask, &grants, .{});
     defer std.testing.allocator.free(listing);

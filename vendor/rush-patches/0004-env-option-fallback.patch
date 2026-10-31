@@ -1,0 +1,55 @@
+diff --git a/src/shell/eval.zig b/src/shell/eval.zig
+index 7d8922c..6dabcb4 100644
+--- a/src/shell/eval.zig
++++ b/src/shell/eval.zig
+@@ -2732,7 +2732,9 @@ fn evalEnvBuiltin(shell: anytype, args: []const []const u8, assignments: []const
+     while (index < args.len and envOperandAssignment(args[index]) != null) index += 1;
+     const env_operands = args[first_env_operand..index];
+ 
+-    if (index < args.len and args[index].len != 0 and args[index][0] == '-') return .{ .status = 2 };
++    if (index < args.len and args[index].len != 0 and args[index][0] == '-') {
++        return evalExternalEnv(shell, args, assignments, args[index]);
++    }
+ 
+     const env_entries = try makeEnvBuiltinEntries(shell, assignments, env_operands);
+     const envp = try makeEnvpFromEntries(shell, env_entries);
+@@ -2773,6 +2775,39 @@ fn evalEnvBuiltin(shell: anytype, args: []const []const u8, assignments: []const
+     return .{ .status = waited.shellStatus() };
+ }
+ 
++fn evalExternalEnv(
++    shell: anytype,
++    args: []const []const u8,
++    assignments: []const ast.Assignment,
++    option: []const u8,
++) EvalError!result.EvalResult {
++    const env_entries = try makeEnvBuiltinEntries(shell, assignments, &.{});
++    const envp = try makeEnvpFromEntries(shell, env_entries);
++    const shell_path = if (shell.state.getVariable("PATH")) |variable| variable.value else envPath(shell.env);
++    const search_path = envEntriesPath(env_entries) orelse shell_path orelse defaultUtilityPath();
++    const utility_path = try findCommandPath(shell, "env", search_path) orelse {
++        const message = try std.fmt.allocPrint(
++            shell.scratchAllocator(),
++            "env: {s}: unsupported by the builtin and no env utility found in PATH\n",
++            .{option},
++        );
++        try shell.host.writeAll(.stderr, message);
++        return .{ .status = 2 };
++    };
++    const path = try shell.scratchAllocator().dupeSentinel(u8, utility_path, 0);
++    const request: host_mod.SpawnRequest = .{
++        .path = path,
++        .argv = try makeExecArgv(shell, args),
++        .fallback_argv = try makeShellFallbackArgv(shell, path, args[1..]),
++        .envp = envp,
++        .default_signals = if (shell.state.options.monitor) &job_control_signals else &.{},
++    };
++    notifyForegroundCommand(shell, "env");
++    defer notifyForegroundCommand(shell, null);
++    const waited = try shell.host.spawnAndWait(request);
++    return .{ .status = waited.shellStatus() };
++}
++
+ fn makeEnvBuiltinEntries(
+     shell: anytype,
+     assignments: []const ast.Assignment,

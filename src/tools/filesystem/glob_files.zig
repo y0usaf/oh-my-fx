@@ -97,9 +97,6 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, list_options: tool_files.Options) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
 
-    // The scan and the per-call work use the scratch allocator, so each search
-    // returns its memory when it ends; only the result body comes from
-    // `ctx.allocator`.
     var arena_state = std.heap.ArenaAllocator.init(ctx.scratch_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
@@ -846,8 +843,6 @@ test "glob_files finds match beyond former traversal cap" {
 }
 
 test "glob_files keeps only its result in the turn's allocator" {
-    // fx passes the turn's arena as `allocator`, so a scan left there stays
-    // until the turn ends and every search adds another.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -870,7 +865,6 @@ test "glob_files keeps only its result in the turn's allocator" {
         }, registry, .{ .id = "call_1", .name = "glob_files", .arguments_json = args });
         try std.testing.expectEqual(.success, result.status);
         try std.testing.expect(std.mem.find(u8, result.body, "many/file-0001.txt") != null);
-        // Listing 2,050 files takes far more than this; the result does not.
         try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
     }
 }
@@ -887,8 +881,6 @@ test "glob_files distinguishes candidate cap from output cap" {
 
 test "glob_files allows external absolute path search roots" {
     const alloc = std.testing.allocator;
-    // Keep the external root out of std.testing.tmpDir(), whose generated path
-    // may contain ignored component names and invalidate this absolute-path case.
     const root = try alloc.print("/tmp/fx-glob-external-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};

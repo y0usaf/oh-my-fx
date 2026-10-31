@@ -2,8 +2,6 @@ const std = @import("std");
 const tool_dispatch = @import("tool_dispatch.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 
-// Generic aliases and helpers shared by registered tool specifications.
-
 pub const ExecutorKind = tool_dispatch.ExecutorKind;
 pub const LabelArgKind = tool_dispatch.LabelArgKind;
 pub const PermissionTargetKind = tool_dispatch.PermissionTargetKind;

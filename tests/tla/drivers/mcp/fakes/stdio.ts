@@ -1,21 +1,3 @@
-// Scripted fake MCP server over stdio.
-//
-// Reads newline-delimited JSON-RPC from stdin and answers from a script. The
-// first rule whose method matches and still has uses left is applied. A
-// request with no matching rule gets -32601. Notifications get no reply unless
-// a rule says so. Every line in and out is appended to --log as JSONL.
-//
-// Usage: bun tests/tla/drivers/mcp/fakes/stdio.ts --script <rules.json> [--log <file>]
-//          [--banner <text>] [--exit-at-start <code>] [--start-delay <ms>] [--linger] [--ignore-term]
-//          [--once <file>] [--exit-after <ms>]
-//
-//   --banner         write <text> to stdout first, as a server printing a non-MCP line would
-//   --exit-at-start  exit with <code> before reading anything (a crash loop)
-//   --once           a rule's "exit" or "crash" happens in the first process only, which leaves <file>
-//   --exit-after     exit with code 1 this long after starting (a server that dies later)
-//   --start-delay    hold every input line until <ms> after start (a slow server)
-//   --linger         keep running after stdin closes (forces the client's SIGTERM)
-//   --ignore-term    ignore SIGTERM (forces the client's SIGKILL)
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 
@@ -48,8 +30,6 @@ export interface Rule {
   then?: "exit" | "crash";
 }
 
-// A rule's result and `before` lines may say "$id" for the request's id, as a
-// listen's subscriptionId must (U10).
 const withId = <T>(value: T, id: unknown): T => JSON.parse(JSON.stringify(value).replaceAll('"$id"', JSON.stringify(id ?? null)));
 
 interface Message {
@@ -75,7 +55,6 @@ function main(): void {
   const exitAfter = get("--exit-after");
   if (exitAfter !== undefined) setTimeout(() => process.exit(1), Number(exitAfter));
   const once = get("--once");
-  // A later process finds the file and skips the rule's ending.
   const ends = once === undefined || !existsSync(once);
   const linger = args.includes("--linger");
   if (args.includes("--ignore-term")) process.on("SIGTERM", () => {});
@@ -87,7 +66,6 @@ function main(): void {
   };
   const send = (line: string) => {
     log("out", line);
-    // Synchronous so nothing is lost when a rule exits or crashes right after.
     writeSync(1, line + "\n");
   };
 

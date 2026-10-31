@@ -102,11 +102,11 @@ def scenario(path, trace_path, bug=None):
     with open(trace_path, "w") as trace:
         log = Log(path, trace, bug)
         log.begin_write(); log.finish_write()
-        log.begin_write(); log.finish_write(); log.fsync()   # 2 acknowledged lines
-        log.begin_write(); log.process_crash()                # torn 3rd line
-        log.recover()                                         # must cut it
-        log.begin_write(); log.finish_write()                 # new 3rd line, not fsynced
-        log.power_loss(keep=3, tear=True)                     # machine crash tears it
+        log.begin_write(); log.finish_write(); log.fsync()
+        log.begin_write(); log.process_crash()
+        log.recover()
+        log.begin_write(); log.finish_write()
+        log.power_loss(keep=3, tear=True)
         log.recover()
         log.begin_write(); log.finish_write(); log.fsync()
 

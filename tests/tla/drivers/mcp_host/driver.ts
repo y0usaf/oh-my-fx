@@ -1,6 +1,3 @@
-// What the mcp-v2-model scenarios share: private fixture folders outside
-// every repository, the real fx binary with a scratch HOME, fixture logs,
-// the credential files, loopback probes, and evidence files.
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TraceRecord } from "./trace";
@@ -97,8 +94,6 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
     throw error;
   }
 }
-
-// ---- credentials ----
 
 export const credDir = (f: Fixture) => join(f.home, ".fx", "mcp-credentials");
 export const v2Path = (f: Fixture) => join(credDir(f), "credentials-v2.json");

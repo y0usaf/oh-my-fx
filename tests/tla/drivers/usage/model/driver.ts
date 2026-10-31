@@ -1,21 +1,3 @@
-// Replays UsageModel DriveSpec behaviors from TLC against the real fx binary.
-//
-// Two fx TUIs (p1, p2) run in tmux and share one HOME, so one
-// ~/.fx/usage-cache. Identities a and b are two AI Gateway API keys. Each
-// process has its own fake gateway that holds every /v1/report request until
-// the behavior says the fetch completes or fails. The usage clock seam
-// (FX_E2E_USAGE_CLOCK_FILE) is the wall clock: wall tick n is 23:40 UTC on
-// Oct 20 2026 + 5n minutes, so the 60 s floor is one tick, the 15-minute timer
-// three, and UTC midnight falls between ticks 3 and 4.
-//
-// Non-ideal steps: Fail answers the held request with 500; Crash SIGKILLs the
-// fx process and starts a new one in its place; Corrupt writes garbage over an
-// identity's cache file; ClockBack moves the wall clock back.
-//
-// After every step the driver compares the real system with the next model
-// state: which processes sent which requests, what each identity's cache file
-// holds, and what the today and 7d rows of each open dashboard show. The
-// first difference ends the behavior and keeps both sides.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -61,16 +43,12 @@ async function until<T>(probe: () => T | undefined | false | Promise<T | undefin
   }
 }
 
-// ---------------------------------------------------------------------------
-// Model side
-
 const rec = (v: Value) => v as Record<string, Value>;
 const wall = (s: State) => (s.now as number) + (s.skew as number);
 const fetchOf = (s: State, p: Proc): Fetch | null => {
   const f = rec(s.inflight)[p];
   return f === null ? null : (f as unknown as Fetch);
 };
-// policy.since: a clock that reads earlier than t was corrected and counts as passed.
 const since = (t: Value, n: number, w: number) => t === null || w < (t as number) || w - (t as number) >= n;
 
 export function timerDue(s: State, p: Proc): boolean {
@@ -94,8 +72,6 @@ export function actionBetween(s: State, t: State): Action {
   if (t.faults !== s.faults) {
     const changed = PROCS.find((p) => procChanged(s, t, p));
     if (changed) return { kind: "Crash", p: changed };
-    // A crash that changes nothing hit a process already in a fresh fx's
-    // state (closed, no fetch history, nothing in memory); crash that one.
     const fresh = PROCS.find((p) =>
       rec(s.open)[p] === false && rec(s.inflight)[p] === null && rec(s.lastStart)[p] === null &&
       rec(s.failedAt)[p] === null && JSON.stringify(rec(s.mem)[p]) === JSON.stringify(rec(t.mem)[p]));
@@ -118,9 +94,6 @@ export function actionBetween(s: State, t: State): Action {
 
 export const describe = (a: Action) =>
   a.kind === "Tick" || a.kind === "ClockBack" ? a.kind : a.kind === "Corrupt" ? `Corrupt(${a.i})` : `${a.kind}(${a.p})`;
-
-// ---------------------------------------------------------------------------
-// Real side
 
 function cachePath(home: string, ident: string): string {
   const hash = createHash("sha256").update(`fx-usage-cache-v1\0api_key\0${KEYS[ident]}\0`).digest("hex");

@@ -133,7 +133,6 @@ const ReconstructionBudget = struct {
     const read_limit = 64 * 1024 * 1024;
     const Admission = enum { admitted, duplicate, exhausted };
 
-    // Source paths borrow selection-arena storage, including missing candidates.
     sources: [candidate_limit][]const u8 = undefined,
     candidate_count: usize = 0,
     admitted_read_bytes: usize = 0,
@@ -155,7 +154,6 @@ const ReconstructionBudget = struct {
             debug_trace.logf("context", "reconstruction_work_omitted reason=oversized admitted_read_bytes={d} validation_bytes={d} prefix_bytes={d}", .{ self.admitted_read_bytes, validation_bytes, prefix_bytes });
             return false;
         }
-        // Reserve both reads before validation. Failed or blank files do not refund work.
         self.admitted_read_bytes += validation_bytes + prefix_bytes;
         return true;
     }
@@ -324,7 +322,6 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                         try scratch.addOmission(home, .home_unavailable);
                         break :blk null;
                     },
-                    // Host homes are validated, normalized absolute host paths.
                     .host => home,
                 };
                 if (canonical_home) |home_root| {
@@ -354,7 +351,6 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
             } else {
                 try scratch.addOmission(options.workspace_root, .unsafe_target);
             }
-            // Admit the explicit global and workspace sources before bounded ancestor work.
             if (launch_home) |home_root| {
                 try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
             }
@@ -455,8 +451,6 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         }
     }
     result.delivered_sources = try dupeOwnedStringSlice(alloc, scratch.delivered_sources.items);
-    // A bounded reconstruction may leave ancestors unread. Only delivered rules
-    // may suppress live discovery, not completion of these directory scans.
     if (!options.bounded_reconstruction) {
         result.evaluated_endpoints = try dupeOwnedStringSlice(alloc, scratch.evaluated_endpoints.items);
     }
@@ -549,13 +543,11 @@ fn appendRuleCandidate(
     const source = try std.Io.Dir.path.join(arena, &.{ scope, "AGENTS.md" });
     if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) return true;
     for (scratch.candidates.items) |candidate| {
-        // A previous walk already covered these ancestors, or stopped at the work cap.
         if (std.mem.eql(u8, candidate.source, source)) return scratch.work_budget == null;
     }
     if (scratch.work_budget) |*budget| {
         switch (budget.admit_candidate(source)) {
             .admitted => {},
-            // Initial global/workspace probes need not have walked this scope's ancestors.
             .duplicate => return true,
             .exhausted => {
                 try scratch.addOmission(source, .selection_cap);
@@ -612,7 +604,6 @@ fn loadHostRule(
     work_budget: ?*ReconstructionBudget,
 ) Allocator.Error!RuleLoad {
     const read_len = hostReadLength(limit, reader.max_read_bytes);
-    // Reserve the bounded read before it happens; the host cannot report size first.
     if (work_budget) |budget| {
         if (!budget.admit_reads(read_len, 0)) return .{ .omitted = .oversized };
     }
@@ -633,15 +624,12 @@ fn classifyHostRule(file: context_contract.InstructionFile, limit: context_limit
     const observed_bytes: usize = @intCast(file.total_bytes);
     const read_len = hostReadLength(limit, max_read_bytes);
     if (file.bytes.len != @min(observed_bytes, read_len)) return .{ .omitted = .unreadable };
-    // A host bound below the rule's prefix would otherwise truncate it silently.
     if (observed_bytes > read_len and read_len < ruleReadLength(limit)) return .{ .omitted = .oversized };
 
     var validator: text_utils.IncrementalUtf8Validator = .{};
     validator.append(file.bytes) catch return .{ .omitted = .unreadable };
     const complete = file.bytes.len == observed_bytes;
     if (complete) validator.finish() catch return .{ .omitted = .unreadable };
-    // Unread bytes past the prefix count as content, as the filesystem loader
-    // would see them while validating the whole file.
     if (complete and std.mem.trim(u8, file.bytes, trim_chars).len == 0) return .blank;
     return ruleBody(file.bytes, observed_bytes, limit);
 }
@@ -2108,7 +2096,6 @@ test "host rule classification matches filesystem size and encoding rules" {
     }
     try std.testing.expectEqual(RuleLoad.blank, classify(&buffer, .{ .bytes = " \n\t", .total_bytes = 3 }, limit));
     try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "ok\xff", .total_bytes = 3 }, limit));
-    // A truncated read may end inside one UTF-8 sequence.
     switch (classify(&buffer, .{ .bytes = "line one\n\xe2\x82", .total_bytes = 40 }, limit)) {
         .body => |body| {
             try std.testing.expectEqualStrings("line one", body.text);
@@ -2117,11 +2104,9 @@ test "host rule classification matches filesystem size and encoding rules" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "line\xffone\n\xe2\x82", .total_bytes = 40 }, limit));
-    // The reader must deliver exactly the requested prefix of the file.
     try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "short", .total_bytes = 40 }, limit));
     try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "rule", .total_bytes = 3 }, limit));
     try std.testing.expectEqual(RuleLoad{ .omitted = .oversized }, classify(&buffer, .{ .bytes = "", .total_bytes = context_limits.emergency_ceiling_bytes + 1 }, limit));
-    // A host bound below the rule prefix omits larger files instead of truncating them.
     try std.testing.expectEqual(RuleLoad{ .omitted = .oversized }, classify(&buffer, .{ .bytes = "line", .total_bytes = 40, .max_read_bytes = 4 }, limit));
     switch (classify(&buffer, .{ .bytes = "rule", .total_bytes = 4, .max_read_bytes = 4 }, limit)) {
         .body => |body| try std.testing.expectEqualStrings("rule", body.text),
@@ -2673,7 +2658,6 @@ fn collectGitHubRepoIdentity(arena: Allocator, git_dir: []const u8, started_ns: 
 fn detectGitWorktreeState(arena: Allocator, workspace_root: []const u8, git_dir: []const u8, started_ns: i128) GitWorktreeState {
     if (gitReadExpired(started_ns)) return .unknown;
 
-    // This bounded hint can prove tracked-file changes but cannot detect untracked files.
     const dirty_markers = [_][]const u8{
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -3703,14 +3687,12 @@ test "gateway_system_prompt: static guidance is capability-neutral" {
 }
 
 test "embedded system prompt drops only terminal identity and rendering claims" {
-    // The only remaining mention is the instruction not to claim a terminal.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded_system_prompt, "terminal"));
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_identity) == null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_rendering) == null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "bolds table headers") == null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "A client application hosts this conversation") != null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "which the client application renders") != null);
-    // Every other section is shared with the terminal prompt.
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Safety") != null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Tools and verification") != null);
     try std.testing.expectEqual(

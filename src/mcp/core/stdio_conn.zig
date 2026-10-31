@@ -467,7 +467,6 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
     const before = conn.*;
     var out: Output = .{};
     conn.step(event, &out) catch |err| {
-        // Refusals change nothing and are only allowed where the model has no Send.
         try testing.expectEqual(before, conn.*);
         switch (err) {
             error.NotRunning => try testing.expect(before.state != .running),
@@ -477,7 +476,6 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
         return true;
     };
 
-    // The world reacts to the event itself.
     switch (event) {
         .spawned => {
             world.spawn_pending = false;
@@ -496,7 +494,6 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
     var delivered = false;
     for (out.effects()) |effect| switch (effect) {
         .spawn => |g| {
-            // OneProcess.
             try testing.expect(world.proc == .none or world.proc == .reaped);
             try testing.expect(g == world.gen + 1);
             world.* = .{ .gen = g, .spawn_pending = true, .pipe = world.pipe, .timers = world.timers, .timer_count = world.timer_count };
@@ -511,9 +508,7 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
             try testing.expect(world.proc != .reaped and world.proc != .none);
             switch (s.signal) {
                 .term => {
-                    // SignalOrder: after stdin closed, on a host stop, not for an error.
                     try testing.expect(world.stdin_closed and conn.stopping and !conn.errored);
-                    // SignalsOnTime: this process's own grace timer just fired.
                     try testing.expect(event == .timer_fired and event.timer_fired.kind == .grace);
                     try testing.expect(world.armedIndex(.{ .kind = .grace, .generation = world.gen }) == null);
                     world.term_sent = true;
@@ -531,13 +526,11 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
             world.timer_count += 1;
         },
         .deliver => |g| {
-            // NoStaleDelivery.
             try testing.expectEqual(world.gen, g);
             try testing.expectEqual(world.gen, event.line_received);
             delivered = true;
         },
         .write => |g| {
-            // WritesOnlyWhenOpen and NoClientResponsesModern.
             try testing.expectEqual(world.gen, g);
             try testing.expect(world.stdin_open);
             if (event.send == .response) try testing.expectEqual(Era.legacy, conn.era);
@@ -546,17 +539,14 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
         .lost => |g| try testing.expectEqual(world.gen, g),
     };
 
-    // NoOrphan and RestartBounded.
     if (conn.down()) try testing.expect(world.proc == .none or world.proc == .reaped);
     try testing.expect(conn.attempts <= conn.config.max_attempts);
     if (conn.state == .failed) try testing.expectEqual(conn.config.max_attempts, conn.attempts);
     if (conn.state == .backoff) try testing.expect(conn.attempts < conn.config.max_attempts);
-    // NoEarlyRestart: a backoff ends only by its own timer.
     if (before.state == .backoff and conn.state == .idle) {
         try testing.expect(event == .timer_fired and event.timer_fired.kind == .backoff and event.timer_fired.generation == conn.generation);
     }
 
-    // Where the model has no choice, the core must act.
     const t = out.transition.?;
     switch (event) {
         .spawned => try testing.expect(conn.state == .running or conn.state == .closing),
@@ -571,7 +561,6 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
         },
         else => {},
     }
-    // An ignored event changed nothing.
     if (t.ignored) {
         try testing.expectEqual(before, conn.*);
         try testing.expectEqual(@as(usize, 0), out.effect_count);
@@ -716,7 +705,6 @@ test "failures back off exponentially, then the connection fails until a reconne
         try conn.step(.{ .process_exited = conn.generation }, &out);
         try testing.expectEqual(State.backoff, conn.state);
         try testing.expectEqual(expected, out.effects()[1].arm_timer.after_ms);
-        // A demand during backoff doesn't start a process.
         try conn.step(.start_requested, &out);
         try testing.expect(out.transition.?.ignored);
         try conn.step(.{ .timer_fired = .{ .kind = .backoff, .generation = conn.generation } }, &out);

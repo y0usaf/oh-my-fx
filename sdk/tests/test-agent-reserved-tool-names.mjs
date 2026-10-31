@@ -26,8 +26,6 @@ const sse = (...events) => new Response(
   { headers: { "content-type": "text/event-stream" } },
 );
 
-// The two most natural names an embedder picks for file tools are the kernel's
-// builtin file-mutation names. Host tools must still execute under them.
 const calls = [];
 const writeResult = { type: "libfx.tool-result", text: "wrote it", images: [] };
 const editResult = { type: "libfx.tool-result", text: "edited it", images: [] };
@@ -74,7 +72,6 @@ const agent = await createFxEngine({
   model: "sdk/tool-model",
   fetch: gateway.fetch,
   tools,
-  // File mutations need a permission decision; answer allow for the test.
   onPermission: () => "allow-once",
   ...(backend === "native"
     ? { nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node") }
@@ -87,12 +84,10 @@ for await (const event of turn) events.push(event);
 const result = await turn.result;
 assert.equal(result.stopReason, "end_turn");
 
-// Both host tools executed through the host executor; no call-time failure.
 assert.deepEqual(calls.map((c) => c.tool), ["write_file", "edit_file"]);
 assert.equal(calls[0].input.path, "/tmp/n.txt");
 assert.equal(calls[0].input.content, "hi");
 
-// Their results reached the model on the next step (not a tool error).
 const second = gateway.chatBodies[1];
 const toolResult = second.prompt
   .filter((m) => m.role === "tool" || (Array.isArray(m.content) && m.content.some((p) => p.type === "tool-result")))
@@ -103,7 +98,6 @@ assert.ok(toolResult.length > 0, "tool results reached the model");
 const resultText = JSON.stringify(toolResult);
 assert.match(resultText, /wrote it/, "write_file result reached the model");
 
-// The events carry the reserved names and the inputs.
 const starts = events.filter((e) => e.type === "tool_start");
 assert.deepEqual(starts.map((e) => e.name), ["write_file", "edit_file"]);
 assert.deepEqual(starts[0].input, { path: "/tmp/n.txt", content: "hi" });

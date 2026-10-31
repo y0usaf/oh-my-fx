@@ -61,8 +61,6 @@ fn objectPath(root: std.json.Value, keys: []const []const u8) ?std.json.Value {
 
 test "a provider 413 behind a Gateway fallback reports a size rejection" {
     const alloc = std.testing.allocator;
-    // Shapes Gateway returned on 2026-10-07 for a 34 MB request to
-    // anthropic/claude-haiku-4.5, reduced to the fields that matter.
     const default_route =
         \\{"error":{"message":"Bad Request","type":"AI_APICallError","param":{"statusCode":400}},
         \\"providerMetadata":{"gateway":{"routing":{"resolvedProvider":"anthropic","modelAttemptCount":1,

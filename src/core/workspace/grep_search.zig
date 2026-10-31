@@ -484,7 +484,6 @@ fn countCandidateList(
     const files = try selectCandidates(work, candidates, include);
     var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .count);
     runParallelScan(&scan);
-    // A count needs every file.
     if (scan.out_of_memory_from != null) return error.OutOfMemory;
     for (scan.outcomes) |outcome| {
         if (outcome.matching_lines == 0) continue;
@@ -581,7 +580,6 @@ fn scanFileAt(
         .done => null,
         .stopped => .collection_cap,
         .not_text => {
-            // The whole file is skipped, so drop the lines already taken from it.
             matches.shrinkRetainingCapacity(first);
             return null;
         },
@@ -604,8 +602,6 @@ fn scanLines(
     case_insensitive: bool,
     sink: anytype,
 ) !ScanEnd {
-    // Only regular files are read, and never with a blocking open: opening a
-    // FIFO for reading would wait for a writer that may never come.
     var file = try io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), read_path, .follow);
     defer file.close(io_mod.getIo());
 
@@ -622,8 +618,6 @@ fn scanLines(
         else |err| switch (err) {
             error.EndOfStream => .{ reader.buffered(), true },
             error.StreamTooLong => {
-                // The line is longer than the buffer. Take what is buffered,
-                // up to the last whole UTF-8 sequence, and keep reading it.
                 const buffered = reader.buffered();
                 const piece = buffered[0 .. buffered.len - incompleteUtf8Tail(buffered)];
                 if (!isLineText(display_path, piece)) return .not_text;
@@ -686,7 +680,6 @@ const LongLine = struct {
             self.matched = true;
             return;
         }
-        // A pattern of one byte or less cannot span two pieces.
         if (pattern.len <= 1) return;
         const carry_cap = pattern.len - 1;
         if (self.window.len == 0) self.window = try scratch.alloc(u8, 2 * carry_cap);
@@ -696,7 +689,6 @@ const LongLine = struct {
             self.matched = true;
             return;
         }
-        // Carry the last `carry_cap` bytes of the line so far.
         if (piece.len >= carry_cap) {
             @memcpy(self.window[0..carry_cap], piece[piece.len - carry_cap ..]);
             self.carry_len = carry_cap;
@@ -1037,7 +1029,6 @@ test "grep search skips a symlink to a FIFO instead of waiting for a writer" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    // A blocking open of the FIFO would wait here forever for a writer.
     const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
@@ -1052,7 +1043,6 @@ test "grep search scans a file root of any size" {
     defer tmp.cleanup();
     const workspace = try workspaceRoot(alloc, tmp);
     defer alloc.free(workspace);
-    // 3,000 lines of 100 bytes put the match past 290 KiB, several chunks in.
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     for (0..3000) |_| try content.appendSlice(alloc, text_utils.repeat("x", 99) ++ "\n");
@@ -1099,8 +1089,6 @@ test "grep search finds a match split across the chunks of a long line" {
     defer tmp.cleanup();
     const workspace = try workspaceRoot(alloc, tmp);
     defer alloc.free(workspace);
-    // One line of three chunks, with "needle" starting three bytes before
-    // the first chunk edge, so neither piece holds all of it.
     const content = try alloc.alloc(u8, 3 * chunk_bytes + 1);
     defer alloc.free(content);
     @memset(content, 'x');
@@ -1118,7 +1106,6 @@ test "grep search finds a match split across the chunks of a long line" {
         const result = try collectRegularFileRoot(arena_state.allocator(), workspace, long, case.pattern, case.case_insensitive, null);
         try std.testing.expectEqual(@as(usize, 1), result.matches.len);
         try std.testing.expectEqual(@as(usize, 1), result.matches[0].line_number);
-        // The match keeps the line's first chunk plus one byte to mark the cut.
         try std.testing.expectEqual(chunk_bytes + 1, result.matches[0].line.len);
     }
     const missing = try collectRegularFileRoot(arena_state.allocator(), workspace, long, "needles", false, null);
@@ -1131,8 +1118,6 @@ test "grep search keeps a UTF-8 character cut by a chunk edge as text" {
     defer tmp.cleanup();
     const workspace = try workspaceRoot(alloc, tmp);
     defer alloc.free(workspace);
-    // A long line of two-byte characters offset by one byte, so a chunk edge
-    // falls inside a character, then a match on the next line.
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     try content.append(alloc, 'a');
@@ -1392,9 +1377,6 @@ test "grep search parallel scan matches single-threaded order and cap truncation
     const workspace = try workspaceRoot(alloc, tmp);
     defer alloc.free(workspace);
 
-    // 1500 files of 2 matches each exceed the collection cap, so the first
-    // 1000 files in sorted order must fill it exactly. Many more batches than
-    // workers means a premature stop would leave files unscanned.
     const content = "needle one\nother\nneedle two\n";
     for (0..1500) |index| {
         var name_buf: [64]u8 = undefined;
@@ -1431,12 +1413,10 @@ test "parallel grep stops once finished batches hold the cap, even with an earli
     const many = try work.alloc(Match, collection_cap);
     for (many) |*match| match.* = .{ .absolute_path = "/w/f", .line_number = 1, .line = "x" };
 
-    // Batch 0 is still running; batch 1 finishes holding the cap.
     scan.outcomes[batch_files] = .{ .matches = many };
     scan.finishBatch(batch_files, batch_files * 2);
     try std.testing.expect(scan.stop.load(.acquire));
 
-    // Below the cap the scan keeps going.
     var short = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
     short.outcomes[batch_files] = .{ .matches = many[0 .. collection_cap - 1] };
     short.finishBatch(batch_files, batch_files * 2);
@@ -1452,8 +1432,6 @@ test "grep fails for running out of memory only before the cut" {
     const many = try work.alloc(Match, collection_cap);
     for (many) |*match| match.* = .{ .absolute_path = "/w/f", .line_number = 1, .line = "x" };
 
-    // The cut lands in the first file, so a later batch running out of
-    // memory changes nothing.
     var past = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
     past.outcomes[0] = .{ .matches = many };
     past.out_of_memory_from = batch_files * 2;
@@ -1461,7 +1439,6 @@ test "grep fails for running out of memory only before the cut" {
     try std.testing.expectEqual(@as(?TruncatedReason, .collection_cap), try mergeMatches(work, &past, &kept));
     try std.testing.expectEqual(collection_cap, kept.items.len);
 
-    // Before the cut, the missing matches would change the result.
     var before = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
     before.outcomes[0] = .{ .matches = many[0..10] };
     before.out_of_memory_from = batch_files;

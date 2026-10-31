@@ -87,7 +87,6 @@ pub fn main(init: std.process.Init) !void {
         const event = nextEvent(random, &table, sent_initialize);
         var out: request.Output = .{};
         table.step(event, &out) catch |err| switch (err) {
-            // Refused steps change nothing and have no model action.
             error.TooManyInFlight, error.InitializeNotCancellable => continue,
             error.IdsExhausted => return err,
         };

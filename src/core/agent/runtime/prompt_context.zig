@@ -91,9 +91,6 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         if (request.verified_images) |images| if (images.len != 0) break :image_input true;
         for (request.messages) |message| {
             if (message.images.len != 0) break :image_input true;
-            // Retained tool images serialize as follow-up user-message file
-            // parts, so they never appear in message.images. Count them as
-            // image input or their base64 payloads are priced as text.
             if (message.tool_result_memory) |memory| if (memory.tool_images.len != 0) break :image_input true;
         }
         break :image_input false;
@@ -103,7 +100,6 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
     }
 
-    // Typed parsing borrows unescaped payload strings. Value parsing copies them.
     const parsed = std.json.parseFromSlice(CostRequest, alloc, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_if_needed,
@@ -117,8 +113,6 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         @intFromBool(parsed.value.messages != null);
     if (envelopes > 1) return error.InvalidRequestMeasurement;
     const messages = parsed.value.prompt orelse parsed.value.input orelse parsed.value.messages orelse {
-        // Unrecognized envelope: degrade to the conservative text estimate
-        // rather than fail the request over a shape this measurer does not know.
         const tokens = textTokens(body);
         return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
     };
@@ -127,10 +121,6 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
     var cursor: usize = 0;
     var found_image = false;
     for (messages) |message| {
-        // Retained tool images never land in user-message content on
-        // input-style bodies: the responses protocol writes them as
-        // input_image parts inside function_call_output items, which carry no
-        // role. Scan both carriers.
         const parts = if (std.mem.eql(u8, message.role, "user"))
             message.content.parts
         else if (parsed.value.input != null and std.mem.eql(u8, message.type, "function_call_output"))
@@ -492,15 +482,11 @@ test "provider request measurement prices retained tool images as image input" {
     ;
     try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
 
-    // Tool images must not be priced as text: their encoded payload inflates
-    // the estimate by roughly bytes/4 phantom tokens.
     const text_only = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(false));
     try std.testing.expect(text_only.estimated_input_tokens > measured.estimated_input_tokens);
 }
 
 test "provider request measurement excludes responses-protocol tool image payloads" {
-    // The responses protocol writes retained tool images as input_image parts
-    // inside function_call_output items, which carry no role.
     const body =
         \\{"input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"capture"},{"type":"input_image","image_url":"data:image/png;base64,AAAABBBBCCCCDDDD"}]},{"role":"user","content":[{"type":"input_text","text":"next"}]}]}
     ;
@@ -521,8 +507,6 @@ test "provider request measurement excludes responses-protocol tool image payloa
 }
 
 test "provider request measurement excludes chat-completions image payloads" {
-    // Chat-completions bodies carry user images, including retained tool
-    // images, as image_url parts with data URLs.
     const body =
         \\{"model":"fixture/model","messages":[{"role":"tool","tool_call_id":"call_1","content":"capture"},{"role":"user","content":[{"type":"text","text":"The tool \"read_file\" returned 1 image(s)."},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAABBBBCCCCDDDD"}}]}]}
     ;
@@ -624,8 +608,6 @@ test "provider request image accounting handles allocation and malformed input f
         "{\"input\":[],\"prompt\":[]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\"}]}]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"escaped\\nimage\"}]}]}",
-        // Prompt-shape file parts must carry the nested v4 data object; every
-        // other shape is rejected rather than mis-measured.
         "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"AAAA\"}]}]}",
         "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\"}]}]}",
         "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"url\",\"url\":\"https://x/y.png\"}}]}]}",

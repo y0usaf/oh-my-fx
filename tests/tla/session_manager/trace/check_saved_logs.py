@@ -135,9 +135,6 @@ def run_tlc(module, spec_files, generated, cfg, invariant="NotWritten"):
         open(os.path.join(work, module + ".cfg"), "w").write(cfg)
         java, jar = toolchain()
         proc = subprocess.run(
-            # Its own java.io.tmpdir: TLC unpacks its standard modules there,
-            # and parallel runs sharing one folder read each other's
-            # half-written files.
             [java, "-XX:+UseParallelGC", f"-Djava.io.tmpdir={work}", "-cp", jar, "tlc2.TLC", "-workers", "1", "-deadlock",
              "-metadir", os.path.join(work, "states"), "-config", module + ".cfg", module],
             cwd=work, capture_output=True, text=True, timeout=600,

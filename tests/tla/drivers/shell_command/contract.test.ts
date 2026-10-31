@@ -1,14 +1,3 @@
-// Runs the real fx binary through every shell call the shell-contract TLA+
-// model covers, then has TLC replay what fx did through the model
-// (tests/tla/shell_command/ShellContract.tla). No model calls: a local fake Gateway serves
-// exact argument bytes.
-//
-// 1. The binary must conform to exactly one modeled design, the current or the
-//    proposed one, and the design properties on the observed trace must match the
-//    exhaustive model check of that design.
-// 2. Controls: tampered, partial and empty evidence must not be accepted.
-// 3. With FX_TLA_PROPOSED=1: the binary must conform to the proposed design
-//    with every property holding. This fails until fx implements it.
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
@@ -21,7 +10,6 @@ const helpers = await targetHelpers();
 const reports = join(artifacts, "tlc");
 const TIMEOUT = 900_000;
 
-// Property verdicts from run-all.sh's exhaustive check of each design.
 const EXPECTED_PROPERTIES: Record<Design, Record<string, string>> = {
   current: { Exactness: "HOLDS", GuardBound: "HOLDS", Completeness: "VIOLATED", HistoryFidelity: "VIOLATED", ZshForgiving: "VIOLATED" },
   proposed: { Exactness: "HOLDS", GuardBound: "HOLDS", Completeness: "HOLDS", HistoryFidelity: "HOLDS", ZshForgiving: "HOLDS" },
@@ -86,7 +74,6 @@ test("bridge rejects tampered, partial and empty evidence", async () => {
   assert.equal(rejected.verdict, "REJECTED", explain(rejected));
   assert.equal(rejected.mismatch?.turn, flip.name, explain(rejected));
 
-  // Drop the only turn that covers some modeled call, so coverage is incomplete.
   const key = (call: { intent: string; shape: string }) => `${call.intent}/${call.shape}`;
   const counts = new Map<string, number>();
   for (const turn of turns) for (const call of turn.calls) counts.set(key(call), (counts.get(key(call)) ?? 0) + 1);

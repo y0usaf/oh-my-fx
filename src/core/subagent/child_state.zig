@@ -515,7 +515,6 @@ pub const Store = struct {
         alloc: Allocator,
         child_id: []const u8,
     ) !void {
-        // A v2 child's own first line says it is one (`role: child`).
         const sessions = switch (self.backend) {
             .v2 => return,
             .v1 => |value| value,
@@ -853,7 +852,6 @@ pub fn isDiscoveredManagedChildSession(
     }
     if (subagent_child) |identity| return identity;
     return sessions.loadListedLegacyChildIdentity(alloc, session_id) catch |err| switch (err) {
-        // A session without an event log has no first event to record it.
         error.SessionNotFound, error.FileNotFound => false,
         else => return err,
     };
@@ -1448,7 +1446,6 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     var old = try Registry.init(alloc, parent_id);
     defer old.deinit(alloc);
 
-    // A new one-off child: one spawn, without a name.
     var next = try old.clone(alloc);
     var first = try testWork(alloc, "work-1", 0xab);
     defer first.deinit(alloc);
@@ -1462,14 +1459,12 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try std.testing.expectEqualStrings(text_utils.repeat("ab", 32), spawn.fingerprint);
     advance(alloc, &old, next);
 
-    // A change of phase alone writes nothing.
     next = try old.clone(alloc);
     next.children[0].phase = .awaiting_approval;
     lines = try planLines(a, old, next);
     try std.testing.expectEqual(@as(usize, 0), lines.len);
     advance(alloc, &old, next);
 
-    // A failure: one finish that carries its text.
     next = try old.clone(alloc);
     try next.finish(alloc, one_off, "work-1", .failed, types.ModelFailureDiagnostic.init("boom"));
     lines = try planLines(a, old, next);
@@ -1479,7 +1474,6 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try std.testing.expectEqualStrings("boom", finish.failure.?);
     advance(alloc, &old, next);
 
-    // A named child: its spawn carries its name.
     next = try old.clone(alloc);
     var second = try testWork(alloc, "work-2", 0xcd);
     defer second.deinit(alloc);
@@ -1489,7 +1483,6 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try std.testing.expectEqualStrings("reviewer", (try std.json.parseFromSliceLeaky(SpawnData, a, lines[0].spawned.data.?, .{})).agent.?);
     advance(alloc, &old, next);
 
-    // Its finish and its next work in one save: the finish comes first.
     next = try old.clone(alloc);
     try next.finish(alloc, named, "work-2", .completed, null);
     var third = try testWork(alloc, "work-3", 0xef);
@@ -1503,7 +1496,6 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try std.testing.expectEqualStrings("work-3", lines[1].spawned.work_id);
     advance(alloc, &old, next);
 
-    // A child never disappears, and only the manager records `lost`.
     var empty = try Registry.init(alloc, parent_id);
     defer empty.deinit(alloc);
     try std.testing.expectError(error.InvalidState, planLines(a, old, empty));
@@ -1540,12 +1532,10 @@ test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
     try std.testing.expectEqualStrings("", failed.instructions());
     try std.testing.expectEqual(Phase.idle, failed.phase);
     try std.testing.expectEqualStrings("boom", failed.last_failure.?.view());
-    // A named child lost before its first turn can take new work (D33).
     const lost = registry.children[2];
     try std.testing.expectEqual(Phase.interrupted, lost.phase);
     try std.testing.expectEqual(Outcome.lost, lost.last_outcome.?);
 
-    // Open work, an unreadable spawn, or a failure on another outcome is refused.
     var bad = folded[1];
     bad.open = true;
     try std.testing.expectError(error.InvalidState, registryFromChildren(alloc, parent_id, &.{bad}));
@@ -1596,7 +1586,6 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
         try state_store.save(alloc, registry);
         try registry.finish(alloc, child_id, "work-1", .completed, null);
         try state_store.save(alloc, registry);
-        // A v2 child needs no marker file: its own first line says it is one.
         try state_store.markChildSession(alloc, child_id);
 
         try children.rememberSeed(child_id, .{ .preferences = seed.preferences, .language = seed.language });

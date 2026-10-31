@@ -97,14 +97,12 @@ pub fn parse(arena: Allocator, data: []const u8, hash: HashFormat) Allocator.Err
         .sha256 => 32,
     };
     if (data.len < 12 + hash_len) return .{ .unavailable = "index_truncated" };
-    // The trailing checksum is not verified; every field below is bounds-checked.
     var reader: Reader = .{ .data = data[0 .. data.len - hash_len] };
     const signature = reader.take(4).?;
     if (!std.mem.eql(u8, signature, "DIRC")) return .{ .unavailable = "index_signature" };
     const version = reader.int(u32).?;
     if (version < 2 or version > 4) return .{ .unavailable = "index_version" };
     const count = reader.int(u32).?;
-    // The smallest v4 entry is 40 + hash + 2 + 1 + 1 bytes.
     if (count > (reader.data.len - reader.pos) / (44 + hash_len)) return .{ .unavailable = "index_truncated" };
 
     const entries = try arena.alloc(Entry, count);
@@ -137,7 +135,6 @@ pub fn parse(arena: Allocator, data: []const u8, hash: HashFormat) Allocator.Err
             const rest = reader.data[reader.pos..];
             const end = std.mem.findScalar(u8, rest, 0) orelse return .{ .unavailable = "index_truncated" };
             const name = rest[0..end];
-            // Entries are padded with 1 to 8 NUL bytes to a multiple of 8.
             const fixed = reader.pos - start;
             const size = (fixed + name.len + 8) & ~@as(usize, 7);
             if (size > reader.data.len - start) return .{ .unavailable = "index_truncated" };
@@ -146,14 +143,11 @@ pub fn parse(arena: Allocator, data: []const u8, hash: HashFormat) Allocator.Err
         };
         previous = path;
         if (path.len == 0) return .{ .unavailable = "index_empty_path" };
-        // Unmerged paths carry stages 1 to 3 in sequence; keep the first.
         if (stage != 0 and kept > 0 and std.mem.eql(u8, entries[kept - 1].path, path)) continue;
         entries[kept] = .{ .path = path, .gitlink = mode & mode_type_mask == mode_gitlink };
         kept += 1;
     }
 
-    // Extensions follow the entries. One starting with an upper-case letter is
-    // optional; any other is required and changes how entries must be read.
     while (reader.pos < reader.data.len) {
         const name = reader.take(4) orelse return .{ .unavailable = "index_truncated" };
         const size = reader.int(u32) orelse return .{ .unavailable = "index_truncated" };
@@ -273,7 +267,6 @@ test "read leaves the index bytes to the caller and frees them when the index is
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad", .data = "not an index" });
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
 
-    // The entries borrow `data`, which stays the caller's to free.
     const outcome = try read(arena, alloc, try std.Io.Dir.path.join(arena, &.{ root, "good" }), .sha1);
     const index = switch (outcome) {
         .index => |value| value,
@@ -283,7 +276,6 @@ test "read leaves the index bytes to the caller and frees them when the index is
     try expectPaths(outcome, &.{"a.txt"}, &.{});
     try std.testing.expectEqual(good.len, index.data.len);
 
-    // An unusable index frees its bytes before returning.
     try std.testing.expect(try read(arena, alloc, try std.Io.Dir.path.join(arena, &.{ root, "bad" }), .sha1) == .unavailable);
 }
 
@@ -295,7 +287,6 @@ test "index reader rejects truncated, hostile and unsupported indexes" {
     const good = try buildForTest(arena, 2, .sha1, &entries, "");
     try expectPaths(try parse(arena, good, .sha1), &.{ "a.txt", "b/c.txt" }, &.{});
 
-    // Every truncation point is reported, never read past.
     for (0..good.len - 1) |len| {
         try std.testing.expect(try parse(arena, good[0..len], .sha1) != .index);
     }
@@ -318,8 +309,6 @@ test "index reader rejects truncated, hostile and unsupported indexes" {
 
     const v4 = try buildForTest(arena, 4, .sha1, &entries, "");
     var bad_prefix = try arena.dupe(u8, v4);
-    // The second entry's strip count, just before its stored suffix, would
-    // remove more than the previous path holds.
     const suffix = std.mem.find(u8, bad_prefix, "b/c.txt").?;
     bad_prefix[suffix - 1] = 0x7f;
     try std.testing.expectEqualStrings("index_prefix", (try parse(arena, bad_prefix, .sha1)).unavailable);

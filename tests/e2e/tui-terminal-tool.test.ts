@@ -683,9 +683,6 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("WIDTH_FLOW_DONE", TIMEOUT);
     await Bun.sleep(300);
 
-    // The 126-column activity cap used to freeze these phrases with trailing
-    // marks; at 160 columns the full launch command fits and must render
-    // without an ellipsis for captured runs, tty runs, and session actions.
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
@@ -754,17 +751,12 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
     await Bun.sleep(300);
 
-    // The main view keeps each row on one line and trails what does not fit.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
     const mainObserved = mainRows.find((line) => line.startsWith("├ Observed "));
     expect(mainObserved).toBeDefined();
     expect(mainObserved).toEndWith("…");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
-    // `interact` carries no command argument, so the Observed heading is the
-    // only place Ctrl-O can show the launch command. It must wrap under the
-    // tree rail instead of trailing. Heading continuations start "│ word";
-    // detail rows start "│  key: value".
     const fullObservedHeading = (grid: string[]) => {
       const rows = grid.map((line) => line.trimEnd());
       const start = rows.findIndex((line) => line.startsWith("├ Observed "));
@@ -798,8 +790,6 @@ test.skipIf(!tmuxAvailable())(
     expect(fullObservedHeading(grid)).toBe(expectedHeading);
     expect(grid.join("\n")).not.toContain("…");
 
-    // Closing Ctrl-O returns to the trailing main view and leaks none of the
-    // full-detail rows into scrollback.
     await session.sendKeys("C-o");
     await session.waitForPane((pane) => !pane.includes("full detail · ctrl+o close"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
@@ -883,9 +873,6 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("session resumed", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
 
-    // The resumed transcript must rebuild full-width rows: the 120-column
-    // activity cap would leave trailing marks, and an unrecorded tty session
-    // would fall back to the raw session id.
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
@@ -1104,7 +1091,6 @@ test.skipIf(!tmuxAvailable())(
     await first.sendText("/quit");
     expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
 
-    // The terminal belonged to the fx process and ended with it, with no prompt.
     await waitUntilGone([shellPid, ...processesMatching("sleep 37.25")], 1_000);
     expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
     expectNoTerminalHostDaemon(fixture);
@@ -1117,7 +1103,6 @@ test.skipIf(!tmuxAvailable())(
     await resumed.sendText("Use the earlier managed TTY.");
     await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);
 
-    // Neither interact nor stop reattaches; both tell the agent to start anew.
     for (const [index, id] of [
       [3, "shell_tty_resume_interact"],
       [4, "shell_tty_resume_stop"],
@@ -1127,7 +1112,6 @@ test.skipIf(!tmuxAvailable())(
       expect(result).toContain("ended when the fx process that started it exited");
       expect(result).toContain("Start a new terminal");
     }
-    // The transcript shows why the terminal is gone.
     expect(await resumed.captureFullScrollback()).toContain("ended when fx exited");
     expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -1157,10 +1141,7 @@ test("fx ask exit ends its TTY terminal within one second", async () => {
   expect(JSON.parse(result.stdout).output).toBe("ASK_TTY_STARTED");
   expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
 
-  // fx may exit before the launcher records the shell pid.
   const shellPid = recordedPid(fixture.home, sessionId);
-  // Match the exact command line of a duration nothing else uses, so other
-  // processes that merely mention it do not count.
   const sleepers = processesMatching("sleep 37.25", { exact: true });
   for (const pid of [...(shellPid === null ? [] : [shellPid]), ...sleepers]) {
     if (!processAlive(pid)) continue;
@@ -1243,7 +1224,6 @@ test.skipIf(!tmuxAvailable())(
     };
     expect(intrusion.tool_calls.map(({ status }) => status)).toEqual(["error", "error"]);
 
-    // The other process exited, but this terminal is still owned and running.
     await Bun.sleep(300);
     expect(processAlive(shellPid)).toBe(true);
     expect(terminalRecord(fixture.home, ownerTerminal).lifecycle).toBe("running");

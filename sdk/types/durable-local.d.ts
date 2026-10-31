@@ -1,5 +1,3 @@
-// `libfx/durable-local` (durable/local.mjs): sessions in files on this
-// machine, through the Workflow local World libfx bundles.
 import type { Durability } from "./libfx.cjs";
 
 export type { Durability } from "./libfx.cjs";

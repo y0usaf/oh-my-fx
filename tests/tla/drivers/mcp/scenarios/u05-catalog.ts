@@ -1,8 +1,3 @@
-// U05 tool catalog, step 6: the catalog core (src/mcp/core/catalog.zig) and
-// the tool store (src/mcp/protocol/tools.zig), driven by
-// tests/tla/drivers/mcp/labs/stdio_lab.zig against the scripted fake server after real era
-// detection. Every scenario checks the catalog, era, stdio, and request
-// traces against their models, and the requests the server actually received.
 
 import type { Rule } from "../fakes/stdio";
 import { expectFinal, labScenario, type LabCase, type Seen } from "../lab";
@@ -18,7 +13,6 @@ const tool = (name: string) => ({ name, inputSchema: { type: "object" } });
 const page = (names: string[], extra: Record<string, unknown> = {}) => ({ tools: names.map(tool), ...extra });
 const ping = (before: unknown[] = []): Rule => ({ method: "ping", before, result: {} });
 
-// What the server received: each request's method, with the cursor of tools/list requests.
 function received(log: { dir: string; line: string }[]): string[] {
   return log
     .filter((l) => l.dir === "in")
@@ -35,7 +29,6 @@ function same(got: unknown, want: unknown, what: string): string | null {
   return JSON.stringify(got) === JSON.stringify(want) ? null : `${what} were ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`;
 }
 
-// Detection, then the catalog, on one preferred modern version.
 function catalogScenario(c: Omit<LabCase, "unit" | "requestTrace" | "era" | "catalog"> & { maxPages?: number; modelPages?: number; catalogVerdict?: "ACCEPTED" | "REJECTED" }): Scenario {
   const maxPages = c.maxPages ?? 100;
   return labScenario({

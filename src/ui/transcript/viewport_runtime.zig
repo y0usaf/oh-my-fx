@@ -1,13 +1,3 @@
-// Host contract:
-// - fields: entries, transcript, layout, cursor_row, cursor_col, viewport_top_row,
-//   owned_top_row, pending_scroll_compact,
-//   min_visible_viewport_rows, reflow_clear_guard_rows, viewport_clear_pending,
-//   resize_history_row_delta,
-//   has_painted_transcript,
-//   last_viewport_selection, last_visible_transcript_*, last_paint_bottom_reserved_rows,
-//   replaceable_row, extra_input_rows, footer_reserved_base_rows
-// - methods: invalidateTranscriptAnchor, recordFrameInvalidation
-// This module owns viewport anchoring and footer-gap coordination helpers.
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");

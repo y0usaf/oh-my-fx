@@ -68,9 +68,6 @@ pub fn walkText(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) Wa
     return .{ .end_row = row, .end_col = col };
 }
 
-// Transcript rows can carry SGR + OSC-8 + other escape sequences (image
-// badges, the user-message bar). ANSI-aware walking skips escape bytes so
-// terminal position tracking stays correct whether a row is plain text or styled.
 pub fn nextCursorColForLine(line: []const u8, cols: u16) u16 {
     if (cols == 0) return 1;
     return @min(cols, walkText(1, 1, line, cols).end_col);

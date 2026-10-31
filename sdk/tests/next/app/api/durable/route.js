@@ -7,8 +7,6 @@ function stream(events) {
   return new Response(data, { headers: { "content-type": "text/event-stream" } });
 }
 
-// One agent for the server, as an app holds it; its sessions live in the
-// durability the environment picks.
 const agent = createFxAgent({
   apiKey: "fixture-unused-key",
   model: "fixture/model",
@@ -37,7 +35,6 @@ export async function POST(request) {
   return new Response(turn.readable, { headers: { "content-type": "application/x-ndjson", "x-libfx-session": session.id } });
 }
 
-// Reconnects from any server.
 export async function GET(request) {
   if (!authorized(request)) return new Response(null, { status: 401 });
   const params = new URL(request.url).searchParams;

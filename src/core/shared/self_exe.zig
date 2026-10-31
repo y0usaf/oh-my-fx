@@ -79,7 +79,6 @@ test "linux re-exec paths name the live inode, not the replaced on-disk file" {
     if (builtin.target.os.tag != .linux) return;
     const alloc = std.testing.allocator;
 
-    // Bypass the test override to cover the Linux production branch.
     const same_process = try productionPathForReexec(alloc);
     defer alloc.free(same_process);
     try std.testing.expectEqualStrings(linux_self_exe, same_process);
@@ -107,7 +106,6 @@ test "peer re-exec path prefers a name that outlives this process" {
     const alloc = std.testing.allocator;
     const path = try productionPathForPeerReexec(alloc);
     defer alloc.free(path);
-    // Fall back to procfs only after the durable on-disk name disappears.
     if (std.mem.startsWith(u8, path, "/proc/")) {
         const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch return;
         defer alloc.free(resolved);
@@ -137,6 +135,5 @@ test "on-disk probe rejects a replaced binary so the peer path falls back" {
     try std.Io.Dir.cwd().deleteFile(io_mod.getIo(), victim);
     try std.testing.expect(!onDiskPathIsExecutable(victim));
 
-    // Peer paths must be absolute.
     try std.testing.expect(!onDiskPathIsExecutable("fx"));
 }

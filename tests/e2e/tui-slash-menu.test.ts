@@ -457,9 +457,6 @@ function createModelsMenuFixture() {
   return { home, workspace, settingsPath, tapePath, stderrPath };
 }
 
-// The menu matcher searches skill paths, so this fixture's home directory must
-// not contain the substring "home": a "home" path segment would make the
-// query HOME match every installed skill.
 function createMentionGuardFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mention-guard-")));
   workDirs.push(root);
@@ -834,16 +831,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         remainOnExit: true,
       });
       await session.waitForComposer(10_000);
-      // Before any title exists, the tab falls back to the build and folder.
       await waitForPaneTitle(session, fallbackTitle(workspace), 5_000);
 
-      // The first prompt's derived title becomes the tab title.
       await session.sendText("generate the release notes");
       await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
       await session.waitForStableComposer();
       await waitForPaneTitle(session, "generate the release notes", 5_000);
 
-      // A rename replaces the tab title.
       await session.sendText("/rename deploy pipeline fix");
       await session.waitForText("renamed to \"deploy pipeline fix\"", 10_000);
       await session.waitForStableComposer();
@@ -865,7 +859,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
 
-      // A resumed session keeps its title in the tab, even in a new folder.
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
@@ -886,7 +879,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
       expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
 
-      // A fresh session resets the tab to the build and current folder.
       await session.sendText("/new");
       await session.waitForStableComposer();
       await waitForPaneTitle(session, fallbackTitle(resumedWorkspace), 5_000);
@@ -2546,15 +2538,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) => composerContains(current, "hello draft") && !current.includes("tab provider"),
         5_000,
       );
-      // The cursor is restored with the text: typing lands mid-draft.
       await session.sendLiteralText("X");
       await session.waitForPane(
         (current) => composerContains(current, "hello drXaft"),
         5_000,
       );
 
-      // A model without effort or Fast options applies on Enter and returns
-      // the draft.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
       await session.sendLiteralText("plain");
@@ -2571,13 +2560,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
 
-      // A model with effort and Fast options continues into the same inline
-      // stages /model offers, and the draft returns once the model applies.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
       await session.sendLiteralText("staged");
-      // The transcript already names the plain model; only its catalog row
-      // must be filtered out.
       await session.waitForPane(
         (current) =>
           current.includes(currentModel) &&
@@ -2615,7 +2600,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
-      // The restored cursor sits mid-draft; clear the whole line before /quit.
       await session.sendKeys("C-e");
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);

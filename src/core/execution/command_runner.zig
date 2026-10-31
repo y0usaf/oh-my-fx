@@ -254,11 +254,6 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         };
         target_input.close(zio);
     } else {
-        // A large script can exceed the pipe buffer, and on macOS the target
-        // stays suspended until waitForForegroundTarget resumes it, so it is
-        // written while the target runs. The target already exec'd with the
-        // default SIGPIPE disposition; ignoring it here only keeps a target
-        // that stops reading from killing the supervisor.
         const ignore_action: std.posix.Sigaction = .{
             .handler = .{ .handler = std.posix.SIG.IGN },
             .mask = std.posix.sigemptyset(),
@@ -286,7 +281,6 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
-    // The target has exited, so the writer finished or saw a broken pipe.
     if (script_writer) |writer| writer.join();
     exitForegroundSessionSupervisor(term);
 }
@@ -764,8 +758,6 @@ pub fn executeCommandInEnvironment(
 
 fn snapshotEligible(shell_path: []const u8, command: []const u8) bool {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return false;
-    // A NUL cannot travel through the stdin script; keep today's argv path,
-    // which rejects it at spawn.
     return shell_resolver.shellKind(shell_path) != null and
         std.mem.findScalar(u8, command, 0) == null;
 }
@@ -847,9 +839,6 @@ fn executeWithSnapshot(
         &generation.environ,
     );
     if (snapshotReplayFailed(result, failure_marker)) {
-        // The replay stopped before the command started, so the command has
-        // not run. Fail this snapshot and let the caller run it once with
-        // full startup.
         debug_trace.logf(
             "core",
             "command runner snapshot replay failed generation={d}; rerunning with full startup",
@@ -1406,7 +1395,6 @@ fn executeProcessWithDetachedSession(
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
-    // The supervisor passes its environment through to the target shell.
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
@@ -1455,7 +1443,6 @@ fn executeProcessWithDetachedSession(
         process_group_id,
         .foreground_supervisor,
     );
-    // Judge the deadline at the supervisor's exit, not after the output drain.
     collected.source = reconcileForegroundTerminationSource(
         collected.source,
         deadline_ms,
@@ -1556,7 +1543,6 @@ pub fn finishDetachedSession(
     debug_trace.logf("core", "detached session lifeline closed pid={d}", .{pid});
     var waiter = ChildWaiter.init(child);
     waiter.start() catch |err| {
-        // The supervisor still exits on its own, so wait for it here.
         debug_trace.logf("core", "detached session exit watch unavailable pid={d} err={s}", .{ pid, @errorName(err) });
         return child.wait(io);
     };
@@ -2077,9 +2063,6 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
     try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.SIG.TERM)), foreground.signal);
 
-    // The startup files ran once into the snapshot. The aliased `builtin`
-    // could not intercept the alias-safe `\builtin eval` that runs the
-    // command, and the replayed TRAPDEBUG still observed it.
     const debug_output = try readAbsoluteFile(arena, debug_log, 64 * 1024);
     try std.testing.expect(std.mem.find(u8, debug_output, "builtin eval") != null);
     try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
@@ -2201,8 +2184,6 @@ test "user profile commands reuse one startup-file snapshot" {
     const arena = arena_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Thousands of functions push the replay past the pipe buffer, so the
-    // supervisor must stream it while the shell reads.
     const paths = try writeSnapshotTestShell(
         arena,
         &tmp,
@@ -2270,7 +2251,6 @@ test "user profile command with an approval from an earlier shell epoch does not
     const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
     const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
 
-    // The grant was checked under epoch 0; a refresh moved the shell to 1.
     shell_snapshot.processOwner().markDirty(.user_reload);
     const stale = try executeCommandInEnvironment(
         .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = 0 },
@@ -2335,7 +2315,6 @@ test "user profile command reruns once with full startup after a failed replay" 
     try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
     try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
 
-    // Later commands fall back to full startup without retrying the replay.
     _ = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
     try std.testing.expectEqualStrings("ran\nran\n", try readAbsoluteFile(arena, marker_path, 4096));
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
@@ -2633,8 +2612,6 @@ const OutputChunkEmitter = struct {
             @memmove(pending.items[0..remaining], pending.items[line_start..]);
             pending.items.len = remaining;
         }
-        // The final flush always delivers the last partial line. It is one
-        // callback, so it cannot stretch the drain.
         if (!flush_remainder and pending.items.len > 0 and self.liveDeliveryEnded(cfg)) {
             self.suppressPresentation(error.OutputDrainInterrupted);
             return;
@@ -2991,8 +2968,6 @@ fn collectOutput(
     var natural_drain: ?NaturalDrain = null;
 
     while (true) {
-        // Observe the leader before any deadline or cancel so a command that
-        // already exited on its own is never signaled or reclassified.
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
@@ -3062,8 +3037,6 @@ fn collectOutput(
             ) orelse break :drain_stop;
             const cuts_output = drain.cutsCommandOutput(reason);
             if (cuts_output and !drain.confirming) {
-                // One more read shows whether the command's own output is
-                // still waiting or has all been read.
                 drain.confirming = true;
                 break :drain_stop;
             }
@@ -3205,8 +3178,6 @@ const NaturalDrain = struct {
         self.bytes +|= read_len;
         self.waited_ns +|= @max(waited_ns, 0);
         if (timed_out) self.leftover_read = true;
-        // A read that returns nothing without timing out ended one stream,
-        // which settles nothing about the other, so confirmation starts over.
         if (read_len == 0) self.confirming = false;
     }
 
@@ -3471,8 +3442,6 @@ fn updateTerminationSignal(
 
     if (signal_started_ms.*) |sent_ms| {
         if (!force_kill_sent.*) {
-            // A force request (process exit) escalates a cooperative stop
-            // that is still inside its grace window.
             const grace_expired = now_ms - sent_ms >= 800;
             if (grace_expired or cancelRequested(cfg.force_cancel_flag)) {
                 try observer.signal(process_group_id, termination_protocol, .force);
@@ -3859,7 +3828,6 @@ test "foreground session owner loss kills the target and descendant before delay
     defer alloc.free(quoted_pids);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
-    // Keep a write window open, but publish readiness only after the PID record is complete.
     const target_script = try alloc.print(
         "sleep 30 & child=$!; (sleep 0.05; printf '%s %s' \"$$\" \"$child\") > {s}.pending && mv {s}.pending {s}; sleep 3; printf FINISHED > {s}",
         .{ quoted_pids, quoted_pids, quoted_pids, quoted_effect },
@@ -3919,9 +3887,6 @@ test "finishing a detached session leaves cleanup to its supervisor" {
     defer alloc.free(pid_path);
     const quoted_pid = try shellQuote(alloc, pid_path);
     defer alloc.free(quoted_pid);
-    // The descendant leaves the supervisor's process group before it records
-    // its PID, so killing that group cannot stop it. Only the supervisor's
-    // own cleanup can.
     const script = try alloc.print(
         "python3 -c 'import os,sys,time; os.setpgid(0,0); p=sys.argv[1]; " ++
             "open(p+\".pending\",\"w\").write(str(os.getpid())); os.rename(p+\".pending\",p); " ++
@@ -5532,8 +5497,6 @@ test "natural command completion keeps a daemon that detached after setsid" {
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
-    // Natural cleanup stops the child while it is still in the command
-    // session, so the parent waits for readiness after setsid and redirection.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5578,8 +5541,6 @@ test "natural command completion keeps a double-forked daemon and its children" 
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "daemon.pids" });
     defer alloc.free(pid_path);
-    // The daemon keeps every inherited descriptor except the output streams,
-    // like CLIs that spawn a detached background server and a browser child.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5631,8 +5592,6 @@ test "natural command completion returns while a detached daemon keeps command o
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "output-holder.pid" });
     defer alloc.free(pid_path);
-    // The daemon keeps a duplicate of the output pipe on a high descriptor,
-    // so end of file never arrives while it runs.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5682,8 +5641,6 @@ test "natural command completion keeps a detached daemon that hides its descript
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
     defer alloc.free(pid_path);
-    // Like ssh-agent, the daemon turns off Linux process inspection, then it
-    // closes every descriptor. Neither may decide whether it survives.
     const command = try alloc.print(
         "python3 -c 'import ctypes,os,sys,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5720,7 +5677,6 @@ test "natural command completion keeps a detached daemon that hides its descript
 test "natural completion drain counts every wait and cuts output only before the leftover is read" {
     const wait_limit_ns: i128 = natural_completion_wait_ms * std.time.ns_per_ms;
     var drain: NaturalDrain = .{ .completed_ms = 1_000 };
-    // Leftover output reads without waiting, however slowly it is delivered.
     drain.record(4096, false, 0);
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), drain.stop(9_000, false, null));
     try std.testing.expect(drain.cutsCommandOutput(.cancelled));
@@ -5728,21 +5684,16 @@ test "natural completion drain counts every wait and cuts output only before the
     try std.testing.expect(!drain.cutsCommandOutput(.wait_limit));
     try std.testing.expect(!drain.cutsCommandOutput(.byte_limit));
 
-    // Waits count even when a detached writer's output ends them.
     drain.record(16, false, wait_limit_ns - 1);
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), drain.stop(9_000, false, null));
     drain.record(16, false, 1);
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, .wait_limit), drain.stop(9_000, false, null));
 
-    // A stream reaching end of file restarts a confirmation but proves
-    // nothing about the other stream.
     drain.confirming = true;
     drain.record(0, false, 0);
     try std.testing.expect(!drain.confirming);
     try std.testing.expect(drain.cutsCommandOutput(.cancelled));
 
-    // A read that finds nothing for a whole poll shows the command's own
-    // output is done.
     drain.record(0, true, 0);
     try std.testing.expect(!drain.cutsCommandOutput(.cancelled));
     try std.testing.expect(!drain.cutsCommandOutput(.deadline));
@@ -5753,7 +5704,6 @@ test "natural completion drain counts every wait and cuts output only before the
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, .cancelled), busy.stop(1_001, true, null));
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, .deadline), busy.stop(1_500, false, 1_500));
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(1_499, false, 1_500));
-    // The live limit ends only delivery. Reading continues past it.
     const limit_ms = busy.completed_ms + natural_completion_live_ms;
     try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(limit_ms + 1, false, null));
     try std.testing.expectEqual(limit_ms, busy.liveUntilMs(null));
@@ -5782,8 +5732,6 @@ test "natural completion delivers all leftover output to a slow consumer" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    // The command exits with its last lines still in the pipe, and delivery
-    // takes 10 ms per line, so draining them takes well over one second.
     var consumer = SlowOutputConsumer{ .delay_ms = 10 };
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
@@ -5808,8 +5756,6 @@ test "natural command completion stops a same-session process that left the proc
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "own-group.pid" });
     defer alloc.free(pid_path);
-    // A process group kill cannot reach this child, so only the session
-    // rule stops it.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5853,9 +5799,6 @@ test "natural completion keeps its exit when the deadline passes during the outp
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
     defer alloc.free(pid_path);
     const timeout_ms: usize = 3_000;
-    // The command exits about 800 ms before its deadline while a detached
-    // daemon keeps the output open, so the deadline lands inside the drain.
-    // Its last line has no newline, so only the final flush delivers it live.
     const command = try alloc.print(
         "python3 -c 'import os,sys,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5913,8 +5856,6 @@ test "natural completion stops waiting on a detached daemon that keeps writing" 
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "chatty-daemon.pid" });
     defer alloc.free(pid_path);
-    // The daemon writes to the command's output every 5 ms, so the pipes
-    // never reach end of file and no read waits a whole poll.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -5980,8 +5921,6 @@ test "natural completion ends live delivery of drained output at a cancel" {
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "burst-daemon.pid" });
     defer alloc.free(pid_path);
-    // After the command exits, the daemon writes 200 lines at once, and the
-    // reader takes 20 ms per line and cancels at the 20th.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -6034,8 +5973,6 @@ test "natural completion keeps complete output when a cancel follows the command
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    // Delivering the last line takes long enough for the command to exit
-    // and both pipes to reach end of file before the cancel lands.
     var cancel = std.atomic.Value(bool).init(false);
     var trigger = CancelOnOutput{ .cancel = &cancel, .needle = "FINAL-LINE", .delay_ms = 300 };
     const result = try executeCommand(.{
@@ -6064,8 +6001,6 @@ test "natural completion keeps complete output when a cancel follows only daemon
     defer alloc.free(workspace);
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "late-daemon.pid" });
     defer alloc.free(pid_path);
-    // The daemon writes once after the command exits, and that output
-    // triggers the cancel, so only daemon output is left unread.
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -6138,14 +6073,11 @@ test "output emitter delivers each line once and flushes the last partial line a
     try std.testing.expectEqualStrings("one\ntwo\nthree\n", recorder.delivered.items);
     try std.testing.expectEqual(@as(usize, 3), recorder.calls);
 
-    // Once live delivery has ended, the final flush still delivers the last
-    // partial line.
     emitter.live_until_ms = 0;
     emitter.flush(alloc, cfg);
     try std.testing.expectEqualStrings("one\ntwo\nthree\nfour", recorder.delivered.items);
     try std.testing.expectEqual(@as(usize, 4), recorder.calls);
 
-    // Later lines are collected by the caller but no longer delivered live.
     var ended: OutputChunkEmitter = .{ .live_until_ms = 0 };
     defer ended.deinit(alloc);
     ended.emitPending(alloc, &ended.stdout_pending, .stdout, "late\n", cfg, false);
@@ -6161,8 +6093,6 @@ test "natural completion marks output incomplete when the deadline cuts leftover
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    // The command exits at once, but delivering its 200 lines takes about
-    // four seconds, so the deadline lands while its output is still unread.
     var consumer = SlowOutputConsumer{ .delay_ms = 20 };
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
@@ -6175,8 +6105,6 @@ test "natural completion marks output incomplete when the deadline cuts leftover
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
     try std.testing.expect(!command_result.timed_out);
     try std.testing.expect(command_result.output_incomplete);
-    // Live delivery ends at the deadline, so the confirming read is not
-    // delivered line by line.
     try std.testing.expect(consumer.lines < 100);
 }
 

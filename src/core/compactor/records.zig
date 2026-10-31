@@ -101,7 +101,6 @@ pub const max_file_name_bytes = file_prefix.len + 1 + 20 + file_suffix.len;
 
 /// `compacted-T<number>.txt` or `compacted-M<number>.txt` in `buffer`.
 pub fn fileName(buffer: *[max_file_name_bytes]u8, id: Id) []const u8 {
-    // The buffer holds any usize in decimal.
     const digits_start = file_prefix.len + 1;
     buffer[0..file_prefix.len].* = file_prefix.*;
     buffer[file_prefix.len] = id.kind.letter();
@@ -175,7 +174,6 @@ pub fn highestSaved(arena: Allocator, store: Store) Store.Error!Highest {
 pub fn readExact(arena: Allocator, store: Store, name: []const u8, bytes: usize) Allocator.Error!?[]const u8 {
     const problem: []const u8 = problem: {
         if (bytes > max_file_bytes) break :problem "ResultSizeUnsupported";
-        // One byte more than expected shows a file that grew.
         const content = store.read(arena, name, bytes + 1) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => break :problem @errorName(err),
@@ -256,7 +254,6 @@ pub fn search(alloc: Allocator, store: Store, queries: []const []const u8, limit
         const id = parseFileName(name);
         if (id == null and !isEarlierArchive(name)) continue;
         const content = store.read(arena, name, max_file_bytes) catch |err| switch (err) {
-            // Removed between listing and opening.
             error.FileNotFound => continue,
             else => return err,
         };
@@ -562,7 +559,6 @@ fn excerpt(arena: Allocator, body: []const u8, query: Query, weights: []const f6
     }
     if (hits.items.len == 0) return body[0..text_utils.utf8BackwardBoundary(body, shown_bytes)];
 
-    // Slide over the hits, keeping room around the words for context.
     const span = shown_bytes * 3 / 4;
     var counts: [max_terms]u32 = @splat(0);
     var covered: f64 = 0;
@@ -585,7 +581,6 @@ fn excerpt(arena: Allocator, body: []const u8, query: Query, weights: []const f6
         if (counts[hit.term] == 0) covered -= weights[hit.term];
     }
 
-    // Center the matching words, then move each end to a nearby line break.
     const words_start = hits.items[best_first].at;
     const words_end = hits.items[best_last].at;
     var to = @min(body.len, ((words_start + words_end) / 2 -| shown_bytes / 2) + shown_bytes);
@@ -725,14 +720,11 @@ test "words match in any form and order, and rare words count more" {
     const found = try search(alloc, store, &.{"2gb limit"}, 5);
     defer alloc.free(found);
     try testing.expect(std.mem.find(u8, found, "matches=\"2\"") != null);
-    // The turn has every word; the tool only repeats the common one.
     const turn = std.mem.find(u8, found, "[1] M21 turn:").?;
     try testing.expect(turn < std.mem.find(u8, found, "[2] T7 shell").?);
-    // Short records are shown whole.
     try testing.expect(std.mem.find(u8, found, "Nothing happens: 2GB is not a limit in the disk-reserve design.") != null);
     try testing.expect(std.mem.find(u8, found, "result-shell") == null);
 
-    // Singular and plural are the same word.
     const plural = try search(alloc, store, &.{"limits"}, 5);
     defer alloc.free(plural);
     try testing.expect(std.mem.find(u8, plural, "matches=\"2\"") != null);
@@ -774,7 +766,6 @@ test "each search says which records hold all its words, first and last, beyond 
     try save(alloc, store, .{ .kind = .tool, .number = 5 }, "T5 shell: zig build test\nResult:\ntests failed, tests failed, tests failed\n");
     try save(alloc, store, .{ .kind = .turn, .number = 1 }, "M1 turn: fix it\nUser 1:\nfix it\n\nAssistant, final reply:\nThe tests failed twice.\n");
 
-    // The best match is the latest look-alike; the first one is still named.
     const found = try search(alloc, store, &.{ "tests failed", "zebra" }, 1);
     defer alloc.free(found);
     try testing.expect(std.mem.find(u8, found, "[1] T5 shell") != null);
@@ -782,7 +773,6 @@ test "each search says which records hold all its words, first and last, beyond 
     try testing.expect(std.mem.find(u8, found, "Every word of \"tests failed\" is in 1 turn (M1), 3 tool calls (first T2, last T5).\n") != null);
     try testing.expect(std.mem.find(u8, found, "Every word of \"zebra\" is in no saved record.\n") != null);
     try testing.expect(std.mem.find(u8, found, "IDs count up in time order: a lower number came earlier.\n") != null);
-    // The coverage comes before the results.
     try testing.expect(std.mem.find(u8, found, "Every word of").? < std.mem.find(u8, found, "[1] T5").?);
 
     const none = try search(alloc, store, &.{"zebra"}, 5);
@@ -829,18 +819,14 @@ test "earlier conversation archives are searched one message at a time" {
 
     const found = try search(alloc, store, &.{"2 GB is not a limit"}, 5);
     defer alloc.free(found);
-    // The reply is one record with the tool call it made; the tool result is
-    // another.
     const start = std.mem.find(u8, archive_text, "### Original assistant\nNothing").?;
     const end = std.mem.find(u8, archive_text, "### Tool result").?;
     const expected = try alloc.print("[1] Earlier conversation archive result-source-aaaa-bbbb.txt, bytes {d}–{d}\n### Original assistant\nNothing special happens at 2 GB.", .{ start + 1, end });
     defer alloc.free(expected);
     try testing.expect(std.mem.find(u8, found, expected) != null);
     try testing.expect(std.mem.find(u8, found, "argument_excerpt=df -h") != null);
-    // Only matching parts are shown, not the rest of the archive.
     try testing.expect(std.mem.find(u8, found, "64 MB") == null);
 
-    // The archive's name is not searched.
     const by_name = try search(alloc, store, &.{"aaaa"}, 5);
     defer alloc.free(by_name);
     try testing.expect(std.mem.find(u8, by_name, "matches=\"0\"") != null);
@@ -877,7 +863,6 @@ test "long shell results show the matching part of their one JSON line" {
     const arena = arena_state.allocator();
     const body = "{\"session_id\":null,\"output_delta\":\"" ++ text_utils.repeat("noise row here\\n", 400) ++ "total sessions: 11,355\\n" ++ text_utils.repeat("more noise\\n", 400) ++ "\"}";
     const query = try prepareQuery(arena, &.{"total sessions"});
-    // A word right after an escaped newline is still that word.
     var counts: [max_terms]u32 = @splat(0);
     var phrase_hits: [max_search_phrases]bool = @splat(false);
     _ = countTerms(body, query, 1, counts[0..query.terms.len], phrase_hits[0..query.phrases.len]);
@@ -888,7 +873,6 @@ test "long shell results show the matching part of their one JSON line" {
     try testing.expect(shown.len <= shown_bytes);
     try testing.expect(std.mem.find(u8, shown, "total sessions: 11,355") != null);
     try testing.expect(std.mem.find(u8, shown, "session_id") == null);
-    // Both ends fall on escaped line breaks.
     try testing.expect(std.mem.startsWith(u8, shown, "noise row here\\n"));
     try testing.expect(std.mem.endsWith(u8, shown, "more noise\\n"));
 }

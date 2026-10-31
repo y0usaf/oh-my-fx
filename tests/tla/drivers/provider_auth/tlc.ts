@@ -1,7 +1,3 @@
-// Runs checks of tests/tla/sdk/ProviderAuth.tla with the TLC that
-// ../lib/tlc.ts finds.
-// A check is a generated module that fixes the model's constants, a config
-// naming the properties, and the verdict each property must have.
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";

@@ -110,8 +110,6 @@ pub fn save(alloc: Allocator, path: []const u8, trees: []const Tree) !void {
 
     const dir_path = std.Io.Dir.path.dirname(path) orelse return error.InvalidSnapshotPath;
     try io_mod.makeDirRecursive(dir_path);
-    // `.iterate` matters on Linux: without it the descriptor is O_PATH and
-    // the directory fsync inside durableReplaceVerified fails with EBADF.
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .follow_symlinks = false, .iterate = true });
     defer dir.close(io);
     var verified: io_mod.VerifiedDir = .{ .dir = dir };
@@ -331,24 +329,19 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
         try std.testing.expectEqualStrings("b.txt", loaded.trees[1].entries[0].path);
     }
 
-    // A different scope, or the same roots in another order, never reuses it.
     try std.testing.expect((try load(alloc, path, &.{"/w"})) == null);
     try std.testing.expect((try load(alloc, path, &.{ "/extra", "/w" })) == null);
 
-    // Every single-byte change breaks the digest.
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_write });
     try file.writePositionalAll(std.testing.io, "X", magic.len + Sha256.digest_length + 4);
     file.close(std.testing.io);
     try std.testing.expect((try load(alloc, path, &roots)) == null);
 
-    // Older formats fail the magic check. A v2 file stamped every source
-    // without following symlinks.
     for ([_][]const u8{ "fx-file-index-v1\n{}", "fx-file-index-v2\n" }) |old| {
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = old, .flags = .{ .permissions = .fromMode(0o600) } });
         try std.testing.expect((try load(alloc, path, &roots)) == null);
     }
 
-    // A file others can read is not trusted.
     try save(alloc, path, &trees);
     try std.Io.Dir.cwd().setFilePermissions(std.testing.io, path, .fromMode(0o644), .{});
     try std.testing.expect((try load(alloc, path, &roots)) == null);

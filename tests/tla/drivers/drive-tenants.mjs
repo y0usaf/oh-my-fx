@@ -1,27 +1,4 @@
 #!/usr/bin/env bun
-// Drives real libfx durable agents along the TLC state graph of
-// TenantIsolation.tla, and checks after every step that the code is in a
-// state the model allows.
-//
-//   bun tests/tla/drivers/drive-tenants.mjs [--walks N] [--depth N] [--seed S]
-//
-// `tests/tla/sdk/check.sh` model-checks the spec and writes
-// graphs/tenants-route.dot, the "four" topology with every rule on.
-//
-// This process is the shared function. Four tenants each create one agent
-// in it, as the model's Register steps say: acme and evil both name theirs
-// "support" on store key k1 but keep their sessions in different Worlds, bob
-// names his "billing" on acme's World, and carl names his "support" on store
-// key k2. Every World delivers only over HTTP, to one wakeHandler() route, as
-// vercel() does, and its queue is the driver's: it holds each message until a
-// Deliver step posts it to the route. A Forge step posts a delivery no queue
-// sent, as anyone who can reach the route can. The harness is scripted: its
-// turns record which tenant's agent ran them, in which World, with which
-// context, which is what the model checks.
-//
-// After each step the driver reads every session's log in every World, the
-// turns that ran, and what is queued, and keeps the model states that match.
-// A step that leaves none is a conformance failure.
 import { strict as assert } from "node:assert";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,7 +17,6 @@ const walks = Number(option("walks", 40));
 const depth = Number(option("depth", 14));
 let seed = Number(option("seed", Date.now() % 100000));
 const firstSeed = seed;
-// A small deterministic generator, so a failing walk can be run again.
 const random = () => {
   seed = (seed * 1103515245 + 12345) % 2147483648;
   return seed / 2147483648;
@@ -53,21 +29,14 @@ const graph = await loadGraph(resolve(here, "../sdk/graphs/tenants-route.dot"));
 const durableInternals = Symbol.for("libfx.durableInternals");
 const encoder = new TextEncoder();
 
-// The "four" topology, as TenantIsolation.tla defines it.
 const tenants = ["acme", "evil", "bob", "carl"];
 const nameOf = { acme: "support", evil: "support", bob: "billing", carl: "support" };
 const keyOf = { acme: "k1", evil: "k1", bob: "k1", carl: "k2" };
 const storeOf = { acme: "A", evil: "B", bob: "A", carl: "C" };
 const stores = ["A", "B", "C"];
 const keyOfStore = { A: "k1", B: "k1", C: "k2" };
-// Comfortably over the limit libfx admits for one input (sdk/durable.js
-// maxInputBytes).
 const oversizeBytes = 9 * 1024 * 1024;
 
-// ---------------------------------------------------------------------------
-// The code under test.
-
-// Every turn any agent ran, as the harness saw it.
 const turns = [];
 const createTenantAgent = createDurableAgentFactory({
   name: "createTenantAgent",
@@ -100,7 +69,6 @@ const createTenantAgent = createDurableAgentFactory({
   }),
 });
 
-// The queue every World shares: each message, until a step delivers it.
 const held = [];
 const keys = new Set();
 let queued = 0;
@@ -113,7 +81,6 @@ function enqueue(queueName, payload, idempotencyKey) {
   return { messageId };
 }
 
-// A World over `dir` that delivers only to the route the driver posts to.
 function routeWorld(dir) {
   const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
   return {
@@ -155,7 +122,6 @@ async function openWalk() {
     labelOf.set(durabilities[st], st);
   }
   const storeOfDurability = (durability) => labelOf.get(durability) ?? "?";
-  // One reader per World, named apart from every tenant's agent.
   const observers = {};
   for (const st of stores) {
     observers[st] = createTenantAgent({ name: `observer-${st}`, durability: durabilities[st], tenant: `observer-${st}`, storeOfDurability });
@@ -163,7 +129,6 @@ async function openWalk() {
   held.length = 0;
   keys.clear();
   turns.length = 0;
-  // Each tenant's session, a run id a World accepts.
   const sessionOf = {};
   for (const t of tenants) sessionOf[t] = await observers.A.newSessionId();
   const tenantOfSession = new Map(tenants.map((t) => [sessionOf[t], t]));
@@ -175,9 +140,6 @@ async function openWalk() {
   };
   return walk;
 }
-
-// ---------------------------------------------------------------------------
-// The code's state, in the model's terms.
 
 const idOf = (messageId) => (messageId === "f0" ? 0 : /^m(\d+)$/.test(messageId ?? "") ? Number(messageId.slice(1)) : `?${messageId}`);
 const contextOf = (context) => (context === undefined || context === null ? "none" : typeof context.tenant === "string" ? context.tenant : "?");
@@ -209,8 +171,6 @@ async function observe(walk) {
   return { agents: Object.keys(walk.agents), refused: [...walk.refused], log, owner, done, queue, ran };
 }
 
-// One canonical form for model and code alike: every collection in this
-// spec is a set, so arrays compare sorted.
 const canonical = (value) => {
   if (Array.isArray(value)) return `{${[...new Set(value.map(canonical))].sort().join(",")}}`;
   if (value && typeof value === "object") return `[${Object.keys(value).sort().map((key) => `${key}:${canonical(value[key])}`).join(",")}]`;
@@ -226,9 +186,6 @@ const viewOf = (state) => canonical({
   ran: state.ran,
 });
 
-// ---------------------------------------------------------------------------
-// The steps.
-
 async function perform(walk, act) {
   const { sessionOf } = walk;
   switch (act.name) {
@@ -236,7 +193,6 @@ async function perform(walk, act) {
       const t = act.t;
       try {
         const agent = createTenantAgent({ name: nameOf[t], durability: walk.durabilities[storeOf[t]], tenant: t, storeOfDurability: walk.storeOfDurability });
-        // Opens its backend, as its first request does.
         await agent.newSessionId();
         walk.agents[t] = agent;
       } catch (error) {
@@ -293,17 +249,12 @@ async function perform(walk, act) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// The walks.
-
 const sameAct = (a, b) => canonical(a) === canonical(b);
 const seenStates = new Set([graph.init]);
 const seenEdges = new Set();
 const outcomes = {};
 let steps = 0;
 
-// The acts the frontier's states allow next, by name then variant, so a
-// name with many variants, such as Forge, does not crowd out the rest.
 function chooseAct(frontier, only) {
   const acts = new Map();
   for (const id of frontier) {
@@ -317,8 +268,6 @@ function chooseAct(frontier, only) {
   const byName = new Map();
   for (const act of acts.values()) byName.set(act.name, [...(byName.get(act.name) ?? []), act]);
   const variants = pick([...byName.values()]);
-  // Most forged deliveries name an agent that runs, so they test the
-  // refusal rather than miss.
   if (variants[0].name === "Forge" && random() < 0.8) {
     const running = new Set([...frontier].flatMap((id) => graph.states.get(id).agents).map((t) => `${nameOf[t]}/${keyOf[t]}`));
     const aimed = variants.filter((act) => running.has(`${act.n}/${act.key}`));
@@ -360,14 +309,12 @@ async function walkOnce(number) {
       if (!act) break;
       await step(act);
     }
-    // The queue's fairness: every message an agent can take reaches it.
     const deliverable = (act, state) => act.name === "Deliver" && state.agents.some((t) => nameOf[t] === act.n && keyOf[t] === act.key);
     for (let left = 16; left > 0; left -= 1) {
       const act = chooseAct(frontier, deliverable);
       if (!act) break;
       await step(act);
     }
-    // Every prompt an app sent ran, on its own agent, as SentRuns says.
     const ranIds = new Set(turns.map((turn) => idOf(turn.turnId)));
     for (const id of walk.sent) assert.ok(ranIds.has(id), `walk ${number}: prompt ${id} ran`);
   } finally {

@@ -28,7 +28,6 @@ pub const Decision = struct {
     reason_owned: bool = false,
     denial_reason: ?core_types.ToolPermissionDenialReason = null,
     structured_model_output: bool = false,
-    // Single-grant behavior is unchanged; suggestions are additive metadata.
     grant_suggestions: []core_types.PermissionGrant = &.{},
     grant_suggestions_owned: bool = false,
     grant_suggestions_alloc: ?std.mem.Allocator = null,

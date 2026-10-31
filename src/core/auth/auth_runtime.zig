@@ -187,8 +187,6 @@ pub const FailureSnapshot = struct {
 /// already recovers from.
 const request_path_verified_window_ms: u32 = 30_000;
 const source_none: u8 = std.math.maxInt(u8);
-// u32 keeps the stamp atomic-loadable on 32-bit wasm; wrapping subtraction
-// keeps window comparisons correct across the ~49 day wrap.
 var request_path_verified_ms = std.atomic.Value(u32).init(0);
 var request_path_verified_source = std.atomic.Value(u8).init(source_none);
 
@@ -903,7 +901,6 @@ const StartupCredentialTask = struct {
 
     fn workerMain(self: *StartupCredentialTask) void {
         defer self.done.store(true, .release);
-        // Matches the blocking launch path: stored credentials only, no network.
         const resolution = credentials.resolveForProvider(
             std.heap.c_allocator,
             oauth_transport.unavailable_provider,
@@ -1613,9 +1610,6 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
-    // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
-    // rewrites the session file and performs network I/O. It reports the expired state
-    // instead of repairing it.
     const resolution = (if (provider) |selected_provider|
         credentials.resolveForProvider(
             alloc,
@@ -1634,7 +1628,6 @@ pub fn loadStatusSnapshotForProvider(
             preferred,
         )) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        // The store could not be interrogated, so its contents are unknown rather than absent.
         else => blk: {
             debug_trace.logf("auth", "status snapshot failed step=resolve err={s}", .{@errorName(err)});
             break :blk credentials.Resolution{ .stored_key_status = .unavailable };
@@ -2524,8 +2517,6 @@ pub const Runtime = struct {
         if (!self.apiKeyEntryActive()) return false;
         if (self.api_key_input.items.len >= max_api_key_entry_bytes) return true;
         if (byte < 0x20 or byte == 0x7f) return true;
-        // Reserve the entry ceiling up front so growth never abandons an
-        // unzeroed buffer holding part of the key.
         try self.api_key_input.ensureTotalCapacityPrecise(alloc, max_api_key_entry_bytes);
         self.api_key_input.appendAssumeCapacity(byte);
         return true;
@@ -2552,7 +2543,6 @@ pub const Runtime = struct {
     fn beginApiKeySaveWithDeps(self: *Self, alloc: Allocator, deps: ApiKeySaveDeps) ApiKeySaveStart {
         if (!self.apiKeyEntryActive() or self.api_key_input.items.len == 0) return .empty;
 
-        // Ownership moves to the worker, so the stage exit below has nothing to zero.
         const key = self.api_key_input;
         self.api_key_input = .empty;
 
@@ -2718,7 +2708,6 @@ pub const Runtime = struct {
                         return null;
                     },
                     .setup => {},
-                    // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
                 },
@@ -2730,8 +2719,6 @@ pub const Runtime = struct {
             },
             .switch_credential => switch (selected) {
                 .source => self.closePicker(alloc),
-                // Automatic is the only action this stage offers; the app
-                // handler clears the stored choice and closes the picker.
                 .action => |action| std.debug.assert(action == .automatic),
                 .provider, .team => unreachable,
             },
@@ -2896,7 +2883,6 @@ pub const Runtime = struct {
     /// Starts resolving the launch credential on a worker. Returns false when
     /// the worker cannot start; the caller then resolves the credential inline.
     pub fn beginStartupCredentialLoad(self: *Self, request: StartupCredentialRequest) bool {
-        // Single-threaded builds have no worker; the caller resolves inline.
         if (comptime builtin.single_threaded) return false;
         std.debug.assert(self.startup_credential_task == null);
         self.startup_credential_task = StartupCredentialTask.start(self.secret_store, request) catch |err| {
@@ -3155,10 +3141,6 @@ fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.So
 
 fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    // Interactive selection paths run on keypresses; a source whose refresh
-    // the issuer rejects must read as "unavailable" (the callers all explain
-    // that), not ride a `try` chain out of the event loop. `resolve()` keeps
-    // its own error handling for startup status reporting.
     return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source) catch |err| switch (err) {
         error.OutOfMemory => err,
         else => {
@@ -3623,7 +3605,6 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway, null).active_source.?);
 
-    // The source is still reported; only its freshness changes across the boundary.
     try std.testing.expect(!runtime.statusSnapshotAt(39_999, .gateway, null).expired);
     try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).expired);
     try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).refreshable());
@@ -3987,7 +3968,6 @@ test "auth status snapshot reports an expired session without claiming it is unr
         stale_detail,
     );
 
-    // The expired signal is additional state, never a downgrade of `refreshable`.
     try std.testing.expect(stale.refreshable());
     try std.testing.expect(stale.missingHelp(.cli) == null);
 }
@@ -4563,8 +4543,6 @@ test "clearing a remembered choice re-resolves even when no login was active" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    // stored_key is last in precedence, so a session sitting on it must move
-    // once the remembered choice that pinned it there is gone.
     var pinned = try makeTestCredential(alloc, "stored-token", .stored_key, null, null);
     defer pinned.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &pinned);
@@ -4596,7 +4574,6 @@ test "switch credential stage includes the active source and pops to its root ac
 
     const switch_view = runtime.pickerView();
     try std.testing.expectEqual(PickerStage.switch_credential, switch_view.stage);
-    // One resolvable source plus the trailing Automatic row.
     try std.testing.expectEqual(@as(usize, 2), switch_view.choiceCount());
     try std.testing.expect((Choice{ .action = .automatic }).eql(switch_view.choiceAt(1).?));
     try std.testing.expect((Choice{ .source = .stored_key }).eql(switch_view.selected_choice.?));
@@ -4759,7 +4736,6 @@ test "an api key save runs off the event loop and is reaped" {
         .store = ApiKeySaveFixture.store,
         .loader = ApiKeySaveFixture.load,
     }));
-    // The stage releases its buffer immediately; the worker owns the key now.
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
     try std.testing.expect(!runtime.apiKeyEntryActive());
 
@@ -4856,7 +4832,6 @@ test "a second key submitted mid-save is refused, not silently dropped" {
     runtime.openApiKeyPicker(alloc);
     for ("vck_second") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
     try std.testing.expectEqual(ApiKeySaveStart.busy, runtime.beginApiKeySaveWithDeps(alloc, deps));
-    // The refused key is wiped rather than leaked or left in the entry buffer.
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
     try std.testing.expect(runtime.takeApiKeySaveResult(alloc) == null);
 
@@ -4865,7 +4840,6 @@ test "a second key submitted mid-save is refused, not silently dropped" {
         if (runtime.takeApiKeySaveResult(alloc)) |value| break value;
     };
     try std.testing.expect(result == .saved);
-    // Exactly one save ran: the second key never reached the store.
     try std.testing.expectEqual(@as(usize, 1), fixture.store_calls);
 }
 
@@ -4883,7 +4857,6 @@ test "deinit joins a save worker that is still running" {
         .loader = ApiKeySaveFixture.load,
     }));
 
-    // Must not hang, must not leak the loaded credential the worker produced.
     runtime.deinit(alloc);
     try std.testing.expect(runtime.api_key_save.thread == null);
 }

@@ -96,8 +96,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn slashCompletionQueryActive(app: *App) bool {
             if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
-            // Model query always owns this slot. Mid-turn bare `/model` does too;
-            // idle bare `/model` still surfaces slash rows.
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return false;
             }
@@ -131,8 +129,6 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn dismissVisibleInlinePicker(app: *App) bool {
             const kind = visibleInlinePickerKind(app) orelse return false;
-            // Escaping the picker abandons the columns it had opened, so the
-            // next `/provider` starts from the provider column again.
             if (kind == .provider) provider_picker_runtime.Runtime(App).abandon(app);
             app.input_runtime.picker.dismissInlinePicker(kind);
             return true;
@@ -414,7 +410,6 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (!app.stream.active) provider_picker_runtime.Runtime(App).navigate(app, delta);
                 return true;
             }
-            // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
             if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return true;
             return false;
         }
@@ -979,9 +974,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             const is_directory = selection.choice.kind == .directory;
             const opens_directory = is_directory and folder_action == .open;
             const adds_terminator = !opens_directory and !reuses_terminator;
-            // An opened folder stays an active query so its contents list next.
-            // A selected folder is finished like a file: its path with the
-            // trailing slash, any quote closed, and a separating space.
             const selected_folder = if (is_directory and !opens_directory)
                 try std.mem.concat(app.alloc, u8, &.{ selection.choice.path, "/" })
             else
@@ -1310,7 +1302,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             } else {
                 try setModelComposerText(app, "/model {s} auto ", .{model});
             }
-            // Preselect the product effort default and Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
                 model,
@@ -1968,7 +1959,6 @@ test "file picker defers bare at refresh until the settled query mode" {
     rt.prepareFilePicker(&app);
     try std.testing.expectEqual(@as(usize, 0), app.file_index_refreshes);
     try std.testing.expect(!app.input_runtime.picker.file_completion.indexed);
-    // A mode change inside the same occurrence must still refresh the index.
     try app.input_runtime.edit_state.insertSlice(alloc, "notes");
     rt.reconcileFilePicker(&app);
     rt.prepareFilePicker(&app);
@@ -2186,7 +2176,6 @@ test "filesystem file picker releases a held folder frame only with its rows" {
 
     try app.input_runtime.textReplacementState().replace(alloc, "@./tree/");
     rt.prepareFilePicker(&app);
-    // The clock stands still, so the wait can end only because the rows arrived.
     const now_ms: i64 = 1_000;
     var polls: usize = 0;
     while (rt.holdFrameForFileListing(&app, now_ms)) : (polls += 1) {
@@ -2206,8 +2195,6 @@ test "file picker keeps watching a listing after a slow folder so waiting can tu
     var app: FilePickerTestApp = .{ .alloc = std.testing.allocator };
     defer app.deinit();
 
-    // The previous folder outlasted the wait, so this listing's frame paints
-    // at once, but the loop still checks back every millisecond.
     app.input_runtime.picker.file_listing_wait = .{ .started_ms = 1_000, .last_outlasted_hold = true };
     try std.testing.expect(!app.input_runtime.picker.file_listing_wait.active(1_001));
     try std.testing.expect(rt.fileListingHoldPending(&app, 1_001));
@@ -2223,7 +2210,7 @@ test "file picker loading Tab preserves pending request and Enter never queues a
     const state = &app.input_runtime.picker.file_completion;
     state.stage(alloc, .{ .state = .ready }, .loading, null);
     state.directory_request = 71;
-    state.rejectSelection(); // A retry of stale rows must also stay loading.
+    state.rejectSelection();
     for (0..4) |_| {
         try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, 4096));
         try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);

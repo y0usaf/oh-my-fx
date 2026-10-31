@@ -386,8 +386,6 @@ fn clipSummary(
     if (cols == 1) return try alloc.dupe(u8, "…");
     const prefix = display_width.prefixByWidthIgnoringAnsi(text, cols - 1);
     const clipped = try alloc.print("{s}…", .{prefix});
-    // A cut inside a styled run can leave the final SGR open; close it so the
-    // accent cannot bleed into whatever the terminal paints next.
     if (std.mem.find(u8, clipped, "\x1b") == null or std.mem.endsWith(u8, clipped, "\x1b[0m"))
         return clipped;
     defer alloc.free(clipped);
@@ -740,10 +738,6 @@ fn highlightCommandPhrase(
 ) !?[]const u8 {
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
-    // Prefer the recorded action label so multi-word labels ("Timed out")
-    // split at the true boundary. Otherwise trust the stored command text:
-    // prose-prefixed rows ("Reading project instructions before continuing:
-    // <cmd>") end with it. Then known multi-word labels, then first space.
     const label_end = if (record.command_action_label) |action|
         if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
             action.len
@@ -763,7 +757,6 @@ fn highlightCommandPhrase(
     const theme = shared_theme.current();
     const profile = code_highlight_languages.resolve("sh") orelse return null;
     const variant: code_highlight.Theme = if (theme.light) .light else .dark;
-    // Commands without tokens keep their exact plain bytes.
     const plain = try code_highlight.highlight(scratch, command, profile, variant, null);
     if (std.mem.eql(u8, plain, command)) return null;
     const highlighted = try code_highlight.highlight(
@@ -796,8 +789,6 @@ fn formatExpandedChild(
         raw_phrase,
         detail,
     ) orelse raw_phrase;
-    // Expanded rows carry no ambient text style, so tokens highlight over the
-    // terminal default foreground.
     const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
     const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
     const accented = if (entryShowsDiffStats(detail))
@@ -1298,8 +1289,6 @@ fn buildWithStyleAndStats(
     var index: usize = 0;
     while (index < entries.len) {
         try build_checkpoint.tick(checkpoint);
-        // Hidden entries keep their action, but grouping below skips them, so
-        // they must not anchor a group either.
         if (projection.entry_actions.items[index] != .keep or
             !transcript_blocks.isEntryVisibleInCompactPresentation(entries[index]))
         {
@@ -1609,8 +1598,6 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
-        // entry 3 has no detail record; without a recorded file mutation the
-        // suffix cannot be trusted and stays plain.
     };
 
     var projection = try build(alloc, &entries, &details, 120);
@@ -1778,8 +1765,6 @@ test "completed command rows shell-highlight quoted strings without coloring the
     defer projection.deinit(alloc);
     const row = projection.entry_actions.items[0].override.bytes;
 
-    // The header, connector, and action label stay uncolored; the command
-    // verb and quoted string pick up the syntax palette and close again.
     try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
     try std.testing.expect(std.mem.find(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
@@ -1816,7 +1801,6 @@ test "minimal completed command rows reproject stored arguments at the current w
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    // The row carries styling (the command verb token), so the clip closes it.
     try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
 
@@ -1914,8 +1898,6 @@ test "completed session and tty command rows reproject stored commands at the cu
             .class = .tool_status,
         } },
     };
-    // tty runs and terminal-session observations are not captured commands;
-    // their full display arrives only through stored command metadata.
     const details = [_]ToolDetailRecord{
         .{
             .entry_id = 1,
@@ -1942,7 +1924,7 @@ test "completed session and tty command rows reproject stored commands at the cu
     defer narrow.deinit(alloc);
     const narrow_rows = narrow.entry_actions.items[0].override.bytes;
     var narrow_lines = std.mem.splitScalar(u8, narrow_rows, '\n');
-    _ = narrow_lines.next(); // group header
+    _ = narrow_lines.next();
     const narrow_tty = narrow_lines.next().?;
     const narrow_observe = narrow_lines.next().?;
     try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
@@ -1950,7 +1932,6 @@ test "completed session and tty command rows reproject stored commands at the cu
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
     try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed \x1b[38;5;252mnpm\x1b[39m run dev-server-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…\x1b[0m"));
-    // Reprojection replaces the frozen ASCII marker before reclipping.
     try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
 
     var wide = try build(alloc, &entries, &details, 400);
@@ -2066,7 +2047,6 @@ test "expanded rows wrap under their tree rail and keep command styling" {
     var grid = try paintExpandedRowsForTest(alloc, rows, cols);
     defer grid.deinit();
     try std.testing.expectEqual(@as(u21, '●'), grid.cellAt(1, 1).?.codepoint);
-    // The header itself is wider than 24 columns and wraps before the first child.
     var first_child_row: u16 = 2;
     while (first_child_row <= grid.rows and grid.cellAt(first_child_row, 1).?.codepoint != '├') : (first_child_row += 1) {}
     var last_child_row: u16 = first_child_row + 1;
@@ -2074,8 +2054,6 @@ test "expanded rows wrap under their tree rail and keep command styling" {
     try std.testing.expect(first_child_row > 2);
     try std.testing.expect(last_child_row > first_child_row + 1 and last_child_row < grid.rows);
 
-    // A non-final child continues under an unstyled rail, and its quoted
-    // argument keeps the string color across every wrap.
     var row: u16 = first_child_row + 1;
     while (row < last_child_row) : (row += 1) {
         const rail = grid.cellAt(row, 1).?;
@@ -2085,7 +2063,6 @@ test "expanded rows wrap under their tree rail and keep command styling" {
         try std.testing.expect(!before_wrap.style.fg.eql(.default));
         try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(before_wrap.style.fg));
     }
-    // The final child indents past its marker.
     row = last_child_row + 1;
     while (row <= grid.rows) : (row += 1) {
         try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 1).?.codepoint);
@@ -2093,7 +2070,6 @@ test "expanded rows wrap under their tree rail and keep command styling" {
         try std.testing.expect(grid.cellAt(row, 3).?.codepoint != ' ');
     }
 
-    // Nothing is hidden: each child's rows hold its whole command.
     const first_painted = try paintedTreeTextForTest(alloc, &grid, first_child_row, last_child_row - 1);
     defer alloc.free(first_painted);
     const first_expected = try withoutSpacesForTest(alloc, "Ran " ++ first_command);
@@ -2165,8 +2141,6 @@ test "expanded group children reproject stored commands at the current width" {
         wide.entry_actions.items[0].override.bytes,
     );
 
-    // A narrower full transcript wraps the stored command instead of clipping
-    // it, and the frozen generation marker never returns.
     var narrow = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{}, null);
     defer narrow.deinit(alloc);
     const narrow_rows = narrow.entry_actions.items[0].override.bytes;
@@ -2203,8 +2177,6 @@ test "command reprojection rejects a record carrying a different command" {
 
     var projection = try build(alloc, &entries, &details, 240);
     defer projection.deinit(alloc);
-    // The frozen tail is no prefix of the stored command, so the row is left
-    // untouched rather than rewritten with unrelated content.
     try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "..."));
     try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "zig build") == null);
 }
@@ -2220,15 +2192,9 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         stored_action: []const u8,
     };
     const cases = [_]Case{
-        // Active row: outcome not yet set, stored label is the start-time
-        // prediction. The live row must keep "Running", never flip to "Ran".
         .{ .label = "Running", .outcome = null, .stored_action = "Ran" },
-        // Plain success: the historical happy path.
         .{ .label = "Ran", .outcome = .completed, .stored_action = "Ran" },
-        // Nonzero exit: the tool completed but the settled label carries the
-        // exit code the start-time prediction could not know.
         .{ .label = "Exited 1", .outcome = .completed, .stored_action = "Ran" },
-        // Failed tool outcome with a divergent settled label.
         .{ .label = "Failed", .outcome = .failed, .stored_action = "Observed" },
     };
 
@@ -2254,8 +2220,6 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         defer projection.deinit(alloc);
         const row = projection.entry_actions.items[0].override.bytes;
 
-        // The frozen marker is gone, the full command is present, and the
-        // row keeps its own label rather than the stored prediction.
         try std.testing.expect(std.mem.find(u8, row, "...") == null);
         try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
         const expected_prefix = try alloc.print("\n└ {s} ", .{case.label});
@@ -3181,7 +3145,6 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
     defer projection.deinit(alloc);
     const rows = projection.entry_actions.items[0].override.bytes;
 
-    // The prose prefix stays plain in full; the trailing command highlights.
     try std.testing.expect(std.mem.find(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);

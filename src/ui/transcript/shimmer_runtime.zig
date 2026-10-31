@@ -1,4 +1,3 @@
-// Activity rendering is surface-owned.
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -252,8 +251,6 @@ fn paintPlannedActivityRow(
     };
 }
 
-// A steady on/off blink with no fade. Folding in the padding keeps the phase
-// non-negative so the blink wraps seamlessly across the fixed cycle.
 fn markerBlinkVisible(shimmer_pos: i16) bool {
     const half = render_request.blink_half_period_frames;
     return @mod(shimmer_pos + render_request.animation_padding, 2 * half) < half;
@@ -271,8 +268,6 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
         w.writeAll(" ") catch return label;
     }
     const rest = label[marker.len..];
-    // The token suffix recedes into the muted gray; the verb and elapsed
-    // counter keep the brighter label gray.
     if (std.mem.find(u8, rest, " (↑")) |token_suffix| {
         w.print("{s}{s}{s}{s}{s}", .{
             ui_render.permission_auto_style,

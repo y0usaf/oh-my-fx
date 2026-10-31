@@ -1,14 +1,3 @@
-// TLC gate for tests/tla/usage/UsageModel.tla: one run per check in a fresh
-// folder, and the verdict each check must reach.
-//
-//   PASS     the configuration's properties hold.
-//   CAUGHT   a planted bug is reported by the property it targets.
-//   FINDING  a property stated for users is broken by the model of the code;
-//            TLC's counterexample is kept in that run's tlc.log.
-//
-// It also simulates drivable behaviors (DriveSpec) in ideal and non-ideal
-// conditions for driver.ts to replay against the real binary. Nothing here
-// downloads anything or calls a model.
 import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
@@ -56,8 +45,6 @@ export function checks(): Check[] {
   const ideal = cfg("Ideal.cfg");
   const hostile = cfg("Hostile.cfg");
   const hostileSwitch = cfg("HostileSwitch.cfg");
-  // A planted bug is checked against only the property it targets, so the
-  // verdict cannot come from another property tripping first.
   const target = (base: string, name: string) => only(base, ["TypeOK", name]);
   return [
     { label: "ideal", expect: "PASS", config: ideal },
@@ -83,7 +70,6 @@ export function checks(): Check[] {
       label: "bug-view-ignores-day", expect: "CAUGHT", names: "TodayIsToday", config: target(ideal, "TodayIsToday"),
       mutant: { find: "today |-> IF r.todayDay = Day(w) THEN r.todayAt ELSE None", replace: "today |-> r.todayAt" },
     },
-    // Two bugs an earlier fx had, planted back.
     {
       label: "bug-future-stamp-wins", expect: "CAUGHT", names: "SuccessShowsToday", config: target(hostile, "SuccessShowsToday"),
       mutant: { find: "    LET xToday == x.todayAt # None /\\ x.todayAt <= w", replace: "    LET xToday == x.todayAt # None" },

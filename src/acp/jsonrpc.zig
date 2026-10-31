@@ -314,9 +314,6 @@ pub const Reader = struct {
         return initCallback(context, read_fn);
     }
 
-    // Native ACP uses raw read(2) because Linux may pass socket-based stdin to
-    // child processes. WASI has no std.posix surface, so use the injected std.Io
-    // backend and let the host's fd_read import suspend through JSPI.
     fn readStdin(_: ?*anyopaque, destination: []u8) usize {
         if (comptime host_target.is_wasm) {
             return std.Io.File.stdin().readStreaming(

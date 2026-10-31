@@ -26,8 +26,6 @@ const Allocator = std.mem.Allocator;
 const max_active_requests: usize = 32;
 const queue_capacity: usize = 16;
 const outcome_capacity: usize = 32;
-// macOS GUI apps commonly inherit 256 descriptors, below what the 64-session
-// terminal budget needs.
 const desired_file_descriptor_limit: u64 = 1024;
 
 pub const AdmissionError =
@@ -468,8 +466,6 @@ pub const Runtime = struct {
                 backend.store.deinit();
                 alloc.destroy(backend);
             } else {
-                // Backend threads still read the registry, so it stays
-                // allocated until the process exits.
                 debug_trace.logf(
                     "terminal_client",
                     "terminal backend left allocated: threads still draining",
@@ -481,8 +477,6 @@ pub const Runtime = struct {
     }
 
     noinline fn resetDrainedState(self: *Runtime) void {
-        // The drain above already nulls every owned slot. Reset only the
-        // observable metadata so teardown does not copy the full runtime.
         self.process_provider = process_provider_mod.unavailable_provider;
         self.profile_home = null;
         self.mutex = .init;
@@ -656,8 +650,6 @@ fn workerMain(runtime: *Runtime) void {
             finishUnstarted(runtime, alloc, unstarted);
             continue;
         }
-        // Tickets are issued here, in admission order, before any worker of
-        // a later request can run.
         if (operation.requiresOrderedMutation(worker.intent.request.value)) {
             worker.ordered_ticket = runtime.ordered.issue();
         }
@@ -1044,8 +1036,6 @@ test "lazy runtime opens no store registry or worker before first admission" {
     try std.testing.expect(runtime.thread == null);
     try std.testing.expect(runtime.backend == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.queue.len);
-    // Ending terminals before any request opened a backend does no I/O, and
-    // the runtime then refuses to open one.
     runtime.closeOwnedTerminals();
     try std.testing.expect(runtime.backend_closed);
     try std.testing.expect(runtime.backend == null);
@@ -1343,9 +1333,6 @@ test "in-process registry starts writes to and stops a real terminal" {
     };
     try std.testing.expect(std.mem.find(u8, output, "GOT:hello") != null);
 
-    // A second terminal is stopped by signal and close, as shell.stop does.
-    // The marker proves the command is running, so the signal cannot land
-    // inside the launcher's startup handshake.
     const sleeper = try fixture.start("printf 'SLEEP%s\\n' ING; sleep 30");
     defer alloc.free(sleeper);
     try fixture.waitForMatch(sleeper, "SLEEPING");
@@ -1388,7 +1375,6 @@ test "closing owned terminals for exit leaves no orphan and records them ended" 
 
     const started = io_mod.milliTimestamp();
     fixture.runtime.closeOwnedTerminals();
-    // Hangup, grace and kill stay inside the exit budget.
     try std.testing.expect(io_mod.milliTimestamp() - started < 1_500);
     try std.testing.expect(processGoneWithin(pid, 1_000));
     try std.testing.expectEqual(
@@ -1396,7 +1382,6 @@ test "closing owned terminals for exit leaves no orphan and records them ended" 
         try fixture.recordedLifecycle(session_id),
     );
 
-    // Nothing starts after exit began.
     var refused = try fixture.run(.{ .screen = .{
         .session_id = session_id,
         .authority = fixture.claim(),

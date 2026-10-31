@@ -265,7 +265,6 @@ pub fn parseModelRows(gpa: Allocator, body: []const u8) ParseError!Rows {
             .tps_weighted = if (tps) |v| v * requests_f else 0,
             .tps_requests = if (tps != null) requests else 0,
         };
-        // Each number was finite, but a product or a sum can still overflow.
         if (!totals.valid()) return error.InvalidResponse;
         if (findRow(rows.items, model)) |row| {
             row.totals.add(totals);
@@ -344,14 +343,11 @@ fn money(value: std.json.Value) ParseError!f64 {
     return f;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 
 test "paths pick the filter for how fx is signed in" {
     var buf: [256]u8 = undefined;
-    const day = utcDay(1_791_676_800_000); // 2026-10-11
+    const day = utcDay(1_791_676_800_000);
     try testing.expectEqualStrings(
         "/v1/report?start_date=2026-10-05&end_date=2026-10-10&group_by=model&metered_scope=user",
         try reportPath(&buf, .member, day - 6, day - 1),
@@ -386,7 +382,6 @@ test "model rows parse, merge duplicates and sort by cost" {
     try testing.expectApproxEqAbs(@as(f64, 2.0), luna.total_cost, 1e-9);
     try testing.expectEqual(@as(u64, 37), luna.totalTokens());
     try testing.expectEqual(@as(u64, 5), luna.reasoning_tokens);
-    // 12.5% of 1484 requests hit the cache; the 1-request row reported none.
     try testing.expectApproxEqAbs(@as(f64, 12.5 * 1484.0 / 1485.0), luna.cacheHitPct().?, 1e-9);
     try testing.expect(luna.p90TtftMs() == null);
 }
@@ -412,7 +407,7 @@ test "perf percentages merge by request count; p90s by request weight" {
 }
 
 test "months start on the 1st and budgets reset on the next 1st" {
-    const oct_11 = utcDay(1_791_676_800_000); // 2026-10-11
+    const oct_11 = utcDay(1_791_676_800_000);
     const oct_1 = monthStart(oct_11);
     try testing.expectEqual(MonthDay{ .year = 2026, .month = 10, .day = 1 }, monthDay(oct_1));
     try testing.expectEqual(oct_1, monthStart(oct_1));
@@ -434,7 +429,6 @@ test "malformed reports are rejected instead of shown" {
         "{\"results\":[{\"model\":\"m\",\"total_cost\":-1}]}",
         "{\"results\":[{\"model\":\"m\",\"total_cost\":1,\"input_tokens\":-3}]}",
         "{\"results\":[{\"model\":\"\",\"total_cost\":1}]}",
-        // Finite numbers whose product or sum is not: the cache would refuse them.
         "{\"results\":[{\"model\":\"m\",\"request_count\":100000000000000000,\"total_cost\":1,\"p90_ttft_ms\":1e300}]}",
         "{\"results\":[{\"model\":\"m\",\"total_cost\":1.7e308},{\"model\":\"m\",\"total_cost\":1.7e308}]}",
     };

@@ -1,6 +1,3 @@
-// Runtime scenarios for the launch-flag contract, and how each one maps onto
-// a LaunchSelection scenario. The fake Gateway serves CATALOG; the chat route
-// accepts exactly the models in TRUTH, like the real Gateway.
 
 export type Path = "ask" | "interactive";
 export type ModelReq = "none" | "exact" | "partial_unique" | "partial_ambiguous" | "unknown" | "private_hidden";
@@ -66,12 +63,10 @@ const none = { fastCap: false, ultraCap: false };
 const base = { speed: "none", effort: "none", catalog: "authenticated", early: false } as const;
 
 export const SCENARIOS: Scenario[] = [
-  // fx ask, ideal
   { id: "ask-exact", kind: "ideal", path: "ask", model: "exact", raw: FULL.id, canonical: FULL.id, ...base, ...full },
   { id: "ask-exact-fast", kind: "ideal", path: "ask", model: "exact", raw: FULL.id, canonical: FULL.id, ...base, speed: "fast", ...full },
   { id: "ask-exact-ultrafast", kind: "ideal", path: "ask", model: "exact", raw: FULL.id, canonical: FULL.id, ...base, speed: "ultrafast", ...full },
   { id: "ask-exact-effort", kind: "ideal", path: "ask", model: "exact", raw: FULL.id, canonical: FULL.id, ...base, effort: "supported", ...full },
-  // fx ask, non-ideal
   { id: "ask-unknown", kind: "nonideal", path: "ask", model: "unknown", raw: "totally/not-a-real-model", ...base, ...none },
   { id: "ask-partial-unique", kind: "nonideal", path: "ask", model: "partial_unique", raw: "mfv-plain", canonical: PLAIN.id, ...base, ...none },
   { id: "ask-partial-ambiguous", kind: "nonideal", path: "ask", model: "partial_ambiguous", raw: "mfv-terra", ...base, ...none },
@@ -82,9 +77,7 @@ export const SCENARIOS: Scenario[] = [
   { id: "ask-private-anonymous", kind: "nonideal", path: "ask", model: "private_hidden", raw: PRIVATE.id, canonical: PRIVATE.id, ...base, catalog: "anonymous", ...none },
   { id: "ask-unknown-catalog-failed", kind: "nonideal", path: "ask", model: "unknown", raw: "totally/not-a-real-model", ...base, catalog: "failed", ...none },
   { id: "ask-fast-catalog-failed", kind: "nonideal", path: "ask", model: "exact", raw: FULL.id, canonical: FULL.id, ...base, speed: "fast", catalog: "failed", ...full },
-  // interactive, ideal
   { id: "tui-exact-fast", kind: "ideal", path: "interactive", model: "exact", raw: FULL.id, canonical: FULL.id, ...base, speed: "fast", ...full },
-  // interactive, non-ideal
   { id: "tui-unknown-fast", kind: "nonideal", path: "interactive", model: "unknown", raw: "totally/not-a-real-model", ...base, speed: "fast", ...none },
   { id: "tui-partial-unique", kind: "nonideal", path: "interactive", model: "partial_unique", raw: "mfv-plain", canonical: PLAIN.id, ...base, ...none },
   { id: "tui-ultrafast-unsupported", kind: "nonideal", path: "interactive", model: "exact", raw: PLAIN.id, canonical: PLAIN.id, ...base, speed: "ultrafast", ...none },

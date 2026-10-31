@@ -1,5 +1,3 @@
-// Shared builder for scenarios that run tests/tla/drivers/mcp/labs/stdio_lab.zig against the
-// scripted fake stdio server (U02 transport-level and U03 to U05 scenarios).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -110,7 +108,6 @@ export function labScenario(c: LabCase): Scenario {
         try {
           serverLog = readFileSync(join(caseDir, "server.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
         } catch {
-          // No log: the server never started.
         }
         return c.check(lines, final, serverLog);
       },

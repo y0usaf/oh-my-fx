@@ -1,8 +1,3 @@
-// A custom provider for libfx agents: any server that speaks OpenAI Chat
-// Completions, such as a local model server or a router. The engine sends its
-// requests through the host's fetch without credentials; when the host has an
-// API key, this module adds it at the fetch edge, to that provider's chat URL
-// only. The key never enters the engine or a session's saved records.
 
 import { tokenString } from "./subscription.js";
 
@@ -11,7 +6,6 @@ const reservedNames = new Set(["gateway", "codex", "grok"]);
 const namePattern = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const providerFields = new Set(["name", "baseUrl", "models"]);
-// libfx option names to the CLI's settings names, which the engine parses.
 const modelFields = {
   contextWindow: "context_window",
   maxOutputTokens: "max_output_tokens",
@@ -37,12 +31,9 @@ function chatUrlOf(baseUrl) {
   if (url.protocol !== "https:" && !(url.protocol === "http:" && loopbackHosts.has(url.hostname))) {
     throw new TypeError("provider.baseUrl must use https, or http on localhost");
   }
-  // The same form the fetch edge compares requests in.
   return `${url.origin}${url.pathname}`;
 }
 
-// The engine's limits (configured_provider.zig), checked here so both engines
-// report a mistake the same way.
 const maxModels = 256;
 const maxModelIdBytes = 1024;
 const maxLimit = 2 ** 32 - 1;
@@ -94,7 +85,6 @@ export function customProviderDefinition(provider) {
   const definition = {
     protocol: "openai-chat-completions",
     base_url: baseUrl,
-    // The host adds the key, so the engine's copy has none.
     auth: { type: "none" },
     ...(models === undefined ? {} : { model_metadata: modelMetadata(models) }),
   };

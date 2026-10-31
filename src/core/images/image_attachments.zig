@@ -200,7 +200,6 @@ pub fn loadUserImageAttachment(
 ) !types.ImageAttachment {
     const normalized_path = try normalizePathInput(alloc, path_input);
     defer alloc.free(normalized_path);
-    // Preserve the raw entry's second trim at the old path-resolution boundary.
     return load_user_image_literal(alloc, workspace_root, std.mem.trim(u8, normalized_path, " \t\r\n"));
 }
 
@@ -554,8 +553,6 @@ pub fn captureInlineImageBytes(
     if (image_id == 0) return error.InvalidImageId;
     if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
     if (bytes.len > max_image_bytes) return error.ImageTooLarge;
-    // The request checker, not capture, decides whether the original can be sent.
-    // Validate the declared type against the caller's bytes.
     const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
     if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
 
@@ -868,8 +865,6 @@ fn writeWithheldAttachmentNotice(
     if (attachment.inline_data == null) {
         if (attachment.snapshot_path) |path| {
             try writer.print("The original is saved at {s}. Use an available image tool to save a smaller copy to a new file", .{path});
-            // Snapshots are named .bin, which hides the type from tools
-            // that choose a decoder by file name.
             if (mediaTypeExtension(attachment.media_type)) |extension| {
                 try writer.print(" ending in {s}", .{extension});
             }
@@ -1903,7 +1898,6 @@ pub fn splitImagePathToken(raw: []const u8) ?ImagePathToken {
             if (!supported_path_extension(decoded[dot..])) return null;
             return .{ .path = payload, .suffix = trimmed[token.quote_end.?..], .literal_payload = true };
         }
-        // Noncanonical escapes keep legacy eligibility (notably backslash-dot).
     }
     const path_start: usize = if (std.mem.startsWith(u8, trimmed, "@")) 1 else 0;
     if (path_start == 1 and std.mem.startsWith(u8, trimmed[path_start..], "@")) return null;
@@ -2249,17 +2243,14 @@ test "authorized image lookup cleans up allocation failure" {
 
 test "findEnclosingImagePlaceholder spans the token at and after the cursor" {
     const text = "a [Image #5] b";
-    // cursor right after the closing ]
     const span_after = findEnclosingImagePlaceholder(text, 12).?;
     try std.testing.expectEqual(@as(usize, 2), span_after.start);
     try std.testing.expectEqual(@as(usize, 12), span_after.end);
     try std.testing.expectEqual(@as(usize, 5), span_after.id);
 
-    // cursor inside the token
     const span_inside = findEnclosingImagePlaceholder(text, 8).?;
     try std.testing.expectEqual(@as(usize, 5), span_inside.id);
 
-    // cursor far away
     try std.testing.expect(findEnclosingImagePlaceholder(text, 1) == null);
     try std.testing.expect(findEnclosingImagePlaceholder(text, 14) == null);
 }
@@ -2352,7 +2343,6 @@ test "expandPlaceholdersWithBadges maps cursor through badge expansion" {
         .{ .id = 1, .path = @constCast("/tmp/a.png"), .media_type = @constCast("image/png") },
     };
 
-    // cursor at byte 0 maps to byte 0
     {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
@@ -2360,7 +2350,6 @@ test "expandPlaceholdersWithBadges maps cursor through badge expansion" {
         try std.testing.expectEqual(@as(?usize, 0), r.cursor_out);
     }
 
-    // cursor right after the placeholder lands right after the rendered badge
     {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
@@ -2369,7 +2358,6 @@ test "expandPlaceholdersWithBadges maps cursor through badge expansion" {
         try std.testing.expectEqual(out.written().len - 1, r.cursor_out.?);
     }
 
-    // cursor at end maps to end of expanded text
     {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
@@ -3233,7 +3221,6 @@ test "capture never rejects an image that is only over the pixel limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // No image converter runs during capture.
     const png = try png_downscale.testSolidGrayPng(alloc, 16385, 2, 128);
     defer alloc.free(png);
     var attachment = try testCaptureFile(alloc, &tmp, "thin.png", png, "image/png");

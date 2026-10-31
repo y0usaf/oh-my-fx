@@ -1,21 +1,4 @@
 #!/usr/bin/env node
-// Type-checks libfx's hand-written declarations in sdk/types the way a
-// consumer resolves them: through the package's `exports`, under node16 and
-// bundler module resolution, against the fixtures in sdk/tests/types. Then
-// checks that every entry point declares exactly the values it exports at
-// runtime, and that each specifier resolves to its declaration file.
-//
-// TypeScript comes from sdk/node's pinned devDependency, or from TSC, the path
-// to a `typescript/bin/tsc`:
-//
-//   node sdk/tests/test-types.mjs
-//   TSC=/path/to/node_modules/typescript/bin/tsc node sdk/tests/test-types.mjs
-//
-// The fixtures for Workflow's real World types and a real xterm terminal run
-// when sdk/durable and sdk/node have their dependencies installed, and the
-// Node.js-only lib check runs when `@types/node` sits beside TypeScript or
-// TYPES_NODE names its directory. Set LIBFX_KEEP_TYPES_DIR=1 to keep the
-// temporary project.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -26,13 +9,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const sdkDir = fileURLToPath(new URL("..", import.meta.url));
 const fixturesDir = fileURLToPath(new URL("./types/", import.meta.url));
 
-// fx-sdk.js exports these for libfx's own modules; they are not public API.
 const wasmInternals = new Set(["coreAnswered", "engineInternals", "journalMarksWanted", "normalizeAgentOptions", "normalizeInstructions", "normalizeModelChoice"]);
 
-// Each specifier as a consumer resolves it, the declaration file it must
-// reach, and the module whose runtime exports that file must match. node.cjs
-// is built from node.js (sdk/scripts/build-node-cjs.mjs), so the `require`
-// entry is checked against node.js.
 const entries = [
   { specifier: "libfx", resolution: "node16", mode: "import", types: "types/node.d.ts", runtime: "node.js" },
   { specifier: "libfx", resolution: "node16", mode: "require", types: "types/node.d.cts", runtime: "node.js" },
@@ -59,7 +37,6 @@ const fail = (message) => {
   console.log(`  FAIL ${message}`);
 };
 
-// TypeScript.
 const tsc = process.env.TSC ? resolve(process.env.TSC) : join(sdkDir, "node/node_modules/typescript/bin/tsc");
 const tsLib = join(dirname(tsc), "../lib/typescript.js");
 if (!existsSync(tsc) || !existsSync(tsLib)) {
@@ -70,7 +47,6 @@ if (!existsSync(tsc) || !existsSync(tsLib)) {
 const ts = createRequire(import.meta.url)(tsLib);
 console.log(`TypeScript ${ts.version} (${tsc})`);
 
-// A consumer project whose node_modules/libfx is the sdk directory.
 const temp = mkdtempSync(join(tmpdir(), "libfx-types-"));
 const srcDir = join(temp, "src");
 const modulesDir = join(temp, "node_modules");
@@ -82,7 +58,6 @@ symlinkSync(sdkDir, join(modulesDir, "libfx"), "dir");
 
 for (const name of readdirSync(fixturesDir)) copyFileSync(join(fixturesDir, name), join(srcDir, name));
 
-// Optional real-library fixtures.
 const workflowDir = join(sdkDir, "durable/node_modules/@workflow");
 const xtermDir = join(sdkDir, "node/node_modules/@xterm");
 const realFixtures = [];
@@ -96,7 +71,6 @@ if (existsSync(join(xtermDir, "headless"))) {
 }
 const typesNode = process.env.TYPES_NODE ? resolve(process.env.TYPES_NODE) : join(dirname(tsc), "../../@types/node");
 
-// tsc runs.
 const strictest = { exactOptionalPropertyTypes: true, noUncheckedIndexedAccess: true, noImplicitOverride: true };
 const runs = [
   {
@@ -166,7 +140,6 @@ for (const run of runs) {
   }
 }
 
-// Each specifier must reach its declaration file through the package's exports.
 console.log("\nresolution");
 const resolutionOptions = (entry) => entry.resolution === "node16"
   ? { module: ts.ModuleKind.Node16, moduleResolution: ts.ModuleResolutionKind.Node16 }
@@ -182,7 +155,6 @@ for (const entry of entries) {
   else fail(`${label} resolved to ${actual ? relative(sdkDir, actual) : "nothing"}, expected ${entry.types}`);
 }
 
-// Each declaration file must declare exactly its runtime module's values.
 console.log("\ndrift (declared values vs runtime exports)");
 const declarationFiles = [...new Set(entries.map((entry) => realpathSync(join(sdkDir, entry.types))))];
 const program = ts.createProgram(declarationFiles, {
@@ -221,7 +193,6 @@ for (const entry of entries) {
 if (failures.length === 0 && !process.env.LIBFX_KEEP_TYPES_DIR) rmSync(temp, { recursive: true, force: true });
 else console.log(`\nproject kept at ${temp}`);
 console.log(failures.length ? `\n${failures.length} check(s) failed` : "\nall type checks passed");
-// The durability modules load Workflow's Worlds, which may hold handles open.
 process.exit(failures.length ? 1 : 0);
 
 function entryLabel(entry) {
@@ -229,8 +200,6 @@ function entryLabel(entry) {
   return `${entry.specifier} (${how})`;
 }
 
-// The value exports of a declaration file, through re-exports, without the
-// names re-exported only as types.
 function declaredValues(file) {
   const source = program.getSourceFile(file);
   const moduleSymbol = source && checker.getSymbolAtLocation(source);

@@ -37,8 +37,6 @@ def main():
     home, workspace = root / "home", root / "workspace"
     (home / ".fx").mkdir(parents=True, mode=0o700)
     workspace.mkdir()
-    # Background title generation would consume one fixture response and shift
-    # the step accounting, so the fixture profile keeps titles off.
     (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0, "session_titles": False}))
     count = 0
     request_bytes = 0
@@ -131,8 +129,6 @@ def main():
             if isinstance(result, dict):
                 result_count += 1
                 output_bytes += result.get("output_bytes", 0)
-        # This workload has one read per step. Completed v4 turns use normalized
-        # conversation events instead of an embedded execution snapshot.
         if result_count > retained["tool_steps"]:
             retained.update(tool_steps=result_count, tool_output_bytes=output_bytes)
     try:

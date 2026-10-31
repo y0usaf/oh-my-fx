@@ -95,7 +95,6 @@ fn mapAdmissionError(err: client.AdmissionError) contracts.StructuredErrorCode {
     return switch (err) {
         error.QueueFull => .capacity_exceeded,
         error.TerminalUnavailable => .unsupported_host,
-        // The owning fx process is exiting and has ended its terminals.
         error.RuntimeStopping => .cancelled,
         else => .invalid_request,
     };

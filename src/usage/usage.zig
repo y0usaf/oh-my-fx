@@ -346,7 +346,6 @@ pub const Dashboard = struct {
         else
             .ready;
         const codex_entry: ?cache.Codex = if (entry) |e| e.codex else null;
-        // Allocate before the arena is copied into the result.
         const codex_usage: ?codex.Usage = if (codex_entry) |c| try c.value.clone(arena.allocator()) else null;
         const grok_entry: ?cache.Grok = if (entry) |e| e.grok else null;
         const grok_usage: ?grok.Usage = if (grok_entry) |g| try g.value.clone(arena.allocator()) else null;
@@ -397,7 +396,6 @@ pub const Dashboard = struct {
         const identity = cache.identityOf(c.scope, c.subject, team);
         if (self.session) |*s| {
             if (std.mem.eql(u8, &s.identity, &identity)) {
-                // Same person; take the fresher token.
                 const bearer = self.gpa.dupe(u8, c.bearer) catch return;
                 std.crypto.secureZero(u8, s.bearer);
                 self.gpa.free(s.bearer);
@@ -432,13 +430,9 @@ pub const Dashboard = struct {
         };
         self.unavailable = null;
         self.failure = null;
-        // The floor is per sign-in: another sign-in's fetch says nothing about
-        // how fresh these numbers are. A fetch still running for it finishes
-        // first, so the first fetch for this one may be owed to `tick`.
         self.fetch_state.last_start_ms = null;
         self.fetch_state.failed_at_ms = null;
         self.fetch_owed = true;
-        // Another identity's numbers never stay on screen (ShowsOwnIdentity).
         if (self.entry) |*e| e.deinit();
         self.entry = self.readCache(identity);
     }
@@ -517,17 +511,13 @@ pub const Dashboard = struct {
     }
 
     fn maybeStartLocked(self: *Dashboard, trigger: policy.Trigger) bool {
-        // Fetches run on a worker thread; single-threaded builds (wasm) show
-        // only what is cached.
         if (comptime builtin.single_threaded) return false;
         const s = self.session orelse return false;
         const now = self.host.now_fn(self.host.ctx);
         if (!policy.due(trigger, self.is_open, self.fetch_state, now)) return false;
-        // Another process may already hold today's finished days.
         self.reloadEntryLocked();
         const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| f.day else null) else null;
         const job = Job.init(self.gpa, s, policy.plan(s.scope, finished_day, now), now) catch return false;
-        // The previous worker has finished (in_flight is false); reap it.
         if (self.worker) |t| {
             t.join();
             self.worker = null;
@@ -553,20 +543,16 @@ pub const Dashboard = struct {
                 self.fetch_state.failed_at_ms = null;
                 const current = if (self.session) |s| std.mem.eql(u8, &s.identity, &job.identity) else false;
                 if (current) {
-                    // This sign-in has had its fetch.
                     self.fetch_owed = false;
                     self.failure = null;
                     if (self.entry) |*e| e.deinit();
                     self.entry = owned;
                 } else {
-                    // The sign-in changed mid-fetch: the answer is cached
-                    // for its own identity but not shown.
                     var o = owned;
                     o.deinit();
                 }
             },
             .failed => |failure| {
-                // Only this sign-in's own failures hold its floor.
                 const current = if (self.session) |s| std.mem.eql(u8, &s.identity, &job.identity) else false;
                 if (current) {
                     self.fetch_owed = false;
@@ -660,15 +646,12 @@ fn fetchAll(dashboard: *Dashboard, job: *const Job) Outcome {
     const fetched = collect(&run) catch return run.stop;
 
     const now = dashboard.host.now_fn(dashboard.host.ctx);
-    // What the dashboard holds now counts too: the plan may have skipped
-    // parts it already had, and the file may hold less after it was unreadable.
     var latest = dashboard.ownedEntryFor(job.identity);
     defer if (latest) |*l| l.deinit();
     const held: ?cache.Entry = if (latest) |l| l.entry else null;
     var fx_dir = dashboard.openOrCreateFxDir() orelse return unsaved(dashboard, job, fetched, now, held);
     defer fx_dir.close(dashboard.io());
     const stored = cache.store(dashboard.gpa, dashboard.io(), fx_dir, job.identity, fetched, now, held) catch |err| switch (err) {
-        // The fetch itself is unfit to keep.
         error.InvalidCache => return .{ .failed = .cache },
         else => return unsaved(dashboard, job, fetched, now, held),
     };
@@ -703,7 +686,6 @@ fn collect(run: *Run) error{Stop}!cache.Entry {
         };
     }
     if (job.plan.budget) {
-        // The budget line is extra: a failure here keeps the usage numbers.
         if (fetchBudget(run)) |budget| {
             if (budget) |value| fetched.budget = .{ .at_ms = job.started_ms, .value = value };
         } else |_| {}
@@ -747,8 +729,6 @@ fn fetchCodex(run: *Run) error{Stop}!codex.Usage {
     const owned = codex.parse(dashboard.gpa, body, dashboard.host.now_fn(dashboard.host.ctx)) catch return run.fail(.{ .failed = .bad_response });
     run.codex_part = owned;
     var value = owned.usage;
-    // The activity and breakdown are extra: a failure keeps the limits, and
-    // the cache keeps what it already has.
     if (fetchProfile(run)) |profile| value.profile = profile else |_| {}
     if (fetchBreakdown(run)) |breakdown| value.breakdown = breakdown else |_| {}
     return value;
@@ -807,8 +787,6 @@ fn fetchGrok(run: *Run) error{Stop}!grok.Usage {
     const owned = grok.parseBilling(gpa, body) catch return run.fail(.{ .failed = .bad_response });
     run.grok_part = owned;
     var value = owned.usage;
-    // The plan's name is extra: a failure keeps the billing, and the cache
-    // keeps the name it already has.
     if (fetchGrokSettings(run)) |settings| value.settings = settings else |_| {}
     return value;
 }
@@ -867,9 +845,6 @@ test {
     _ = codex;
     _ = view;
 }
-
-// ---------------------------------------------------------------------------
-// Dashboard tests
 
 const testing = std.testing;
 
@@ -974,7 +949,6 @@ test "opening shows the cache at once and fills it from AI Gateway in the backgr
 
     dashboard.open(member);
     dashboard.waitForFetch();
-    // First fetch: today, the finished week and month, and the budget.
     try testing.expectEqual(@as(usize, 4), gateway.count);
     try testing.expectEqualStrings("/v1/report?start_date=2026-10-11&end_date=2026-10-11&group_by=model&metered_scope=user", gateway.path(0));
     try testing.expect(gateway.teams[0]);
@@ -989,10 +963,8 @@ test "opening shows the cache at once and fills it from AI Gateway in the backgr
     try testing.expectApproxEqAbs(@as(f64, 43), snap.of(.month).totals.total_cost, 1e-9);
     try testing.expectEqual(@as(usize, 2), snap.of(.days_7).models.len);
     try testing.expectApproxEqAbs(@as(f64, 6596.55), snap.budget().?.spent, 1e-9);
-    // 2026-10-11: a monthly budget resets on Nov 1.
     try testing.expectEqual(report.MonthDay{ .year = 2026, .month = 11, .day = 1 }, report.monthDay(snap.budgetResetDay().?));
 
-    // A second process opening later reads the shared cache immediately.
     var other_gateway: FakeGateway = .{ .now_ms = gateway.now_ms + 1000 };
     var other = Dashboard.init(testing.allocator, other_gateway.host(home));
     defer other.deinit();
@@ -1001,7 +973,6 @@ test "opening shows the cache at once and fills it from AI Gateway in the backgr
     defer instant.deinit();
     try testing.expectApproxEqAbs(@as(f64, 2.5), instant.of(.today).totals.total_cost, 1e-9);
     other.waitForFetch();
-    // It already has today's finished days: only today and the budget.
     try testing.expectEqual(@as(usize, 2), other_gateway.count);
 }
 
@@ -1011,7 +982,6 @@ test "a dashboard reads what another fx process stored since" {
     const home = try testHome(&tmp);
     defer testing.allocator.free(home);
 
-    // The first process fetches on Oct 10, finished days included.
     var first_gateway: FakeGateway = .{ .now_ms = 20736 * std.time.ms_per_day + 23 * std.time.ms_per_hour };
     var first = Dashboard.init(testing.allocator, first_gateway.host(home));
     defer first.deinit();
@@ -1020,7 +990,6 @@ test "a dashboard reads what another fx process stored since" {
     try testing.expectEqual(@as(usize, 3), first_gateway.count);
     first.close();
 
-    // On Oct 11 a second process stores today and today's finished days.
     var second_gateway: FakeGateway = .{};
     var second = Dashboard.init(testing.allocator, second_gateway.host(home));
     defer second.deinit();
@@ -1028,7 +997,6 @@ test "a dashboard reads what another fx process stored since" {
     second.waitForFetch();
     try testing.expectEqual(@as(usize, 3), second_gateway.count);
 
-    // The first reopens and its own fetch fails: it shows the second's today.
     first_gateway.now_ms = second_gateway.now_ms + 30 * std.time.ms_per_s;
     first_gateway.status = 500;
     first.open(api_key);
@@ -1040,8 +1008,6 @@ test "a dashboard reads what another fx process stored since" {
         try testing.expectEqual(@as(?i64, second_gateway.now_ms), shown.of(.today).fetched_at_ms);
     }
 
-    // While the first stays open, the second stores Oct 12: the first's
-    // next redraw shows it.
     second_gateway.now_ms += std.time.ms_per_day;
     try testing.expect(second.refresh());
     second.waitForFetch();
@@ -1053,8 +1019,6 @@ test "a dashboard reads what another fx process stored since" {
         try testing.expectEqual(@as(?i64, second_gateway.now_ms), shown.of(.today).fetched_at_ms);
     }
 
-    // On Oct 13 the second stores the finished days first; the first's
-    // refresh then reads only today.
     second_gateway.now_ms += std.time.ms_per_day;
     try testing.expect(second.refresh());
     second.waitForFetch();
@@ -1095,8 +1059,6 @@ test "a Codex sign-in reads its plan's limits from ChatGPT" {
 
     dashboard.open(chatgpt);
     dashboard.waitForFetch();
-    // Limits, activity and the breakdown from the month's first day, all to
-    // ChatGPT with the account and no team.
     try testing.expectEqual(@as(usize, 3), gateway.count);
     try testing.expectEqualStrings("/backend-api/wham/usage", gateway.path(0));
     try testing.expectEqualStrings("/backend-api/wham/profiles/me", gateway.path(1));
@@ -1130,7 +1092,6 @@ test "a Codex sign-in reads its plan's limits from ChatGPT" {
     try testing.expectEqualStrings("cli", surfaces[0].name);
     try testing.expectEqualStrings("desktop app", surfaces[1].name);
 
-    // Another process opens instantly from the shared cache.
     var other_gateway: FakeGateway = .{ .now_ms = gateway.now_ms + 1000 };
     var other = Dashboard.init(testing.allocator, other_gateway.host(home));
     defer other.deinit();
@@ -1140,7 +1101,6 @@ test "a Codex sign-in reads its plan's limits from ChatGPT" {
     try testing.expectEqualStrings("plus", instant.codex_usage.?.plan);
     other.waitForFetch();
 
-    // The AI Gateway sign-in never sees the Codex numbers, and back.
     dashboard.close();
     dashboard.open(member);
     var gateway_snap = try dashboard.snapshot(testing.allocator);
@@ -1170,7 +1130,6 @@ test "a failed Codex activity request keeps the limits and the stored activity" 
 
     var snap = try dashboard.snapshot(testing.allocator);
     defer snap.deinit();
-    // The refresh counts as fresh: the limits came back.
     try testing.expect(snap.status == .ready);
     try testing.expectEqual(@as(?i64, gateway.now_ms), snap.codex_at_ms);
     try testing.expectEqual(@as(?u64, 1000), snap.codex_usage.?.profile.?.lifetime_tokens);
@@ -1188,7 +1147,6 @@ test "a Grok sign-in reads its plan's billing and name from the Grok proxy" {
 
     dashboard.open(xai);
     dashboard.waitForFetch();
-    // Billing, then settings, both with the user and no team.
     try testing.expectEqual(@as(usize, 2), gateway.count);
     try testing.expectEqualStrings("/billing?format=credits", gateway.path(0));
     try testing.expectEqualStrings("/settings", gateway.path(1));
@@ -1209,7 +1167,6 @@ test "a Grok sign-in reads its plan's billing and name from the Grok proxy" {
     try testing.expect(snap.codex_usage == null);
     try testing.expectEqual(@as(usize, 0), snap.of(.month).models.len);
 
-    // A failed settings request keeps the new billing and the stored name.
     gateway.settings_status = 500;
     gateway.now_ms += policy.floor_ms;
     try testing.expect(dashboard.refresh());
@@ -1221,7 +1178,6 @@ test "a Grok sign-in reads its plan's billing and name from the Grok proxy" {
     try testing.expectEqual(@as(?i64, gateway.now_ms), again.grok_at_ms);
     try testing.expectEqualStrings("SuperGrok", again.grok_usage.?.plan().?);
 
-    // A refused sign-in fails the refresh and keeps the numbers on screen.
     gateway.status = 401;
     gateway.now_ms += policy.floor_ms;
     try testing.expect(dashboard.refresh());
@@ -1243,21 +1199,19 @@ test "the floor holds open and the 15-minute timer, never r" {
 
     dashboard.open(api_key);
     dashboard.waitForFetch();
-    try testing.expectEqual(@as(usize, 3), gateway.count); // no budget for an API key
+    try testing.expectEqual(@as(usize, 3), gateway.count);
     try testing.expect(!gateway.teams[0]);
     try testing.expect(std.mem.endsWith(u8, gateway.path(0), "&api_key_id=self"));
 
     gateway.now_ms += 30 * std.time.ms_per_s;
     dashboard.tick();
     try testing.expectEqual(@as(usize, 3), gateway.count);
-    // r fetches at once, inside the floor or not, and again after that.
     try testing.expect(dashboard.refresh());
     dashboard.waitForFetch();
     try testing.expectEqual(@as(usize, 4), gateway.count);
     try testing.expect(dashboard.refresh());
     dashboard.waitForFetch();
     try testing.expectEqual(@as(usize, 5), gateway.count);
-    // Reopening inside the floor shows the cache without fetching.
     dashboard.close();
     dashboard.open(api_key);
     try testing.expectEqual(@as(usize, 5), gateway.count);
@@ -1344,18 +1298,15 @@ test "a clock corrected backward does not freeze /usage" {
     var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
     defer dashboard.deinit();
 
-    // The clock ran a day ahead when this was fetched and stored.
     gateway.now_ms = real + std.time.ms_per_day;
     dashboard.open(api_key);
     dashboard.waitForFetch();
     dashboard.close();
 
-    // Corrected: reopening fetches at once, and the result is shown and kept.
     gateway.now_ms = real;
     const before = gateway.count;
     dashboard.open(api_key);
     dashboard.waitForFetch();
-    // Today plus the finished days, which were stored for tomorrow.
     try testing.expectEqual(@as(usize, 3), gateway.count - before);
     {
         var shown = try dashboard.snapshot(testing.allocator);
@@ -1366,7 +1317,6 @@ test "a clock corrected backward does not freeze /usage" {
         try testing.expect(shown.of(.days_7).finished_current);
     }
 
-    // The next refresh reads only today again.
     gateway.now_ms = real + 2 * std.time.ms_per_min;
     const again = gateway.count;
     try testing.expect(dashboard.refresh());
@@ -1386,7 +1336,6 @@ test "an unreadable cache file keeps the finished days on screen and in the file
     dashboard.open(api_key);
     dashboard.waitForFetch();
 
-    // Something else (garbage, or another fx version's schema) replaces the file.
     const identity = cache.identityOf(.api_key, api_key.subject, "");
     var name_buf: [128]u8 = undefined;
     const name = try std.mem.print(&name_buf, ".fx/{s}/{s}.json", .{ cache.dir_name, &identity });
@@ -1396,7 +1345,6 @@ test "an unreadable cache file keeps the finished days on screen and in the file
     const before = gateway.count;
     try testing.expect(dashboard.refresh());
     dashboard.waitForFetch();
-    // Only today is read; the finished days come from what the fetch was planned from.
     try testing.expectEqual(@as(usize, 1), gateway.count - before);
     {
         var shown = try dashboard.snapshot(testing.allocator);
@@ -1404,7 +1352,6 @@ test "an unreadable cache file keeps the finished days on screen and in the file
         try testing.expect(shown.of(.days_7).finished_current);
         try testing.expect(shown.of(.days_7).totals.total_cost > 40);
     }
-    // The file has them again for every other fx process.
     var other = Dashboard.init(testing.allocator, gateway.host(home));
     defer other.deinit();
     other.open(api_key);
@@ -1418,7 +1365,6 @@ test "a cache that cannot be written still shows what was fetched" {
     defer tmp.cleanup();
     const home = try testHome(&tmp);
     defer testing.allocator.free(home);
-    // `usage-cache` is a file, so nothing can be stored.
     try tmp.dir.writeFile(testing.io, .{ .sub_path = ".fx/" ++ cache.dir_name, .data = "not a directory" });
     var gateway: FakeGateway = .{};
     var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
@@ -1444,7 +1390,6 @@ test "a dashboard never shows less than it had when the file goes back" {
     dashboard.open(api_key);
     dashboard.waitForFetch();
 
-    // A store that started over from an unreadable file left an older entry.
     const identity = cache.identityOf(.api_key, api_key.subject, "");
     const older = try cache.encode(testing.allocator, identity, .{
         .today = .{ .day = report.utcDay(gateway.now_ms), .at_ms = gateway.now_ms - std.time.ms_per_hour, .models = &.{} },
@@ -1471,7 +1416,6 @@ test "a provider switch fetches the new sign-in at once, and r works for it" {
     dashboard.open(member);
     dashboard.waitForFetch();
 
-    // Seconds later the provider changes and /usage opens again.
     dashboard.close();
     gateway.now_ms += 5 * std.time.ms_per_s;
     const chatgpt: Credential = .{ .scope = .codex, .bearer = "chatgpt_token", .team = null, .subject = "acct_9", .account_id = "acct_9", .label = "codex (ChatGPT)" };
@@ -1483,7 +1427,6 @@ test "a provider switch fetches the new sign-in at once, and r works for it" {
     defer shown.deinit();
     try testing.expectEqual(@as(?i64, gateway.now_ms), shown.codex_at_ms);
 
-    // r fetches for it at once too.
     gateway.now_ms += 5 * std.time.ms_per_s;
     const before_r = gateway.count;
     try testing.expect(dashboard.refresh());
@@ -1511,13 +1454,11 @@ test "a sign-in that arrives during another's fetch gets its fetch when that one
     defer before.deinit();
     try testing.expect(before.codex_at_ms == null);
 
-    // The next event-loop pass starts it, without waiting out any floor.
     dashboard.tick();
     dashboard.waitForFetch();
     var after = try dashboard.snapshot(testing.allocator);
     defer after.deinit();
     try testing.expectEqual(@as(?i64, gateway.now_ms), after.codex_at_ms);
-    // Owed once: later passes wait for the 15-minute timer.
     const fetched = gateway.count;
     dashboard.tick();
     dashboard.waitForFetch();

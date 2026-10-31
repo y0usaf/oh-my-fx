@@ -569,8 +569,6 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(quitPane).not.toContain(WARNING);
       expect(quitPane).not.toContain(COMPACT_WARNING);
 
-      // The quit arm lapses after 3s. The warning only survives that long
-      // because its visible budget paused while the hint owned the footer.
       const resumedPane = await session.waitForText(WARNING, TIMEOUT);
       expect(resumedPane).not.toContain(QUIT_HINT);
       expect(session.isAlive()).toBe(true);

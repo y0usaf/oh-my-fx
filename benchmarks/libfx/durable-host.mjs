@@ -1,5 +1,3 @@
-// Effectful shell shared by the durable harnesses: the scripted gateway as a
-// fetch function, sleeps, and agent options. Decisions live in durable.mjs.
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,9 +7,6 @@ export const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url))
 
 const encoder = new TextEncoder();
 
-// A fetch that answers the catalog GET and scripts every model POST from the
-// request body. `stepsFor(prompt)` picks the scripted turn; `onRequest`
-// sees each parsed request and the frames sent back.
 export function scriptedFetch({ stepsFor, onRequest = () => {} }) {
   return async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
@@ -60,7 +55,6 @@ export async function agentOptions({ backend, fetch, tools = [], checkpoint, per
   };
 }
 
-// libfx tool descriptors for the durable tool set, all routed to `run`.
 export function hostTools(run) {
   return Object.entries(durableTools).map(([name, policy]) => ({
     name,

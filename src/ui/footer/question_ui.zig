@@ -52,7 +52,6 @@ pub fn composeQuestionPanelText(
         return out.toOwnedSlice();
     };
 
-    // The question is its own header; batch progress lives in the hint row.
     try writeQuestionPanelQuestion(&out.writer, entry.question, row_budget);
     try out.writer.writeByte('\n');
 
@@ -101,7 +100,6 @@ fn writeQuestionPanelOptionLine(
     row_budget: usize,
 ) !void {
     const selected = index == entry.choice_index;
-    // No caret: selection reads purely from the white-vs-gray contrast.
     const option_style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
 
     var ordinal_buf: [16]u8 = undefined;
@@ -465,9 +463,6 @@ fn writeQuestionAnswerResolution(
     number: usize,
     cols: u16,
 ) !void {
-    // The question is numbered by its position in the batch; the muted
-    // answer hangs beneath, aligned under the question text. Pure
-    // typography, so the block never reads as a tool group.
     var prefix_buf: [16]u8 = undefined;
     const question_prefix = std.mem.print(&prefix_buf, "  {d}) ", .{number}) catch "  ";
     var indent_buf: [16]u8 = undefined;
@@ -480,9 +475,6 @@ fn writeQuestionAnswerResolution(
     try writeResolutionField(writer, indent, indent, answer, cols, ui_render.statusline_style);
 }
 
-// Wraps like the main transcript: soft wrap at word boundaries inside each
-// hard line, with continuation rows hanging under the field's first text
-// column. Long fields never trail off with an ellipsis.
 fn writeResolutionField(
     writer: *std.Io.Writer,
     first_prefix: []const u8,
@@ -626,7 +618,6 @@ test "compose question panel renders only the current paginated entry" {
     try std.testing.expect(std.mem.find(u8, text, "Q0?") == null);
     try std.testing.expect(std.mem.find(u8, text, "Q1?") != null);
     try std.testing.expect(std.mem.find(u8, text, "Q2?") == null);
-    // No caret: the selected option is the one carrying the white style.
     try std.testing.expect(std.mem.find(u8, text, "❯") == null);
     try std.testing.expect(std.mem.find(u8, text, "[✓]") == null);
     var sel_buf: [64]u8 = undefined;
@@ -783,12 +774,10 @@ test "resolved long question and answer wrap into hanging continuation rows" {
     const text = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, width);
     defer std.testing.allocator.free(text);
 
-    // Nothing trails off: every word survives and no ellipsis is emitted.
     try std.testing.expect(std.mem.find(u8, text, "…") == null);
     try std.testing.expect(std.mem.find(u8, text, "results?") != null);
     try std.testing.expect(std.mem.find(u8, text, "context visible") != null);
 
-    // Continuation rows hang under the question text ("  1) " is 5 wide).
     try expectVisibleIndentBefore(text, "cover only the assistant's written", 5);
     try expectVisibleIndentBefore(text, "results?", 5);
     try expectVisibleIndentBefore(text, "context visible", 5);
@@ -1020,8 +1009,6 @@ test "freeform cursor moves to a continuation row at an exact wrap boundary" {
     try prompt.syncFrom(std.testing.allocator, &entries);
     prompt.moveChoice(-1);
 
-    // Exactly the freeform content width at 24 cols (24 - 7 prefix), so the
-    // cursor lands on a synthetic continuation row.
     const answer = "abcdefghijklmnopq";
     for (answer) |byte| _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = byte });
 

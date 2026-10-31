@@ -2123,8 +2123,6 @@ describe("Vision route fake Gateway", () => {
     "empty successful Vision provider output is invalid and permits one recovery request",
     async () => {
       const root = createIsolatedRoot();
-      // The empty response is served twice because a structurally invalid successful
-      // response earns one internal retry before Vision reports the failure.
       const gateway = startImageGateway([
         sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "vision_empty"),
         sseText(JSON.stringify({ images: [] })),
@@ -2273,7 +2271,6 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests[1].body).not.toContain("Do not wrap the JSON");
         expect(JSON.parse(gateway.chatRequests[0].body).responseFormat).toBeUndefined();
         expect(JSON.parse(gateway.chatRequests[3].body).responseFormat).toBeUndefined();
-        // Byte-identical retry payload: same verified snapshot, ids, focus, and batch.
         expect(gateway.chatRequests[2].body).toBe(gateway.chatRequests[1].body);
         expect(gateway.chatRequests[3].body).toContain("FX LOGO");
         expect(gateway.chatRequests[3].body).not.toContain("provider_response_invalid");
@@ -3337,7 +3334,6 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(input);
     session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
     await session.waitForStableComposer(TIMEOUT);
-    // A pending recovery checkpoint continues automatically on resume.
     await session.waitForText(/continues\s+automatically/, TIMEOUT);
     await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
@@ -3368,8 +3364,6 @@ describe("request size budget", () => {
   const SIZE_IMAGE_COUNT = 6;
   const SIZE_NOTICE = "not sent to keep the request under the provider's size limit";
   const SIZE_PROMPT = "Read img01.png through img06.png one at a time with read_file.";
-  // Bodies AI Gateway returned on 2026-10-07 for a request over Claude's
-  // limit, reduced to the fields fx reads.
   const gatewayFallbackBody = JSON.stringify({
     error: { message: "Bad Request", type: "AI_APICallError", param: { statusCode: 400 } },
     providerMetadata: {
@@ -3447,7 +3441,6 @@ describe("request size budget", () => {
   function writeSizeImages(workspace: string) {
     const images = new Map<string, string>();
     for (let index = 1; index <= SIZE_IMAGE_COUNT; index++) {
-      // About 1 MB of base64 each, distinct bytes per file.
       const png = paddedPng(solidPng(64, 64), 750_000 + index);
       writeFileSync(join(workspace, `img0${index}.png`), png);
       images.set(`img0${index}.png`, png.toString("base64"));
@@ -3474,7 +3467,6 @@ describe("request size budget", () => {
 
         const rejected = gateway.requests.filter((request) => request.status !== 200);
         expect(rejected).toHaveLength(1);
-        // No summary request: the conversation was not compacted.
         expect(gateway.requests.every((request) => request.tools)).toBe(true);
 
         const rejectedIndex = gateway.requests.indexOf(rejected[0]!);
@@ -3483,10 +3475,8 @@ describe("request size budget", () => {
         expect(after.length).toBeGreaterThan(0);
         for (const request of after) {
           expect(request.body.length).toBeLessThanOrEqual(learnedLimit);
-          // Text history survives: the original prompt rides every request.
           expect(request.body).toContain(SIZE_PROMPT);
         }
-        // The retry drops the oldest images and keeps the newest.
         expect(after[0]!.images).not.toContain("img01.png");
         expect(after[0]!.images).toContain(rejected[0]!.images.at(-1));
         expect(after[0]!.body).toContain(SIZE_NOTICE);

@@ -1,15 +1,3 @@
-// The trace bridge: turns what a scenario saw of real fx into TraceObs.tla
-// and checks it against a model's trace wrapper, MCP-v2's way (sentinel
-// invariant: violated exactly when a complete match exists).
-//
-// Verdicts:
-//   ACCEPTED      a complete match exists that keeps every stated property
-//   VIOLATES      every complete match breaks a stated property (`broken`
-//                 names them, from a match TLC prints)
-//   REJECTED      no complete match: the real behavior leaves the model;
-//                 `firstBad` is the first record no prefix match can take
-//   INCONCLUSIVE  an empty trace
-//   TOOL_ERROR    anything else (a parse error, an unexpected exit)
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runTlc, sha256Text } from "./tlc";
@@ -86,7 +74,6 @@ export async function checkTrace(opts: { module: string; records: TraceRecord[];
 
   const whole = await run("match", records, "NotDone");
   if (unmatched(whole)) {
-    // The longest prefix that matches; the record after it is the first the model can't take.
     let lo = 0, hi = records.length - 1;
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2);

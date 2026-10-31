@@ -1,11 +1,3 @@
-// `libfx/chatgpt`: sign in with ChatGPT for a Codex agent. Two flows, both
-// plain data between steps so a website can start in one request and finish in
-// another:
-//
-// - Paste the address: the user signs in on OpenAI, lands on a page at
-//   localhost:1455 that does not load, and pastes its address back.
-// - Device code: the user enters a short code on OpenAI's page. ChatGPT
-//   workspaces and accounts must turn device code sign-in on first.
 import { chatgptClientId, chatgptIssuer, normalizeChatgptCredentials, refreshChatgptCredentials } from "./chatgpt.js";
 import { hostFetch, pkceChallenge, randomSecret, readSignInAddress, signInError, wait } from "./oauth.js";
 

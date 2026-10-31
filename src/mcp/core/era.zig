@@ -237,7 +237,6 @@ pub const Detector = struct {
                 }
             },
             .probe_timer_fired => |probe| {
-                // A timer from an earlier probe, or for one already answered, is no step.
                 if (probe != d.probe or d.pending != .discover) return;
                 d.legacyAnswer(out);
             },
@@ -253,9 +252,6 @@ pub const Detector = struct {
                 if (d.pending != .initialize) {
                     ignored = true;
                 } else if (hint and d.tried[0] < 2) {
-                    // A modern server that missed the probe; probe once more.
-                    // Detection always starts with the first preferred version,
-                    // so its two-probe limit allows exactly one fall forward.
                     d.modern_seen = true;
                     d.startProbe(0, out);
                 } else d.fail(.initialize_failed, out);
@@ -276,7 +272,6 @@ pub const Detector = struct {
                     ignored = true;
                 } else {
                     d.advertised = listed;
-                    // Never switch eras mid-process.
                     if (d.nextCandidate(listed)) |index| {
                         d.tried[index] += 1;
                         d.version = .{ .preferred = index };
@@ -578,7 +573,6 @@ const World = struct {
 const Move = Event;
 
 fn apply(d: *Detector, w: *World, event: Event) !bool {
-    // The environment offers only answers to what is pending.
     switch (event) {
         .process_started => if (w.processes >= 2) return false,
         .discover_result, .unsupported_version, .modern_rejection, .legacy_answer, .discover_not_implemented => if (w.pending != .discover) return false,
@@ -590,7 +584,6 @@ fn apply(d: *Detector, w: *World, event: Event) !bool {
     var out: Output = .{};
     d.step(event, &out) catch |err| switch (err) {
         error.NotReady => {
-            // LegacyOrder: operation requests wait for detection.
             try testing.expect(!before.ready());
             try testing.expectEqual(before, d.*);
             return true;
@@ -616,7 +609,6 @@ fn apply(d: *Detector, w: *World, event: Event) !bool {
         .legacy_answer, .initialize_result, .initialize_error, .initialize_timed_out => w.pending = .none,
         .probe_timer_fired => |n| {
             w.timers &= ~(@as(u64, 1) << @intCast(n));
-            // Only the current probe's timer answers anything.
             if (n == before.probe and before.pending == .discover) w.pending = .none;
         },
         .operation_version_rejected => |listed| if (before.state == .modern) {
@@ -635,11 +627,9 @@ fn apply(d: *Detector, w: *World, event: Event) !bool {
             }
             w.pending = .discover;
             w.probes[i] += 1;
-            // ProbesBounded.
             try testing.expect(w.probes[i] <= 2);
         },
         .send_initialize => {
-            // NoFallbackAfterModern.
             if (w.modern_answer) try testing.expect(w.last_listed.legacy);
             w.pending = .initialize;
         },
@@ -653,11 +643,9 @@ fn apply(d: *Detector, w: *World, event: Event) !bool {
         },
         .ready => |v| {
             const era: State = if (v == .legacy) .legacy else .modern;
-            // EraSticky.
             if (w.ready_era) |e| try testing.expectEqual(e, era);
             w.ready_era = era;
             w.ready = v;
-            // ChosenSupported.
             switch (v) {
                 .preferred => |i| try testing.expect(w.last_listed.has(i) or w.unlisted),
                 .legacy => try testing.expect(event == .initialize_result and event.initialize_result == .legacy),
@@ -667,11 +655,9 @@ fn apply(d: *Detector, w: *World, event: Event) !bool {
         .failed => {},
     };
     if (d.state == .legacy) try testing.expectEqual(@as(u8, 1), w.initialized);
-    // LegacyOrder and VersionOnEveryRequest: only after detection, with the version in use.
     if (event == .operation_sent) try testing.expect(w.ready != null);
     if (event == .operation_sent) try testing.expectEqual(if (d.state == .modern) w.ready.? else Version.none, out.meta.?);
 
-    // Where the model has no choice, the core must act.
     switch (event) {
         .discover_result => |listed| if (before.pending == .discover and listed.preferred != 0) try testing.expectEqual(State.modern, d.state),
         .legacy_answer => if (before.pending == .discover and !before.modern_seen) try testing.expectEqual(State.initializing, d.state),
@@ -679,7 +665,6 @@ fn apply(d: *Detector, w: *World, event: Event) !bool {
         .probe_timer_fired => |n| if (n == before.probe and before.pending == .discover) {
             try testing.expect(d.state != .probing or d.probe != before.probe);
         } else {
-            // A timer from an earlier probe is no step at all.
             try testing.expect(out.transition == null);
             try testing.expectEqual(before, d.*);
         },
@@ -747,7 +732,6 @@ test "random long runs keep the model's invariants, and detection always ends (R
         var d: Detector = .init(test_config);
         var w: World = .{};
         for (0..random.uintLessThan(usize, 60)) |_| _ = try apply(&d, &w, moves[random.uintLessThan(usize, moves.len)]);
-        // Only the fair moves from here: probe timers fire, initialize times out.
         for (0..16) |_| {
             if (d.state != .probing and d.state != .initializing) break;
             if (d.pending == .discover) _ = try apply(&d, &w, .{ .probe_timer_fired = d.probe }) else _ = try apply(&d, &w, .initialize_timed_out);
@@ -792,7 +776,6 @@ test "initialize may agree on an older 2025 version, which the detector keeps" {
     try d.step(answer, &out);
     try testing.expectEqualSlices(Effect, &.{ .send_initialized, .{ .ready = .{ .legacy = 2 } } }, out.effects());
     try testing.expectEqualStrings("2025-03-26", versionName(d.config, d.version).?);
-    // 2025 requests carry no version in `_meta`; over HTTP it goes in the header.
     try d.step(.operation_sent, &out);
     try testing.expectEqual(Version.none, out.meta.?);
 }
@@ -805,7 +788,6 @@ test "a legacy server is found by any other error, no answer, or an error withou
         try d.step(.detect_requested, &out);
         try d.step(answer, &out);
         try testing.expectEqualSlices(Effect, &.{.send_initialize}, out.effects());
-        // A late answer to the abandoned probe changes nothing.
         try d.step(.{ .discover_result = .{ .preferred = 1 } }, &out);
         try testing.expect(out.transition.?.ignored);
         try d.step(.{ .initialize_result = .{ .preferred = 0 } }, &out);
@@ -897,7 +879,6 @@ test "over HTTP, 404 with -32601 to the probe is a modern server without discove
     try d.step(.detect_requested, &out);
     try d.step(.discover_not_implemented, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .ready = .{ .preferred = 0 } }}, out.effects());
-    // The first request learns the real versions.
     try d.step(.{ .operation_version_rejected = .{ .preferred = 0b10 } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .ready = .{ .preferred = 1 } }}, out.effects());
 }

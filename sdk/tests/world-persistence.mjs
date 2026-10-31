@@ -1,23 +1,11 @@
-// A libfx persistence store over a Workflow World, written the way an app or
-// the Workflow package would write it: libfx never sees the World, and this
-// store never reads libfx's records.
-//
-// A session is one World run. Each record and each checkpoint is a
-// `step_created` event in it, and a record's cursor is its event slot. A
-// World commits a write at the next free slot rather than refusing it, so a
-// record also stores the cursor it continued: a load keeps only the unbroken
-// chain of records, and a write that lands after another writer's record for
-// the same cursor is fenced.
 import { FxFencedError } from "../node.js";
 
 const recordStep = "fx.record";
 const checkpointStep = "fx.checkpoint";
-// Event ids are a prefix and the slot, zero-padded to 26 digits.
 const eventId = /^[a-z]+_(\d{26})$/;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-// A ULID: 48 bits of time, then 80 random bits, in Crockford base32.
 function ulid(now = Date.now()) {
   const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
   let time = "";
@@ -36,7 +24,6 @@ function slotOf(event) {
 const toBase64 = (bytes) => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
 const fromBase64 = (text) => new Uint8Array(Buffer.from(text, "base64"));
 
-// The payload of one of this store's steps, or null for any other event.
 function stepOf(event, stepName) {
   if (event?.eventType !== "step_created" || event.eventData?.stepName !== stepName) return null;
   const input = event.eventData.input;
@@ -52,7 +39,6 @@ function stepOf(event, stepName) {
 export function worldPersistence(world, { runId = null, pageSize = 100 } = {}) {
   let created = runId !== null;
   const id = runId ?? `wrun_${typeof world.createRunId === "function" ? world.createRunId({}) : ulid()}`;
-  // The newest slot this store has seen; each write names it.
   let eventCount = 0;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
 
@@ -67,8 +53,6 @@ export function worldPersistence(world, { runId = null, pageSize = 100 } = {}) {
     created = true;
   }
 
-  // Writes one step after the newest slot seen; returns its slot and the
-  // events that landed between.
   async function write(stepName, payload) {
     const known = eventCount;
     const result = await world.events.create(id, {
@@ -83,7 +67,6 @@ export function worldPersistence(world, { runId = null, pageSize = 100 } = {}) {
     return { slot, between: reported.filter((event) => slotOf(event) > known && slotOf(event) < slot) };
   }
 
-  // The run's events, newest first, down to and excluding `stopBelow`.
   async function readNewestFirst(stopBelow) {
     const events = [];
     for (let cursor; ;) {
@@ -101,8 +84,6 @@ export function worldPersistence(world, { runId = null, pageSize = 100 } = {}) {
     get runId() {
       return id;
     },
-    // The latest checkpoint and the records after it: the run is read newest
-    // first, as far back as that checkpoint's cursor.
     async load() {
       if (!created) return {};
       const newestFirst = [];
@@ -116,7 +97,6 @@ export function worldPersistence(world, { runId = null, pageSize = 100 } = {}) {
           if (checkpoint && slot <= stopAt) { done = true; break; }
           const saved = checkpoint ? null : stepOf(event, checkpointStep);
           if (saved) {
-            // Records stored after the snapshot but before this event follow it.
             checkpoint = saved;
             stopAt = Number(saved.through);
             continue;

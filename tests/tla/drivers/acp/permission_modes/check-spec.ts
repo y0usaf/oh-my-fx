@@ -1,8 +1,3 @@
-// Exhaustive TLC check of the permission-mode contract plus mutation
-// qualification: each planted mutant must violate the named property, which
-// shows the properties are strong enough to catch that mistake.
-//
-//   bun tests/tla/drivers/acp/permission_modes/check-spec.ts
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { outDir } from "../../lib/tlc";

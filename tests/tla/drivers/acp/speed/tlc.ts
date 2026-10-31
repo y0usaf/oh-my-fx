@@ -1,5 +1,3 @@
-// TLC helpers for the ACP speed driver: the shared runner in
-// ../../lib/tlc.ts, pointed at the specs in tests/tla/acp/.
 import { join } from "node:path";
 import { TLA_ROOT, runTlc as runShared } from "../../lib/tlc";
 

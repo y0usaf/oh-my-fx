@@ -1665,7 +1665,6 @@ fn runRuntimeRecoveryControl(
             return error.WrongRecoveryControlError;
         }
     } else {
-        // The call reports why the stopped server could not be restarted.
         const response = call.response orelse return error.WrongRecoveryControlError;
         if (std.mem.find(u8, response, "server_restart_failed") == null or
             std.mem.find(u8, response, "did not complete startup within 500 ms (startup_timeout_ms)") == null)

@@ -149,8 +149,6 @@ pub fn QuestionRuntime(comptime App: type) type {
             if (app.question_prompt.isFreeformSelected()) {
                 switch (action) {
                     .cursor_up => {
-                        // At the top of the freeform draft, Up leaves the
-                        // slot and resumes option navigation.
                         if (!moveFreeformCursorVertical(app, .up)) {
                             app.question_prompt.moveChoice(-1);
                         }
@@ -194,7 +192,6 @@ pub fn QuestionRuntime(comptime App: type) type {
                     }
                 },
                 .cursor_right, .word_right => {
-                    // Enter advances; right arrow remains inert to avoid skipping answers.
                 },
                 else => {},
             }

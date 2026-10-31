@@ -58,8 +58,6 @@ pub fn Runtime(comptime App: type) type {
             query: picker_state.ProviderPickerQuery,
             column: *ColumnBuffer,
         ) usize {
-            // Emptied up front so early returns leave no stale slice count in
-            // a caller-retained buffer.
             column.count = 0;
             if (comptime !supported(App)) return 0;
             if (app.auth.sourceInventoryRefreshActive()) {
@@ -96,8 +94,6 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .key_source => {
                     const view = app.auth.pickerView();
-                    // `current` always means "used for inference right now",
-                    // so a key is only current while the gateway is active.
                     const active = if (active_provider == .gateway) app.auth.credentialSource() else null;
                     inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".field_names) |field_name| {
                         const key_source = @field(provider_picker_catalog.KeySource, field_name);
@@ -114,9 +110,6 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .api_key => {
-                    // The column outlives the entry while the save thread
-                    // works; an empty ready-looking field there would invite
-                    // pasting the key again, into the composer this time.
                     column.labels[0] = if (app.auth.apiKeySaveInFlight())
                         "saving the key..."
                     else
@@ -127,10 +120,6 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .team => {
                     const selection = app.auth.loadedTeamSelection() orelse return 0;
-                    // `current` always means "used for inference right now".
-                    // The login session remembers a team even while a
-                    // subscription provider or an API key is doing the actual
-                    // inference; that remembered team earns no marker then.
                     const oauth_inference_active = active_provider == .gateway and
                         app.auth.credentialSource() == .fx_login;
                     const current = if (oauth_inference_active) selection.currentTeam() else null;
@@ -252,8 +241,6 @@ pub fn Runtime(comptime App: type) type {
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
-            // No matching option: let Enter fall through so the router reports
-            // the unknown text instead of silently eating the key.
             const selected = selectedLabel(app, query, &column) orelse return false;
 
             switch (query.stage) {
@@ -263,8 +250,6 @@ pub fn Runtime(comptime App: type) type {
                         try commit(app, .{ .provider = provider });
                         return true;
                     }
-                    // Nothing is applied yet: the provider is only a heading
-                    // until the method, and then the team, are chosen too.
                     const slug = provider_catalog.find(provider).slug;
                     try setComposerText(app, "{s}{s} ", .{ query.prefix, slug });
                     try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, slug, "", .method);
@@ -273,17 +258,11 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .method => {
                     const method = provider_picker_catalog.parseMethod(selected) orelse return false;
-                    // The inventory is what says whether this method already
-                    // has a credential to switch to; it goes stale the moment
-                    // a key lands in the environment or the keychain.
                     try app.auth.refreshSourceInventory(app.alloc);
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     if (method == .api_key) {
-                        // With detected keys the next column asks which to use
-                        // (or `new` to paste one); with none there is nothing
-                        // to ask, so the paste field opens directly.
                         const view = app.auth.pickerView();
                         if (view.available_sources.contains(.ai_gateway_api_key) or
                             view.available_sources.contains(.stored_key))
@@ -294,9 +273,6 @@ pub fn Runtime(comptime App: type) type {
                         try openKeyStage(app, query.prefix, .api_key);
                         return true;
                     }
-                    // A first sign-in picks the team as part of the OAuth flow,
-                    // so the team column only earns a place once a session
-                    // exists to list teams for.
                     const prefix = try app.alloc.dupe(u8, query.prefix);
                     defer app.alloc.free(prefix);
                     const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
@@ -306,9 +282,6 @@ pub fn Runtime(comptime App: type) type {
                     switch (teams) {
                         .ready => {},
                         .needs_sign_in, .blocked => {
-                            // An ambient OIDC token satisfies oauth without a
-                            // browser round trip; switch to it instead of
-                            // forcing a sign-in it does not need.
                             if (ambientOauthSource(app)) |source| {
                                 try commitSource(app, source, provider);
                                 return true;
@@ -320,9 +293,6 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                             return true;
                         },
-                        // Teams refine the account rather than gate it, so this
-                        // is the last column the choice has: the login is still
-                        // the credential the user asked for, teams or not.
                         .unavailable => {
                             try commitSource(app, .fx_login, provider);
                             return true;
@@ -347,8 +317,6 @@ pub fn Runtime(comptime App: type) type {
                     }
                     return true;
                 },
-                // Enter is consumed by the key field itself, which the auth
-                // runtime routes before the composer ever sees the byte.
                 .api_key => return false,
                 .team => {
                     const index = teamIndex(app, selected) orelse return false;
@@ -392,13 +360,8 @@ pub fn Runtime(comptime App: type) type {
 
             switch (query.stage) {
                 .provider => return false,
-                // Arrow keys never reach here while the key field is active;
-                // its entry routing consumes them. Esc is the way out.
                 .api_key => return false,
                 .method => {
-                    // Back to the full provider column, not to the committed
-                    // token as a filter: the point of stepping back is seeing
-                    // the alternatives again, with the old choice preselected.
                     try setComposerText(app, "{s}", .{prefix});
                     picker.clearProviderPickerFlow();
                     syncProviderSelection(app, provider_slug);
@@ -429,9 +392,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !supported(App)) return;
             if (app.input_runtime.picker.provider_picker_stage != .api_key) return;
             if (app.auth.apiKeyInlineActive()) return;
-            // Enter pops the entry stage before the save thread finishes; the
-            // column must outlive the save so the switch-to-gateway gate can
-            // still see where the key came from when the result lands.
             if (app.auth.apiKeySaveInFlight()) return;
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -439,9 +399,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn commit(app: *App, choice: auth_runtime.Choice) !void {
-            // Clear first: the choice may open the device-code or API key
-            // screen, and a leftover `/provider ...` line under it reads as if the
-            // picker were still waiting for input.
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             try app_auth_runtime.Runtime(App).applyPickerChoice(app, choice);
@@ -465,9 +422,6 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
-            // The provider only follows a credential that actually applied;
-            // switching after a failed selection would strand the provider
-            // without the credential the user just asked it to use.
             if (try auth_rt.applySourceChoice(app, source)) {
                 if (!provider_runtime.provider(app).eql(provider)) {
                     try auth_rt.applyPickerChoice(app, .{ .provider = provider });
@@ -779,8 +733,6 @@ test "key column is a masked field, not a list of options" {
     try std.testing.expectEqual(@as(usize, 1), typed.count);
     try std.testing.expect(std.mem.find(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
 
-    // While the save thread works the row says so instead of rendering an
-    // empty ready-looking field.
     app.auth.save_in_flight = true;
     const saving = columnFor(&app, .api_key, "");
     try std.testing.expectEqual(@as(usize, 1), saving.count);
@@ -793,7 +745,6 @@ test "key source column offers only detected keys plus new" {
     defer app.deinit();
     try app.input_runtime.picker.beginProviderPickerFlow(alloc, "vercel", "api-key", .key_source);
 
-    // Nothing detected: only `new` remains.
     const bare = columnFor(&app, .key_source, "");
     try std.testing.expectEqual(@as(usize, 1), bare.count);
     try std.testing.expectEqualStrings("new", bare.labels[0]);

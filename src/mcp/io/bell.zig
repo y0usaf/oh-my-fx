@@ -32,7 +32,7 @@ pub const Bell = struct {
         if (timeout_ms) |ms| b.wakes.concurrent(b.io, ringAfter, .{ b, ms }) catch return error.ConcurrencyUnavailable;
         _ = b.queue.getOne(b.io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            error.Closed => unreachable, // the queue is never closed
+            error.Closed => unreachable,
         };
     }
 

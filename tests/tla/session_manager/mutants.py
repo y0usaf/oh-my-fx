@@ -19,7 +19,6 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 JAR = os.environ.get("TLA2TOOLS_JAR", os.path.expanduser("~/.local/share/tla/tla2tools.jar"))
 
-# (spec, bug description, text to replace, replacement, invariant that must fail)
 MUTANTS = [
     ("Wiring", "a fork reuses a session that exists",
      "    /\\ f \\notin {cur, next}\n    /\\ ~made[f]\n",
@@ -172,7 +171,6 @@ def main():
                 survivors += 1
                 continue
             (work / f"{spec}.tla").write_text(text.replace(old, new, 1))
-            # A smaller model, when the full one is too large to search per mutant.
             small = HERE / f"{spec}.mutants.cfg"
             shutil.copy(small if small.exists() else HERE / f"{spec}.cfg", work / f"{spec}.cfg")
             run = subprocess.run(

@@ -1,8 +1,3 @@
-// Exhaustive TLC check of the speed contract plus mutation qualification:
-// each planted mutant must violate the named invariant, which shows the
-// invariants are not vacuous. Several mutants match how an earlier fx behaved.
-//
-//   bun tests/tla/drivers/acp/speed/check-spec.ts
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { outDir } from "../../lib/tlc";

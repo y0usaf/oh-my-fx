@@ -721,7 +721,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.sendText("Build the performance transcript.");
       await session.waitForText("PERF_TRANSCRIPT_TAIL", TIMEOUT);
 
-      // One correctness cycle also fences the inline prewarm before timing.
       session.sendKeysImmediate(["C-o"]);
       await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
@@ -764,9 +763,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["C-o"]);
       await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       let beforePrime = await session.capturePane();
-      // The first key moves one viewport into the three-viewport prepared
-      // window. Each loop then moves to its edge before the measured key
-      // crosses that edge and waits for the replacement window.
       session.sendKeysImmediate(["PageUp"]);
       await session.waitForPane(
         (pane) => pane !== beforePrime && pane.includes("full detail"),
@@ -966,8 +962,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      // Three terminal routes, the in-process terminal store's profile and
-      // sessions folders, plus command-replay logs, commands, and tool-results routes.
       expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(8);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 

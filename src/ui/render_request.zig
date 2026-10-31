@@ -63,8 +63,6 @@ pub const FrameAttempt = struct {
 };
 
 pub const animation_padding: i16 = 8;
-// Fixed 40-frame cycle (-8..31): two 20-frame marker pulses per wrap, so the
-// pulse phase stays seamless regardless of the animated label's length.
 const animation_max_phase: i16 = 31;
 pub const animation_interval_ms: i64 = 50;
 pub const max_consecutive_input_pending_aborts: u8 = 4;
@@ -73,12 +71,8 @@ pub const max_consecutive_input_pending_aborts: u8 = 4;
 pub const blink_half_period_frames: i16 = 10;
 
 comptime {
-    // The blink must complete whole on/off periods within one phase cycle or
-    // the marker visibly stutters at the wrap.
     const cycle = animation_max_phase + animation_padding + 1;
     std.debug.assert(@mod(cycle, 2 * blink_half_period_frames) == 0);
-    // Frame-phase blink (tool markers) and the wall-clock activity blink must
-    // share one tempo or the two markers drift visibly apart.
     std.debug.assert(
         blink_half_period_frames * animation_interval_ms == activity_status.activity_blink_half_period_ms,
     );
@@ -333,7 +327,6 @@ pub const RenderRequestState = struct {
             _ = self.pending_invalidations.appendOrCollapse(range);
         }
         if (snapshot.animation_candidate) |candidate| {
-            // Capture removes one slot; resets during the attempt only replace the remaining slot.
             std.debug.assert(self.animation_candidate_len < self.animation_candidates.len);
             var i: usize = self.animation_candidate_len;
             while (i > 0) : (i -= 1) {

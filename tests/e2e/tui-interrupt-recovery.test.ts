@@ -440,7 +440,6 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await waitForCondition(() => existsSync(startPath), "held tool start");
 
       await session.sendText(steerText);
-      // The queued steer is only visible as the waiting banner above the composer.
       await session.waitForText(steerText, TIMEOUT);
 
       await session.sendKeys("Up");
@@ -797,8 +796,6 @@ while :; do sleep 1; done
       const workspaceRoot = realpathSync(workspace);
       const pidPath = join(workspaceRoot, "held-command.pid");
       const scriptPath = join(workspaceRoot, "hold-exit.sh");
-      // Ignoring TERM keeps a cooperative stop inside its grace window, so
-      // exit has to force-kill the command rather than wait it out.
       writeFileSync(
         scriptPath,
         `#!/bin/sh
@@ -842,8 +839,6 @@ while :; do sleep 1; done
       );
       const commandPid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
 
-      // One burst, so exit lands while the first press is still cancelling
-      // the command and both paths join the same command thread.
       session.sendKeysImmediate(["C-c", "C-c"]);
       await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
 
@@ -869,9 +864,6 @@ while :; do sleep 1; done
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(corpus, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      // The search must still be running when the second Escape lands, about
-      // half a second after it starts. Linux searches 30,000 files in about a
-      // third of a second, so it needs a larger corpus than macOS.
       const corpusFiles = process.platform === "darwin" ? 30_000 : 120_000;
       for (let index = 0; index < corpusFiles; index += 1) {
         writeFileSync(
@@ -994,8 +986,6 @@ while :; do sleep 1; done
       await waitForCondition(() => held.started, "first response start");
       await session.sendKeys("C-c");
       await waitForCondition(() => held.cancelled, "first response cancellation");
-      // Race the finalization window on purpose: the follow-up must be
-      // accepted even if the interrupted turn has not finished closing.
       await session.sendText("Send this right after the cancel.");
       await session.waitForText("SEND_AFTER_CANCEL_ACCEPTED", TIMEOUT);
 
@@ -1054,8 +1044,6 @@ while :; do sleep 1; done
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Work on the report.");
       await waitForCondition(() => held.started, "held response start");
-      // Drop the live stream so the turn enters recovery, then kill fx before
-      // any cleanup can run: the checkpoint and the owner marker both survive.
       gateway.stop();
       await waitForTrace(tracePath, "recovery_checkpoint_set", TIMEOUT);
       Bun.spawnSync(["kill", "-9", String(session.processPid())]);
@@ -1072,8 +1060,6 @@ while :; do sleep 1; done
       session = null;
       gateway = null;
 
-      // Same profile, fresh process: the recovering turn must not restart
-      // itself; the user decides whether to retry it.
       const retryGateway = startFakeGateway([
         fakeGatewayFinalText("RECOVERY_RETRY_COMPLETE"),
       ]);
@@ -1100,8 +1086,6 @@ while :; do sleep 1; done
       expect(resumedScrollback).toContain("fx quit unexpectedly while this response was recovering");
       expect(resumedScrollback).not.toContain("continues automatically");
 
-      // Quitting without choosing keeps the suppression sticky: the next
-      // resume asks again instead of silently re-arming the turn.
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
       expect(existsSync(join(sessionDir, "owner.live"))).toBe(false);

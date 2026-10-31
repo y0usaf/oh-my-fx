@@ -365,7 +365,6 @@ test.skipIf(!tmuxAvailable())(
       const events = readFileSync(eventsPath, "utf8");
       for (const label of labels) expect(events).toContain(label);
 
-      // Pause after real terminal output, with no synthetic cursor response.
       const launch = `printf '\\033[2J\\033[H'; i=1; while [ "$i" -le 66 ]; do printf 'PRIOR_%03d\\n' "$i"; i=$((i+1)); done; : > ${shellQuote(launchReady)}; while [ ! -f ${shellQuote(launchGate)} ]; do sleep 0.02; done; exec ${shellQuote(FX_BIN)} --resume ${shellQuote(id)}`;
       active = await TmuxSession.create({
         cmd: `/bin/sh -c ${shellQuote(launch)}`,
@@ -518,7 +517,6 @@ function hasSemanticSymbol(
   return text.includes("\ud83d\udc69");
 }
 
-// `fx replay --frames` draws each captured row between `|` edges.
 function semanticTextLines(text: string): string[] {
   return text.split("\n").map((line) => {
     const plain = stripAnsi(line);
@@ -540,8 +538,6 @@ function findSemanticRowLines(
   );
 }
 
-// Joins a row's description with the lines it wraps onto, skipping the
-// full-transcript viewer chrome between captured pages.
 function wrappedSemanticDescription(lines: string[], index: number): string {
   const parts = [semanticCells(lines[index]!).at(-1) ?? ""];
   for (let next = index + 1; next < lines.length; next += 1) {
@@ -635,10 +631,6 @@ function expectAlignedSemanticTable(
   }
 }
 
-// A narrow table stays a grid: every row keeps a rendered header's borders,
-// and descriptions wider than their column continue on wrapped lines.
-// Replay output holds frames at more than one width, so a row is matched
-// against every rendered header rather than the nearest one above it.
 function expectAlignedWrappedSemanticTable(
   text: string,
   observation: SemanticObservation,
@@ -812,7 +804,6 @@ async function collectFullTranscriptPages(
     pages.push(pane);
     previous = pane;
   }
-  // Paging starts at the bottom and moves up, so reverse into document order.
   return pages.reverse().join("\n");
 }
 
@@ -1026,7 +1017,6 @@ test.skipIf(!tmuxAvailable())(
         active = await TmuxSession.create({
           cmd: `${FX_BIN} --resume-last`,
           cwd: realpathSync(workspace),
-          // A fixed zone, so entry headers show this zone's local time on every machine.
           env: { ...gatewayEnv(home, resumeGateway), TZ: "IST-5:30" },
           stderrPath,
           width: 100,
@@ -1276,8 +1266,6 @@ printf '${trailingMarker}   '
       expect(fullTail).toContain(splitMarker);
       expect(fullTail).toContain(trailingMarker);
       expect(fullTail).not.toContain("lines more (ctrl+o");
-      // Page up until the head region with the ANSI marker is visible; the
-      // page count varies with session and network record height at the top.
       let fullHead = await active.capturePane();
       for (let page = 0; page < 40 && !fullHead.includes(ansiMarker); page += 1) {
         await active.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -1616,7 +1604,6 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: realpathSync(workspace),
-        // A fixed zone, so entry headers show this zone's local time on every machine.
         env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath, TZ: "IST-5:30" },
         stderrPath,
         width: 100,
@@ -1640,10 +1627,6 @@ test.skipIf(!tmuxAvailable())(
       expect(expandedAtTail).toContain(tailMarker);
       expect(expandedAtTail).not.toContain("FULL_CTRL_O_LINE_0001");
 
-      // Page up to the head of the retained command output. Content around the
-      // first output line can straddle a page boundary depending on transcript
-      // height, so collect markers across pages instead of requiring them in
-      // one pane.
       let sawLineOne = false;
       let sawToolHeader = false;
       let sawCommandArgument = false;
@@ -1651,7 +1634,6 @@ test.skipIf(!tmuxAvailable())(
         const before = await active.capturePane();
         if (before.includes("FULL_CTRL_O_LINE_0001")) {
           sawLineOne = true;
-          // The head of a 100-line output never shares a viewport with its tail.
           expect(before).not.toContain(tailMarker);
         }
         if (/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} IST · Tool/.test(before)) sawToolHeader = true;
@@ -1941,16 +1923,12 @@ printf '${tailMarker}\\n'
       expect(partialFull).toContain(futureMarker);
       expect(partialFull).not.toContain(unstableMarker);
       expect(partialFull).not.toContain(tailMarker);
-      // The stable head of the overflowed output sits above the live tail;
-      // page phase varies with session and network record height at the top.
       for (let page = 0; page < 4 && !partialFull.includes(stableMarker); page += 1) {
         await active.sendHexBytes(["1b", "5b", "35", "7e"]);
         partialFull = await active.waitForText(stableMarker, timeout);
       }
       expect(partialFull).toContain(stableMarker);
 
-      // Page up to the scrolled-history region; the page count varies with
-      // session and network record height at the top.
       for (let page = 0; page < 20; page += 1) {
         const pane = await active.capturePane();
         if (pane.includes(historicalSentinel)) break;
@@ -3373,7 +3351,6 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: realpathSync(workspace),
-        // A fixed zone, so entry headers show this zone's local time on every machine.
         env: { ...gatewayEnv(home, gateway), TZ: "IST-5:30" },
         stderrPath,
         width: 100,
@@ -4293,10 +4270,6 @@ test.skipIf(!tmuxAvailable())(
       );
       expect(pageUpViewport).not.toEqual(tailViewport);
 
-      // Two more pages reach the earlier command's retained output, which the
-      // compact view never shows. Match any retained row rather than one
-      // offset: Ctrl-O wraps long command headings, so a page's landing row
-      // depends on their length.
       const retainedSetupRow = /CTRL_O_PRESSURE_SETUP_OUTPUT_0(?:[1-6]\d)/;
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -5747,7 +5720,6 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed).not.toMatch(/[*✓!✗⊘i] session: resumed:/);
 
       const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
-      // A v2 relaunch keeps its switch, so it reopens the same store.
       expect(argvLines).toEqual([
         installedFx,
         `${installedFx}${SESSIONS_V2 ? "\t--sessions-v2" : ""}\tresume\t${sessionId}\t--upgrade-relaunch`,
@@ -6081,7 +6053,6 @@ test.skipIf(!tmuxAvailable())(
     );
     writeFileSync(stderrPath, "");
 
-    // 400 lines x ~32 chars is about 12.8 KB, past the 4 KB inline budget.
     const spilledLines = Array.from(
       { length: 400 },
       (_, index) => `SPILLED_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
@@ -6120,8 +6091,6 @@ test.skipIf(!tmuxAvailable())(
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      // The log frame carries only the artifact reference; the snapshots live
-      // in the session result store.
       const sessionId = sessionIdFromHome(home);
       const sessionDir = join(home, ".fx", "sessions", sessionId);
       const eventsJsonl = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
@@ -6135,9 +6104,6 @@ test.skipIf(!tmuxAvailable())(
       expect(presentation.previous_content).toBeNull();
       expect(presentation.after_content).toBeNull();
       expect(presentation.content_handle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
-      // The elided middle of the file is nowhere in the result frame; only
-      // the bounded preview lines stay inline. (The write arguments in the
-      // tool_call frame legitimately carry the full content.)
       expect(JSON.stringify(toolResultFrame)).not.toContain("SPILLED_DIFF_LINE_200_");
       const storedArtifact = readFileSync(
         join(sessionDir, "tool-results", presentation.content_handle),
@@ -6146,8 +6112,6 @@ test.skipIf(!tmuxAvailable())(
       expect(storedArtifact).toContain("SPILLED_DIFF_LINE_200_");
       expect(storedArtifact).toContain("SPILLED_DIFF_LINE_400");
 
-      // Resume renders the compact row from the inline preview lines and the
-      // full diff reloads the spilled snapshots through the handle.
       const resumedGateway = startFakeGateway([]);
       try {
         active = await TmuxSession.create({
@@ -6243,8 +6207,6 @@ test.skipIf(!tmuxAvailable())(
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      // Delete the spilled artifact; resume must degrade to the inline
-      // preview instead of failing.
       const sessionId = sessionIdFromHome(home);
       const sessionDir = join(home, ".fx", "sessions", sessionId);
       const eventsJsonl = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
@@ -6272,8 +6234,6 @@ test.skipIf(!tmuxAvailable())(
         const resumed = await waitForScrollback(active, completion);
         expect(resumed).toContain("Wrote missing-diff.md +400");
 
-        // Full detail renders the inline preview lines; the spilled middle
-        // content is unavailable and nothing crashes.
         await active.sendKeys("C-o");
         await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
         await active.waitForText("MISSING_DIFF_LINE_001_", TIMEOUT);
@@ -6320,8 +6280,6 @@ test.skipIf(!tmuxAvailable())(
     );
     writeFileSync(stderrPath, "");
 
-    // A live session writes a 400-line file; the commit spills the snapshots
-    // into the result store.
     const spilledLines = Array.from(
       { length: 400 },
       (_, index) => `COMPACT_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
@@ -6357,8 +6315,6 @@ test.skipIf(!tmuxAvailable())(
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      // Rewrite the log into the actual schema-v2 legacy shape: inline
-      // snapshots, no handle, no artifact. Version 3 introduced the handle.
       const sessionId = sessionIdFromHome(home);
       const sessionDir = join(home, ".fx", "sessions", sessionId);
       const eventsPath = join(sessionDir, "events.jsonl");
@@ -6378,8 +6334,6 @@ test.skipIf(!tmuxAvailable())(
         (_, index) => `LEGACY_INLINE_PAYLOAD_${String(index).padStart(4, "0")}`,
       );
       const legacyBlob = `${legacyLines.join("\n")}\n`;
-      // A created file's legacy shape: no previous content, full after inline.
-      // (Identical previous/after would produce an empty diff in full detail.)
       presentation.previous_content = null;
       presentation.after_content = legacyBlob;
       delete presentation.content_handle;
@@ -6388,7 +6342,6 @@ test.skipIf(!tmuxAvailable())(
       const fatBytes = statSync(eventsPath).size;
       expect(fatBytes).toBeGreaterThan(256 * 1024);
 
-      // Resume compacts the log before the transcript hydrates.
       const tracePath = join(root, "resume.trace.log");
       const resumedGateway = startFakeGateway([]);
       try {
@@ -6414,8 +6367,6 @@ test.skipIf(!tmuxAvailable())(
         active = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-        // The log is compact again: snapshots moved to a fresh artifact, the
-        // frame carries a handle, and the freshness marker is recorded.
         const compactedBytes = statSync(eventsPath).size;
         expect(compactedBytes).toBeLessThan(fatBytes / 4);
         const compacted = readFileSync(eventsPath, "utf8");
@@ -6438,8 +6389,6 @@ test.skipIf(!tmuxAvailable())(
         expect(trace).toContain("event=session_log_compacted");
         expect(trace).toContain("event=session_log_compaction_verified");
 
-        // A second resume replays the compacted log and its rebuilt cache;
-        // the full detail reloads the snapshots through the new handle.
         const secondGateway = startFakeGateway([]);
         try {
           active = await TmuxSession.create({
@@ -6892,7 +6841,6 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(home);
     mkdirSync(workspace);
     const workspaceRoot = realpathSync(workspace);
-    // 12 saved sessions exercise a first page that is taller than the viewport.
     const savedMarkers = Array.from(
       { length: 12 },
       (_, index) => `SESSION_PICKER_ROW_${index}`,
@@ -7734,7 +7682,6 @@ test.skipIf(!tmuxAvailable())(
       const historyPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
       const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
-      // Success is silent; publication, not a transcript notice, gates resume.
       await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"context_checkpoint"'), "durable context checkpoint");
       await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
@@ -7742,9 +7689,6 @@ test.skipIf(!tmuxAvailable())(
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
       expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
       expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
-      // Plain turns have nothing to summarize, but the earlier message may set
-      // a rule, so the one model call files it; the checkpoint keeps the
-      // earlier message and reply word for word.
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.requests[3].body).toContain(JSON.stringify(`- M1: "${earlierRequest}"`).slice(1, -1));
       const saved: string = records.find((record) => record.event.context_checkpoint).event.context_checkpoint.summary;
@@ -8057,13 +8001,6 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
   const sessionDir = join(home, ".fx", "sessions", sessionId);
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
-  // The session was created in a workspace that no longer applies, then later
-  // lived in `workspace`: origin and current roots differ, which used to
-  // blank the replay root and withhold session labels and reclip metadata for
-  // every absolute-path command. Written in the modern durable format
-  // (schema-4 metadata plus events.jsonl frames); the legacy single-file
-  // format cannot express diverging roots because its loader never reads
-  // origin_workspace_root.
   const oldWorkspace = join(root, "old-workspace");
   const tail = "a".repeat(60);
   const command = `cd ${workspace}/alpha && printf '${tail}' && printf 'done'`;
@@ -8151,14 +8088,10 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
       stderrPath,
     });
     const scrollback = await waitForScrollback(active, "RECLIP_MOVED_REPLY");
-    // The replayed row abbreviates against the live workspace and reclips to
-    // the live width instead of keeping the frozen compact-bound marker.
     const row = scrollback.split("\n").find((line) => line.includes("Ran cd ./alpha"));
     expect(row).toBeDefined();
     expect(row!).toContain(tail);
     expect(row!).not.toContain("...");
-    // Session-action rows resolve the launch command through the live root
-    // instead of falling back to the raw session id.
     expect(scrollback).toContain("Observed cd ./alpha");
     expect(scrollback).not.toContain("Observed shell-1");
     await active.sendText("/quit");

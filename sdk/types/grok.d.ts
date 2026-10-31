@@ -1,4 +1,3 @@
-// `libfx/grok` (grok-sign-in.js): sign in with a Grok plan for a Grok agent.
 import type { FxProviderCredentials, FxFetch } from "./libfx.cjs";
 
 /** Options every network step accepts. */

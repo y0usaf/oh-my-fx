@@ -122,7 +122,6 @@ fn fetchCatalog(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchIn
     };
     defer alloc.free(body);
 
-    // Modalities only enrich the list; without them every model reads as text-only.
     const modalities_url = xai_grok_models.modalitiesUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -151,7 +150,6 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     if (!xai_grok.acceptsCredential(request.credential)) {
         return stream_provider.failResult(error.GrokSubscriptionCredentialRequired);
     }
-    // The model travels in a header too.
     try xai_grok.validateModel(request.model);
     const context: *Context = @ptrCast(@alignCast(raw.?));
     const transport = context.transport;

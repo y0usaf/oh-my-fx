@@ -1,6 +1,3 @@
-// TLC for the MCP host models in tests/tla/mcp_host/: the TLC that ../lib/tlc.ts
-// finds, one run per call in a fresh work folder, and the run's verdict. Nothing
-// here downloads anything or calls a model.
 import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";

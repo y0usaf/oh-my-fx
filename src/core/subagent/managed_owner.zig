@@ -279,7 +279,6 @@ pub const Owner = struct {
             error.Timeout, error.Canceled => {},
         };
         self.mutex.lockUncancelable(io_mod.getIo());
-        // A finished slot's observation must not follow the registry into a new turn.
         const unpublished = active.completion == .unpublished;
         var observation: WaitError!Observation = switch (active.completion) {
             .published => |completed| completed,
@@ -318,7 +317,6 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, candidate.child_id, child_id)) continue;
                 if (candidate.completion == .running) {
                     candidate.cancel.store(true, .seq_cst);
-                    // Stop approval waits without changing explicit cancellation to interruption.
                     if (candidate.worker) |worker| worker.requestShutdown();
                 }
                 candidate.waiters += 1;
@@ -523,8 +521,6 @@ test "child feedback allocation failure preserves ownership" {
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
     const outcome = runOne(slot);
-    // Startup must not inspect the old slot between saved and in-memory completion.
-    // Take owner before registry, matching cancellation and approval lock ordering.
     owner.mutex.lockUncancelable(io_mod.getIo());
     const completed = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
     slot.completion = if (completed) |value| .{ .published = value } else .unpublished;
@@ -1149,7 +1145,6 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     var fixture = CancellationJoinTest{ .owner = &owner, .slot = slot };
     owner.services = .{ .context = &fixture, .capture_fn = CancellationJoinTest.capture, .run_fn = CancellationJoinTest.run };
     slot.thread = try std.Thread.spawn(.{}, CancellationJoinTest.childMain, .{&fixture});
-    // Release every gate and stop the real worker even when an assertion fails.
     errdefer {
         fixture.start.set(io_mod.getIo());
         fixture.permission.set(io_mod.getIo());
@@ -1176,7 +1171,6 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
             fixture.finish.set(io_mod.getIo());
             if (route_pinned) route.release_fn(route.context);
         }
-        // The owner lock makes cancellation observation occur after its worker request.
         var cancelled = false;
         for (0..1000) |_| {
             owner.mutex.lockUncancelable(io_mod.getIo());
@@ -1191,7 +1185,6 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
         route_pinned = route.pin_fn(route.context);
         try std.testing.expect(route_pinned);
         fixture.permission.set(io_mod.getIo());
-        // Rescue blocked permission waits so regressions fail instead of hanging.
         rescued = if (CancellationJoinTest.wait(&fixture.returned)) |_| false else |_| blk: {
             fixture.rescue();
             try CancellationJoinTest.wait(&fixture.returned);
@@ -1209,7 +1202,6 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
         try std.testing.expectEqual(@as(usize, 0), fixture.commits);
         try std.testing.expect(!slot.shutdown.load(.seq_cst));
         fixture.finish.set(io_mod.getIo());
-        // Detach invalidates the approval, but cannot release the worker while pinned.
         for (0..1000) |_| {
             if (approvals.pendingRevision() >= 2) break;
             io_mod.sleep(std.time.ns_per_ms);

@@ -568,8 +568,6 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.ModelRequest,
 ) anyerror!agent_stream_provider_contract.Result {
-    // The provider runtime installs a process-long gateway connection pool as
-    // the provider context; nothing else uses this context today.
     const shared_pool: ?*http_pool.HttpPool = if (context) |ctx| @ptrCast(@alignCast(ctx)) else null;
     const credential_source = request.credential.credentialSource();
     if (credential_source == .configured) return agent_stream_provider_contract.failResult(error.ConfiguredCredentialCannotAuthorizeGateway);
@@ -996,8 +994,6 @@ fn fetchCliModelCatalog(
 
 pub fn resolveChatUrl(fallback: []const u8, override: ?[]const u8) []const u8 {
     const candidate = override orelse return fallback;
-    // The chat URL carries the bearer token and full request payload; only a
-    // loopback HTTP override is trusted for local testing.
     if (!gateway_client.isLoopbackHttpUrl(candidate)) return fallback;
     return candidate;
 }
@@ -2685,7 +2681,6 @@ test "model catalog GET sends fx user agent without attribution headers" {
 
     try std.testing.expectEqualStrings(gateway_client.user_agent, fixture.capturedHeaderValue("user-agent").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);
-    // Attribution headers stay on model generation requests only.
     try std.testing.expect(fixture.capturedHeaderValue("http-referer") == null);
     try std.testing.expect(fixture.capturedHeaderValue("x-title") == null);
     if (fixture.failure()) |err| return err;

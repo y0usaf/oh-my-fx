@@ -1,5 +1,3 @@
-// `libfx/durable-world` (durable/world.mjs): sessions kept in a World the app
-// supplies, such as Workflow's Postgres World.
 import type { Durability } from "./libfx.cjs";
 
 export type { Durability } from "./libfx.cjs";

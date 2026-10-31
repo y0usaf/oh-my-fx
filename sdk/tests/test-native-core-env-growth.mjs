@@ -1,11 +1,4 @@
 #!/usr/bin/env node
-// The native addon reads the environment from libc at each use. Node.js owns
-// the environment, and an app that adds variables after the first native
-// runtime started makes libc move its array and free the old one; an addon
-// that kept the old array would read freed memory on its next lookup, which
-// crashes the process on macOS.
-//
-//   node sdk/tests/test-native-core-env-growth.mjs [libfx.node]
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -19,8 +12,6 @@ const addon = resolve(process.argv[2] && process.argv[2] !== "child" ? process.a
 if (process.argv.includes("child")) {
   const names = Number(process.argv.at(-1));
   const { createFxEngine } = await import("../node.js");
-  // A variable written before the addon loads, as an app's dotenv does,
-  // leaves libc's array on the heap, where the next growth can free it.
   process.env.LIBFX_ENV_GROWTH_BEFORE = "1";
   const home = await mkdtemp(join(tmpdir(), "libfx-env-home-"));
   const workspaceRoot = await mkdtemp(join(tmpdir(), "libfx-env-workspace-"));
@@ -53,7 +44,6 @@ if (process.argv.includes("child")) {
   process.exit(0);
 }
 
-// Each run is a process of its own: a crash shows as its exit, not ours.
 for (const names of [0, 10, 200]) {
   for (let run = 0; run < 3; run += 1) {
     const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), addon, "child", String(names)], {

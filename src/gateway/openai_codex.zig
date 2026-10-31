@@ -87,8 +87,6 @@ pub fn buildRequest(
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
-    // Codex exposes Fast mode as its priority service tier for supported
-    // ChatGPT subscription models.
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
 
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
@@ -110,8 +108,6 @@ pub fn buildRequest(
         try std.json.Stringify.value(label, .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
-    // The ChatGPT Codex endpoint chooses the model's output limit and rejects
-    // the public Responses API max_output_tokens parameter.
     try writer.writeByte('}');
     return out.toOwnedSlice();
 }

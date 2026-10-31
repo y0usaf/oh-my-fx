@@ -5399,7 +5399,6 @@ test "processQueuedPrompt records permission preflight failures as failed tool c
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    // A preflight content failure is a tool failure, not a rejection.
     try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
@@ -5428,8 +5427,6 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    // The denied web_search stays rejected; the read_file preflight failure
-    // is a tool failure.
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
     try std.testing.expectEqualStrings("web_search", hooks.rejected_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
@@ -6177,8 +6174,6 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
 
         var config = fixture.config();
         config.max_provider_attempts = 2;
-        // Retryable failures recover autonomously now; park the turn with a
-        // lifecycle pause (the user's try-later) when the retry is scheduled.
         var pause_flag = std.atomic.Value(bool).init(false);
         deps.pause_on_auto_retry_status = true;
         deps.recovery_pause_flag = &pause_flag;
@@ -6614,8 +6609,6 @@ test "child target failures settle the batch before and after permission without
         try std.testing.expectEqualStrings("good-neighbor", probe.hooks.executed_call_ids.items[0]);
         try std.testing.expectEqual(@as(usize, if (case.after_permission) 2 else 1), probe.hooks.permission_names.items.len);
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
-        // Target-resolution failures arrive through the permission tool_failure
-        // channel and record as tool failures, not rejections.
         try std.testing.expectEqual(@as(usize, 1), probe.hooks.failed_names.items.len);
         try std.testing.expectEqual(@as(usize, 0), probe.hooks.rejected_names.items.len);
     }

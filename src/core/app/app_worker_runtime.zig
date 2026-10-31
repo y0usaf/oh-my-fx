@@ -220,8 +220,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         } else {
             try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = finished });
         }
-        // A later queued finish must follow the pacer-owned turn. Neither a
-        // begin nor a presentation event may invoke UI or admit another prompt.
         try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later prompt") } });
         try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("do not render") } });
         try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
@@ -242,7 +240,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         try std.testing.expect(app.pacer.deferred_turn == null);
         try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
         try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
-        // Close the actual writer before reload so only durable state can pass.
         app.session_persistence.writable.?.deinit(alloc);
         app.session_persistence.writable = null;
         var loaded = try store.loadReadOnly(alloc, "shutdown-finish");
@@ -777,9 +774,6 @@ pub fn Runtime(comptime App: type) type {
                 !awaiting_tool_terminal and
                 app.stream.active)
             {
-                // The worker can become idle before its final UI events reach
-                // this thread. Keep any open command block until the queued
-                // turn boundary finalizes it instead of discarding output.
                 app.stream = .{};
                 app.shell.render_requests.request(.footer);
             } else if (modal_active and !app.stream.active) {
@@ -787,8 +781,6 @@ pub fn Runtime(comptime App: type) type {
                 app.stream.turn_started_ms = io_mod.milliTimestamp();
                 app.shell.render_requests.request(.footer);
             }
-            // Waiting on an approval or question is not thinking: freeze the
-            // elapsed clock for the duration of the wait.
             activity_status.syncWaitingClock(&app.stream, modal_active, io_mod.milliTimestamp());
 
             if (comptime @hasField(App, "program_status")) {
@@ -911,7 +903,6 @@ pub fn Runtime(comptime App: type) type {
                 .turn_thinking => |thinking| return if (thinking.tone == .thinking) thinking.label else null,
                 .none, .tool_slot => {},
             }
-            // Existence guard only: pass no clock so the label skips the counter.
             if (!app.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
                 return activity_status.buildTurnLabel(buf, .{ .active = true }, 0);
             }
@@ -1157,9 +1148,6 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                         }
                     },
-                    // The serving provider already appears on the ctrl+o
-                    // network record; nothing interactive consumes the event
-                    // today. The batch drain frees the payload.
                     .provider_resolved => {},
                     .api_status_text => |text| {
                         resetStream(app, false);
@@ -1254,9 +1242,6 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.error_text(handlers.ctx, notice);
                     },
                     .restore_failed_prompt => |prompt| {
-                        // Never clobber a draft the user typed while the doomed
-                        // turn was still retrying; only an empty composer gets
-                        // the failed prompt back.
                         if (app.input_runtime.edit_state.input.items.len == 0) {
                             try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
                             app.shell.render_requests.request(.footer);
@@ -1384,7 +1369,6 @@ pub fn Runtime(comptime App: type) type {
             const changed = !std.meta.eql(app.stream.token_progress, update);
             app.stream.token_progress = update;
 
-            // An armed animation tick already repaints the label within 50ms.
             const animation_armed = app.shell.render_requests.animation_visible and
                 app.shell.render_requests.animation_next_deadline_ms != 0;
             if (changed and !animation_armed) app.shell.render_requests.request(.footer);
@@ -2092,8 +2076,6 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
     try tickNoop(&app);
     try expectProgramStatusReports(&app, "\x1b]7501;state=done:app=fx\x1b\\");
 
-    // Work that starts no turn and reports no result settles as idle instead
-    // of reporting the earlier result again.
     app.worker.processing = true;
     try tickNoop(&app);
     app.worker.processing = false;
@@ -2103,7 +2085,6 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
         "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=idle:app=fx\x1b\\",
     );
 
-    // A failed `/compact` reports an error although no turn ran.
     app.worker.processing = true;
     const compaction = app.worker.compaction.begin(.manual, null, 0);
     try tickNoop(&app);
@@ -2130,8 +2111,6 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
         "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=error:app=fx\x1b\\",
     );
 
-    // An approval prompt that opens outside a turn does not bring the
-    // reported error back once it closes.
     app.worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
     try tickNoop(&app);
     app.worker.pending_permission_request = null;
@@ -2992,7 +2971,6 @@ test "core.app_worker_runtime records admitted route recovery as a full-detail r
     try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
     try std.testing.expect(std.mem.find(u8, record.body, "attempt: 1/3") != null);
     try std.testing.expect(std.mem.find(u8, record.body, "retry delay: 4s") != null);
-    // The record stays out of the transcript entry store.
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
 }
 
@@ -3458,8 +3436,6 @@ test "core.app_worker_runtime syncState freezes the turn clock while an approval
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    // A turn is processing when an approval opens: the elapsed clock must
-    // freeze so approval wait time is not counted as thinking.
     app.worker.processing = true;
     app.worker.pending_permission_request = .{
         .id = 7,
@@ -3470,8 +3446,6 @@ test "core.app_worker_runtime syncState freezes the turn clock while an approval
     try std.testing.expect(app.stream.active);
     try std.testing.expect(app.stream.waiting_since_ms > 0);
 
-    // Approval resolved but the turn keeps processing: the freeze releases and
-    // the running clock resumes with no wait state left behind.
     app.worker.pending_permission_request = null;
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(!app.approval_prompt.isActive());

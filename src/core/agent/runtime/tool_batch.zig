@@ -75,8 +75,6 @@ pub fn appendToolResultContent(
     if (accounting.increment_error) batch.step_error_count += 1;
     if (accounting.mark_write) batch.step_had_writes = true;
     var content = model_output;
-    // Only well-formed calls escalate: malformed-argument rejections never
-    // execute and already have their own hard-stop path.
     if (tool_call.argument_integrity == .valid) {
         if (batch.identical_failure_escalation) |escalation| {
             const failure_count = try escalation.observe(arena, tool_call, accounting.increment_error);
@@ -194,11 +192,6 @@ pub fn assembleParallelToolResults(
             &prepared.memory,
             execution.tool_result_memory,
         );
-        // The parallel run's attempts are deinitialized when this scope exits,
-        // but history keeps prepared.memory. ArenaAllocator.free genuinely
-        // reclaims most-recent and dedicated-chunk allocations, so the
-        // attempt-owned slices must be transferred into the history arena
-        // before that deinit runs.
         prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
         try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
@@ -652,8 +645,6 @@ test "repeated identical failures escalate from the second failure on" {
     }
 
     try std.testing.expectEqual(@as(usize, 3), suffix.items.len);
-    // The first failure is delivered plain; the second and third carry the
-    // running count, and every delivery preserves the original failure text.
     try std.testing.expectEqualStrings(failure_output, suffix.items[0].content.?);
     try std.testing.expect(std.mem.find(u8, suffix.items[1].content.?, "already failed 2 times this turn") != null);
     try std.testing.expect(std.mem.find(u8, suffix.items[2].content.?, "already failed 3 times this turn") != null);

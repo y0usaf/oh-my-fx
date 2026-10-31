@@ -1,11 +1,3 @@
-// Connects runs of the real credential edge to TLC.
-//
-// 1. The run's events become AuthObserved.tla. AuthTrace replays them through
-//    ProviderAuth's own Next under the scenario's constants. ACCEPTED needs TLC
-//    exit 12 on the NotAllMatched sentinel; a completed search is REJECTED.
-// 2. After acceptance, each property is checked on the same replay.
-//
-// Unreadable, partial or anomalous evidence is never acceptance.
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { observedModule, type Run } from "./driver";

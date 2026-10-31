@@ -156,7 +156,6 @@ pub const Generation = struct {
     names: std.StringHashMapUnmanaged(void) = .empty,
     zdotdir: ?[]const u8 = null,
     fingerprint: Fingerprint = .{},
-    // Guarded by the owning Owner's mutex.
     leases: usize = 0,
     retired: bool = false,
     next_retired: ?*Generation = null,
@@ -530,7 +529,6 @@ pub const Owner = struct {
 
     fn startCaptureLocked(self: *Owner, shell_path: []const u8, cwd: []const u8) !void {
         if (self.capture_thread) |thread| {
-            // The previous capture already finished; only its thread remains.
             thread.join();
             self.capture_thread = null;
         }
@@ -545,8 +543,6 @@ pub const Owner = struct {
             .shell_path = owned_shell,
             .cwd = owned_cwd,
             .epoch = self.epoch,
-            // Taken before the shell reads the files, so an edit during the
-            // capture still marks the result dirty.
             .fingerprint = currentFingerprint(shell_path, null),
         };
         self.capture_thread = try std.Thread.spawn(.{}, runPendingCapture, .{pending});
@@ -563,7 +559,6 @@ pub const Owner = struct {
                 generation.epoch = pending.epoch;
                 generation.fingerprint = pending.fingerprint;
                 if (generation.zdotdir) |zdotdir| {
-                    // The startup files moved ZDOTDIR; watch its files too.
                     generation.fingerprint = withMovedZdotdir(
                         pending.fingerprint,
                         currentFingerprint(pending.shell_path, zdotdir),
@@ -756,8 +751,6 @@ fn captureWithShell(request: CaptureRequest) CaptureOutcome {
 }
 
 fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
-    // Targets without detached process sessions, such as WASI, cannot run
-    // the capture shell.
     if (comptime !command_runner.supports_foreground_session) return .{ .failed = .spawn_failed };
     const kind = shell_resolver.shellKind(request.shell_path) orelse
         return .{ .failed = .unsupported_shell };
@@ -772,9 +765,6 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     const invocation = try shell_resolver.capturedInvocation(scratch, .{ .user = request.shell_path }, script);
     const end_marker = try markerText(scratch, &nonce, "END", "\x00", "\x00");
 
-    // The capture runs an interactive login shell. Without its own session
-    // it would share fx's controlling terminal, stop on job control, and its
-    // startup files could write over the fx interface.
     var child = command_runner.spawnDetachedSession(
         scratch,
         invocation.argv(),
@@ -785,8 +775,6 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
         return .{ .failed = .spawn_failed };
     };
     const supervisor_pid: std.posix.pid_t = child.id orelse return .{ .failed = .spawn_failed };
-    // The supervisor, not fx, stops the shell and anything its startup files
-    // left running, then exits on its own.
     defer if (command_runner.finishDetachedSession(&child)) |term| {
         traceSupervisorExit(supervisor_pid, term);
     } else |err| {
@@ -871,7 +859,6 @@ fn readPayload(
                 });
             }
             stderr_bytes += drained;
-            // Stop watching stderr once it closes.
             if (drained == 0) fds[1].fd = -1;
         }
         if (fds[0].revents == 0) continue;
@@ -1041,7 +1028,6 @@ test "snapshot owner keeps a leased generation alive across a refresh" {
     try testing.expectEqual(@as(u32, 2), FakeCapture.calls.load(.seq_cst));
     try testing.expect(first.generation != second.generation);
     try testing.expect(first.generation.retired);
-    // The retired generation is still readable while its lease is held.
     try testing.expectEqualStrings("alias ll='ls -l'\n", first.generation.replay);
     try testing.expectEqual(epoch_before + 1, second.generation.epoch);
     first.release();
@@ -1054,7 +1040,6 @@ test "snapshot owner resets remembered shell grants on refresh" {
     var owner: Owner = .{ .capture_fn = FakeCapture.capture };
     defer owner.deinit();
 
-    // Grants fx never recorded count as made before the first refresh.
     try testing.expect(owner.shellGrantCurrent("npm test"));
     owner.recordShellGrant("npm test");
     try testing.expectEqual(@as(u64, 0), owner.shellGrantEpoch("npm test"));
@@ -1167,7 +1152,6 @@ test "snapshot fingerprint stamps every startup directory zsh can read" {
 
     const before = fingerprintFor(.zsh, &dirs);
     try testing.expectEqual(zsh_system_files.len + max_user_dirs * zsh_user_files.len, before.len);
-    // The last directory's files are watched like the first's.
     try writeTestFile(tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
     try testing.expect(!before.eql(&fingerprintFor(.zsh, &dirs)));
 }
@@ -1184,13 +1168,11 @@ test "a moved ZDOTDIR keeps the stamps taken before the capture" {
     const now = [_]?[]const u8{ null, home, moved };
 
     const before_capture = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
-    // An edit while the capture runs, then the capture reports the move.
     try writeTestFile(tmp.dir, "home/.zshrc", "export ZDOTDIR=moved\n");
     const merged = withMovedZdotdir(before_capture, fingerprintFor(.zsh, &now));
     try testing.expectEqual(before_capture.len + zsh_user_files.len, merged.len);
     try testing.expect(!merged.eql(&fingerprintFor(.zsh, &now)));
 
-    // Without an edit during the capture, the merged stamps match.
     const after_edit = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
     const clean = withMovedZdotdir(after_edit, fingerprintFor(.zsh, &now));
     try testing.expect(clean.eql(&fingerprintFor(.zsh, &now)));
@@ -1223,7 +1205,6 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     const generation = switch (outcome) {
         .ready => |value| value,
         .failed => |reason| {
-            // Names the failure in the test output without a direct write.
             try testing.expectEqualStrings("ready", @tagName(reason));
             unreachable;
         },

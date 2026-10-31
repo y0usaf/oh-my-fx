@@ -71,9 +71,6 @@ const max_values = 16;
 pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpoint.Entry, sources: Sources, counts: *Counts) Allocator.Error!ledger.Written {
     var users: std.ArrayList([]const u8) = .empty;
     for (sources.users) |user| try users.append(arena, try normalized(arena, user));
-    // A value found anywhere in this compaction, or in what stays after it,
-    // is taken as true, even when the note names another turn or tool call
-    // for it.
     var everything: std.ArrayList([]const u8) = .empty;
     for (sources.turns) |record| try everything.append(arena, record.text);
     for (sources.tools) |record| try everything.append(arena, record.text);
@@ -82,7 +79,6 @@ pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpo
     const all = everything.items;
     var result = written;
 
-    // Notes are about this compaction's own turns and tool calls.
     const works = try arena.alloc(ledger.Note, written.works.len);
     for (works, written.works) |*slot, note| {
         var problems: Problems = .{};
@@ -97,8 +93,6 @@ pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpo
         var problems: Problems = .{};
         try checkCitations(arena, &problems, note.text, sources, counts);
         try checkValues(arena, &problems, note.text, all, counts);
-        // A note shared by a run of calls starts with the run, like `T3–T8:`,
-        // and may speak of calls that worked and calls that failed.
         const cited = try citations(arena, note.text);
         const shared = cited.len > 0 and cited[0].first == note.number and cited[0].last > note.number;
         if (!shared) try checkFailedCall(arena, &problems, note.text, note.number, sources.tools, counts);
@@ -110,21 +104,16 @@ pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpo
     for (entries, written.entries, 0..) |*slot, entry, index| {
         var problems: Problems = .{};
         const cited = try citations(arena, entry.text);
-        // Every entry says where it comes from, as the request asks. The
-        // turn in progress has no ID yet.
         const sourced = cited.len > 0 or std.ascii.findIgnoreCase(entry.text, "turn in progress") != null;
         if (!sourced) {
             counts.no_source += 1;
             try problems.add(arena, "no source", .{});
         }
         try checkCitations(arena, &problems, entry.text, sources, counts);
-        // An entry about one tool call states its result, like a note on it.
         if (entry.id[0] != 'R') if (onlyTool(cited)) |number| try checkFailedCall(arena, &problems, entry.text, number, sources.tools, counts);
         if (entry.id[0] == 'R') {
             try checkQuote(arena, &problems, entry.text, users.items, counts);
         } else if (namesThisCompaction(cited, sources)) {
-            // An entry only about earlier compactions' turns cannot be
-            // checked against this one's.
             try checkValues(arena, &problems, entry.text, all, counts);
         }
         for (try checkpoint.replacedIds(arena, entry.text)) |id| {
@@ -169,7 +158,6 @@ fn citations(arena: Allocator, text: []const u8) Allocator.Error![]const Citatio
     var out: std.ArrayList(Citation) = .empty;
     var at: usize = 0;
     while (at < text.len) : (at += 1) {
-        // Without saved records a turn is named like `turn 3`.
         const turn_word = "turn ";
         if ((at == 0 or !isWordByte(text[at - 1])) and std.ascii.startsWithIgnoreCase(text[at..], turn_word)) {
             var end = at + turn_word.len;
@@ -185,7 +173,6 @@ fn citations(arena: Allocator, text: []const u8) Allocator.Error![]const Citatio
         const first = readNumber(text, &end) orelse continue;
         if (end < text.len and isWordByte(text[end])) continue;
         var last = first;
-        // A run: `T3–T8`, `T3-T8` or `T3 to T8`.
         for ([_][]const u8{ "\u{2013}", "-", " to " }) |dash| {
             if (!std.mem.startsWith(u8, text[end..], dash)) continue;
             var range_end = end + dash.len;
@@ -257,8 +244,6 @@ fn checkValues(arena: Allocator, problems: *Problems, text: []const u8, all: []c
     var missing: std.ArrayList(u8) = .empty;
     for (try values(arena, text)) |value| {
         if (try foundIn(arena, value, all)) continue;
-        // Code in backticks is often written with other spacing or
-        // punctuation; it counts when every name in it is found.
         const code = std.mem.find(u8, text, try std.mem.concat(arena, u8, &.{ "`", value, "`" })) != null;
         if (code and namesFound(value, all)) continue;
         counts.unfound_values += 1;
@@ -341,9 +326,6 @@ fn exactLooking(word: []const u8) bool {
     }
     if (longest_run >= 3 or dotted_digits) return true;
     if (word[0] == '/' or word[0] == '~' or std.mem.startsWith(u8, word, "./") or std.mem.find(u8, word, "://") != null) return true;
-    // A file name, maybe with folders and a line number: a name, a dot, and
-    // an extension of two to six letters or digits. A list like
-    // `search/edit/read` is not a path.
     const name = fileName(word);
     const dot = std.mem.findScalarLast(u8, name, '.') orelse return false;
     const extension = name[dot + 1 ..];
@@ -571,7 +553,6 @@ test "entries that name their source and state what it holds pass unmarked" {
         .{ .id = "F3", .text = "F3 (M4): resumeForWrite lives in src/core/app.zig" },
         .{ .id = "R1", .text = "R1 (M4): \"never push to main\"" },
         .{ .id = "R2", .text = "R2 (turn in progress): \"keep the fix small\"" },
-        // Without saved records a turn is cited by its number.
         .{ .id = "R3", .text = "R3 (turn 4): \"never push to main\"" },
         .{ .id = "S1", .text = "S1 (T7): 141 tests run, 2 fail; replaces S0" },
     };
@@ -593,7 +574,6 @@ test "what an entry gets wrong is marked, and the entry stays" {
         .{ .id = "D1", .text = "D1 (M4): keep the fix small; replaces D7" },
         .{ .id = "R1", .text = "R1 (M4): \"never force push\"" },
         .{ .id = "R2", .text = "R2 (M4): keep it small" },
-        // Numbers with more around them and case count as found.
         .{ .id = "F4", .text = "F4 (T9): LIBFX went to 0.0.10-dev after ~707AFAC508E1" },
         .{ .id = "F5", .text = "F5 (turn 9): 141 tests" },
     };
@@ -625,7 +605,6 @@ test "every entry names its source, and one about a failed call does not call it
         .{ .id = "O1", .text = "O1: which branch ships it?" },
         .{ .id = "F1", .text = "F1 (T7): the tests passed" },
         .{ .id = "S2", .text = "S2 (M4, T7): the suite is green" },
-        // Several calls, or a run of them, may have failed and then worked.
         .{ .id = "S3", .text = "S3 (T7, T8): the suite passes after the fix" },
         .{ .id = "S4", .text = "S4 (T7\u{2013}T9): tests pass" },
     };
@@ -657,8 +636,6 @@ test "an entry may replace one written before it in the same reply" {
     try testing.expectEqualStrings(entries[1].text, result.entries[1].text);
     try testing.expect(std.mem.endsWith(u8, result.entries[2].text, "[check: replaces S4, which does not exist]"));
 
-    // S4 may be saved only in the ledger of a folded compaction, which the
-    // highest numbers so far count.
     var folded = test_sources;
     folded.highest = .{ 0, 0, 0, 4, 0 };
     const again = try check(arena, .{ .entries = entries[2..] }, &.{}, folded, &counts);
@@ -681,7 +658,6 @@ test "tool notes are checked against their call, and a failed call is not a succ
     try testing.expectEqualStrings("found libfx 0.0.11 [check: not in the saved turns or tool calls: 0.0.11]", result.tools[2].text);
     try testing.expectEqual(@as(usize, 1), counts.failed_as_success);
 
-    // A note on a failed call that says it failed passes.
     const honest = [_]ledger.Note{.{ .number = 7, .text = "ran the tests; they did not pass" }};
     var honest_counts: Counts = .{};
     const kept = try checked(arena, .{ .tools = &honest }, &.{}, &honest_counts);
@@ -705,8 +681,6 @@ test "a value named under the wrong call passes; one found nowhere is marked" {
     const arena = arena_state.allocator();
     const notes = [_]ledger.Note{
         .{ .number = 4, .text = "Read core/app.zig:12 (T9) and bumped libfx to 0.0.10; edited lib/other.ts" },
-        // A path counts by its last two parts, code by its names; a quote
-        // must be exact.
         .{ .number = 4, .text = "Read /repo/src/core/app.zig:40 and `resumeForWrite(void)`; the user wants \"exact CLI parity\"" },
     };
     var counts: Counts = .{};
@@ -714,7 +688,6 @@ test "a value named under the wrong call passes; one found nowhere is marked" {
     try testing.expectEqualStrings(notes[0].text ++ " [check: not in the saved turns or tool calls: lib/other.ts]", result.works[0].text);
     try testing.expectEqualStrings(notes[1].text ++ " [check: not in the saved turns or tool calls: exact CLI parity]", result.works[1].text);
 
-    // An entry only about earlier compactions is not checked against this one.
     const entries = [_]checkpoint.Entry{.{ .id = "F9", .text = "F9 (T2): lib/other.ts holds the cache" }};
     const earlier_only = try checked(arena, .{ .entries = &entries }, &.{}, &counts);
     try testing.expectEqualStrings(entries[0].text, earlier_only.entries[0].text);
@@ -729,7 +702,6 @@ test "values are the words whose exact form matters" {
     try testing.expectEqual(expected.len, found.len);
     for (expected, found) |want, got| try testing.expectEqualStrings(want, got);
     try testing.expectEqual(@as(usize, 0), (try values(arena, "F12 T3\u{2013}T9 M40 R2 search/edit/read (T47,T60,T109) (M9/T254):")).len);
-    // A path with an ID-like part is still a path.
     try testing.expectEqual(@as(usize, 1), (try values(arena, "see T3/main.zig")).len);
 }
 
@@ -756,7 +728,6 @@ test "punctuation inside closing quote marks is not part of the quoted words" {
         try testing.expectEqual(@as(usize, 1), found.len);
         try testing.expect(try foundIn(arena, found[0], &texts));
     }
-    // Quote marks around a paraphrase still claim exact words.
     const paraphrase = try values(arena, "the \u{201c}build immediately\u{201d} instruction");
     try testing.expect(!try foundIn(arena, paraphrase[0], &texts));
 }

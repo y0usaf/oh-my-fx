@@ -1,7 +1,3 @@
-// In-memory ring buffer of recent tool invocations. Used by /trace so
-// the report shows which tools the model invoked, with bounded args/results
-// for normal tools, without forcing a persistent trace log. web_fetch is
-// compact-only because its prompt and fetched content are sensitive.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -100,9 +96,6 @@ pub fn omitsPayloadsForName(tool_name: []const u8) bool {
 }
 
 var mutex: std.Io.Mutex = .init;
-// All-zero so the ring lands in .bss instead of ~200KB of initialized data
-// in the binary. At-rest slots are never observed: snapshot() is bounded by
-// `stored` and record() overwrites whole slots.
 var ring: [ring_capacity]ToolCallMetric = std.mem.zeroes([ring_capacity]ToolCallMetric);
 var head: usize = 0;
 var stored: usize = 0;

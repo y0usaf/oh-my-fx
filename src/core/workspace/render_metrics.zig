@@ -54,7 +54,6 @@ const Ring = struct {
 };
 
 var mutex: std.Io.Mutex = .init;
-// Zero-initialized storage stays in .bss; unused slots are never read.
 var ring: Ring = std.mem.zeroes(Ring);
 
 pub fn record(kind: Kind, comptime fmt: []const u8, args: anytype) void {

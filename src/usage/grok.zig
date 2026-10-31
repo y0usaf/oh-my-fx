@@ -156,7 +156,6 @@ pub fn parseBilling(gpa: Allocator, body: []const u8) ParseError!Owned {
         else => return error.InvalidResponse,
     };
 
-    // The older shape: a monthly allowance and what was used of it.
     if (usage.used_percent == null) {
         const limit = try cents(config.get("monthlyLimit"));
         const used = try cents(config.get("used"));
@@ -169,7 +168,6 @@ pub fn parseBilling(gpa: Allocator, body: []const u8) ParseError!Owned {
     if (usage.resets_at_ms == null) if (config.get("billingPeriodEnd")) |end| if (end == .string) {
         usage.resets_at_ms = timeOf(end.string);
     };
-    // proto3 leaves out a zero, so a period without a percentage is unused.
     if (usage.used_percent == null and usage.period != null) usage.used_percent = 0;
 
     if (config.get("productUsage")) |value| switch (value) {
@@ -182,7 +180,6 @@ pub fn parseBilling(gpa: Allocator, body: []const u8) ParseError!Owned {
                 const product = item.object.get("product") orelse continue;
                 if (product != .string) return error.InvalidResponse;
                 const name = try productName(alloc, product.string) orelse continue;
-                // proto3 leaves out a zero.
                 const used = try percent(item.object.get("usagePercent")) orelse 0;
                 try products.append(alloc, .{ .name = name, .used_percent = used });
             }
@@ -326,13 +323,9 @@ fn digits(s: []const u8) ?i64 {
     return std.fmt.parseInt(i64, s, 10) catch null;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 
 test "the credits shape gives the period's use, its reset, products and money" {
-    // The Grok CLI's own fixture for `GetGrokCreditsConfig`.
     const body =
         \\{"config":{"creditUsagePercent":42.5,
         \\"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-06-01T00:00:00Z","end":"2026-06-08T00:00:00Z"},
@@ -346,12 +339,10 @@ test "the credits shape gives the period's use, its reset, products and money" {
     const u = owned.usage;
     try testing.expectEqual(@as(?f64, 42.5), u.used_percent);
     try testing.expectEqual(@as(?PeriodKind, .weekly), u.period);
-    // 2026-06-08 is day 20612.
     try testing.expectEqual(@as(?i64, 20612 * std.time.ms_per_day), u.resets_at_ms);
     try testing.expectEqual(@as(usize, 2), u.products.len);
     try testing.expectEqualStrings("grok build", u.products[0].name);
     try testing.expectEqual(@as(f64, 61.2), u.products[0].used_percent);
-    // A product without a percentage used none of the period.
     try testing.expectEqualStrings("chat", u.products[1].name);
     try testing.expectEqual(@as(f64, 0), u.products[1].used_percent);
     try testing.expectEqual(@as(?i64, 1250), u.prepaid_cents);
@@ -389,7 +380,6 @@ test "no billing data, proto3 zeros and string amounts parse" {
     try testing.expectEqual(@as(?i64, 4299), zeros.usage.on_demand_cap_cents);
     try testing.expectEqual(@as(?f64, null), zeros.usage.used_percent);
 
-    // Bought credits arrive negative; an unused period leaves out its 0%.
     var unused = try parseBilling(testing.allocator, "{\"config\":{\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"end\":\"2026-10-14T05:50:16.561Z\"},\"prepaidBalance\":{\"val\":-500},\"onDemandUsed\":{},\"onDemandCap\":{}}}");
     defer unused.deinit();
     try testing.expectEqual(@as(?f64, 0), unused.usage.used_percent);

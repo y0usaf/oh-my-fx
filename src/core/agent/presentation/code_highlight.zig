@@ -16,8 +16,6 @@ const light_palette: Palette = shared_theme.fx_light.syntax;
 
 fn paletteForTheme(theme: Theme) Palette {
     const active = shared_theme.current();
-    // When the requested variant matches the active theme, custom themes
-    // contribute their syntax palette; otherwise render the builtin variant.
     if (active.light == (theme == .light)) return active.syntax;
     return switch (theme) {
         .dark => dark_palette,
@@ -39,16 +37,12 @@ pub fn highlight(
     errdefer styled.deinit(alloc);
     const palette = paletteForTheme(theme);
     if (base) |base_style| try styled.appendSlice(alloc, base_style);
-    // A theme can disable syntax highlighting entirely; the span then keeps
-    // only the caller's base, byte-identical to a token-free source.
     if (!palette.enabled) {
         try styled.appendSlice(alloc, source);
         return styled.toOwnedSlice(alloc);
     }
 
     var index: usize = 0;
-    // Command-position state, used only by command_words profiles (shell):
-    // the next word is a command name unless a token says otherwise.
     var command_position = profile.command_words;
     while (index < source.len) {
         const byte = source[index];
@@ -83,8 +77,6 @@ pub fn highlight(
         }
         if (isNumberStart(source, index)) {
             const end = numberEnd(source, index);
-            // Shell: bare number arguments stay plain (a run id is not a
-            // literal); only file descriptors glued to a redirect color.
             if (profile.bare_numbers or fdContext(source, index, end)) {
                 try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
             } else {
@@ -95,7 +87,6 @@ pub fn highlight(
             continue;
         }
         if (profile.dollar_vars and byte == '$') {
-            // Command substitution reopens command position for its contents.
             if (index + 1 < source.len and source[index + 1] == '(') {
                 try appendStyled(alloc, &styled, palette.operator_style, "$(", base);
                 command_position = true;
@@ -127,14 +118,12 @@ pub fn highlight(
             const end = operatorRunEnd(source, index, profile.operators);
             const run = source[index..end];
             try appendStyled(alloc, &styled, palette.operator_style, run, base);
-            // Redirect targets are paths, not commands; `2>&1`-style runs too.
             command_position = std.mem.findScalar(u8, run, '<') == null and
                 std.mem.findScalar(u8, run, '>') == null;
             index = end;
             continue;
         }
         if (profile.command_words and byte == '`') {
-            // Backticks parse as code; their contents reopen command position.
             try styled.append(alloc, byte);
             command_position = true;
             index += 1;
@@ -143,14 +132,10 @@ pub fn highlight(
         if (isIdentifierStart(byte)) {
             const end = identifierEnd(source, index);
             const token = source[index..end];
-            // A word glued to a path separator is a path segment, not syntax:
-            // /dev/null keeps "null" plain.
             const after_separator = index > 0 and source[index - 1] == '/';
             var styled_word = false;
             if (profile.command_words) {
                 if (command_position and !after_separator) {
-                    // Control keywords read as keywords; other command words
-                    // as functions, matching the grammar's scopes.
                     const style = if (inList(token, &command_prefixes, .sensitive))
                         palette.keyword_style
                     else
@@ -169,8 +154,6 @@ pub fn highlight(
                 }
             }
             if (!styled_word) try styled.appendSlice(alloc, token);
-            // Control keywords are followed by the command they govern; an
-            // ordinary command word is followed by its arguments.
             if (profile.command_words) {
                 command_position = styled_word and command_position and
                     inList(token, &command_prefixes, .sensitive);
@@ -213,7 +196,6 @@ fn tildeStart(source: []const u8, index: usize, operators: []const u8) bool {
 /// take the keyword color while the rest keeps the string color.
 fn appendDoubleQuoted(alloc: Allocator, out: *std.ArrayList(u8), palette: Palette, text: []const u8, base: ?[]const u8) !void {
     const inner_end = text.len - 1;
-    // The opening quote rides the first text chunk so the pair stays one span.
     var chunk_start: usize = 0;
     var i: usize = 1;
     while (i < inner_end) {
@@ -241,8 +223,6 @@ fn appendDoubleQuoted(alloc: Allocator, out: *std.ArrayList(u8), palette: Palett
 fn appendStyled(alloc: Allocator, out: *std.ArrayList(u8), style: []const u8, text: []const u8, base: ?[]const u8) !void {
     try out.appendSlice(alloc, style);
     try out.appendSlice(alloc, text);
-    // Close whatever the slot opened: fg-only slots keep the plain reset,
-    // themed slots carrying bold/italic get those reset too.
     try out.appendSlice(alloc, shared_theme.closingFor(style));
     if (base) |base_style| try out.appendSlice(alloc, base_style);
 }
@@ -338,8 +318,6 @@ fn isNumberStart(source: []const u8, index: usize) bool {
     if (index == 0) return true;
     const prev = source[index - 1];
     if (isIdentifierContinue(prev)) return false;
-    // A digit run glued to a word by a dash is a name segment, not a number:
-    // paths like build-20260918 stay plain while flags like -80 still color.
     if (prev == '-' and index >= 2 and isIdentifierContinue(source[index - 2])) return false;
     return true;
 }
@@ -586,10 +564,8 @@ test "themed attribute slots close fully without bleeding into later text" {
     const styled = try highlight(alloc, "const x = 1; // note\n", languages.resolve("zig").?, .dark, null);
     defer alloc.free(styled);
 
-    // Italic comment and bold keyword each close with their attributes reset.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[3;38;2;106;153;85m// note\x1b[39m\x1b[23m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[1;38;2;130;210;206mconst\x1b[39m\x1b[22m") != null);
-    // Nothing stays bold or italic past the final close.
     try std.testing.expect(!std.mem.endsWith(u8, styled, "\x1b[3;38;2;106;153;85m"));
 }
 
@@ -598,10 +574,8 @@ test "base style wraps the span and restores after each token" {
     const styled = try highlight(alloc, "echo 'hi there' 42", languages.resolve("sh").?, .dark, "<base>");
     defer alloc.free(styled);
 
-    // The span opens with the base, and every token close re-establishes it.
     try std.testing.expect(std.mem.startsWith(u8, styled, "<base>\x1b[38;5;252mecho\x1b[39m<base> "));
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m'hi there'\x1b[39m<base>") != null);
-    // Bare number arguments stay plain in shell.
     try std.testing.expect(std.mem.endsWith(u8, styled, "<base> 42"));
 }
 
@@ -634,8 +608,6 @@ test "shell operators and variables take the keyword color" {
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m;\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$HOME\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$?\x1b[39m") != null);
-    // Comments keep their color, flags take the number color as a unit, and
-    // a $ inside quotes stays string.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;245m# done\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-2\x1b[39m") != null);
 
@@ -643,7 +615,6 @@ test "shell operators and variables take the keyword color" {
     defer alloc.free(quoted);
     try std.testing.expect(std.mem.find(u8, quoted, "\x1b[38;5;250m'$HOME'\x1b[39m") != null);
 
-    // Other languages do not pick up shell operators.
     const zig_src = try highlight(alloc, "a < b", languages.resolve("zig").?, .dark, null);
     defer alloc.free(zig_src);
     try std.testing.expectEqualStrings("a < b", zig_src);
@@ -654,11 +625,8 @@ test "digit runs glued to words by a dash stay plain" {
     const styled = try highlight(alloc, "cd build-20260918 && head -80 2>/dev/null", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    // The date suffix in the path is a name segment and keeps the plain text,
-    // as does the literal-looking "null" in /dev/null.
     try std.testing.expect(std.mem.find(u8, styled, "build-20260918") != null);
     try std.testing.expect(std.mem.find(u8, styled, "/dev/null") != null);
-    // The numeric flag colors as a unit, and the redirect fd still colors.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-80\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
 }
@@ -670,16 +638,12 @@ test "dash flags color as units only at word boundaries" {
 
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-8\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m--json\x1b[39m") != null);
-    // A lone dash (stdin marker) stays plain between the verb and the
-    // redirect, and the redirect target is an argument, not a keyword.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mcat\x1b[39m - \x1b[38;5;252m<\x1b[39m in") != null);
 
-    // Flags after operators still count as boundaries.
     const after_pipe = try highlight(alloc, "echo x | head -1", languages.resolve("sh").?, .dark, null);
     defer alloc.free(after_pipe);
     try std.testing.expect(std.mem.find(u8, after_pipe, "\x1b[38;5;250m-1\x1b[39m") != null);
 
-    // Other languages keep minus signs plain.
     const zig_src = try highlight(alloc, "a - b", languages.resolve("zig").?, .dark, null);
     defer alloc.free(zig_src);
     try std.testing.expectEqualStrings("a - b", zig_src);
@@ -690,15 +654,10 @@ test "command position colors any command word and only command words" {
     const styled = try highlight(alloc, "gh run list | xargs echo > out.txt", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    // Unknown binaries color in command position, matching the bash grammar's
-    // variable.function; a builtin used as an argument stays plain, and the
-    // redirect target is a path, not a command.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mgh\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mxargs\x1b[39m") != null);
-    // echo is an argument here and stays plain; the redirect target too.
     try std.testing.expect(std.mem.find(u8, styled, " echo \x1b[38;5;252m>\x1b[39m out.txt") != null);
 
-    // Control keywords hand command position to the command they govern.
     const chain = try highlight(alloc, "if cd /x; then echo hi; fi", languages.resolve("sh").?, .dark, null);
     defer alloc.free(chain);
     for ([_][]const u8{ "if", "cd", "then", "echo", "fi" }) |word| {
@@ -728,10 +687,8 @@ test "braced variables tildes globs and substitution parse like the grammar" {
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m*\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m~\x1b[39m/out") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$(\x1b[39m") != null);
-    // The substitution contents open in command position.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mdate\x1b[39m") != null);
 
-    // Backtick contents parse as code rather than one flat string.
     const ticks = try highlight(alloc, "echo `uname -s`", languages.resolve("sh").?, .dark, null);
     defer alloc.free(ticks);
     try std.testing.expect(std.mem.find(u8, ticks, "`\x1b[38;5;252muname\x1b[39m") != null);
@@ -746,7 +703,6 @@ test "double quotes interpolate variables inside the string color" {
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m\"hi \x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$USER\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m${HOME}\x1b[39m") != null);
-    // Single quotes do not interpolate.
     const single = try highlight(alloc, "echo '$USER'", languages.resolve("sh").?, .dark, null);
     defer alloc.free(single);
     try std.testing.expect(std.mem.find(u8, single, "\x1b[38;5;250m'$USER'\x1b[39m") != null);
@@ -801,8 +757,6 @@ test "split slots let themes color commands variables and operators apart" {
     const styled = try highlight(alloc, "while true; do echo $HOME | head -2; done", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    // Control keywords keep the keyword color; command words take the
-    // function color; variables and operators take their own.
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;204mwhile\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;201mtrue\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;201mecho\x1b[39m") != null);

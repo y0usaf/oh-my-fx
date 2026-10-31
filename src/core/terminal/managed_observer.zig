@@ -255,8 +255,6 @@ pub fn syncOwned(ctx: Context, requested_session_id: []const u8) !SyncOutcome {
         {
             continue;
         }
-        // This process starts and indexes its own terminals, so an unknown
-        // lost terminal belonged to an fx process instance that has exited.
         if (facts.lifecycle == .lost) {
             if (std.mem.eql(u8, facts.session_id, requested_session_id)) {
                 outcome = .ended_with_owner;

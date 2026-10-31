@@ -1,14 +1,4 @@
 #!/bin/sh
-# Run TLC once on a spec and a config, for the Bun drivers and Python checkers
-# under tests/tla/.
-#
-# Usage: run-tlc.sh <Module.tla> <Config.cfg> [extra TLC arguments...]
-#
-# Every .tla file in the spec's folder and the config are copied into a fresh
-# work folder, so TLC never writes next to the models. Set KEEP_TLC_WORK=1 to
-# keep that folder. Exits with TLC's own code (0 pass, 12 safety violation,
-# 13 liveness violation), or 2 for a toolchain problem. TLC and Java come from
-# the same places as in tlc.sh.
 set -eu
 
 if [ "$#" -lt 2 ]; then

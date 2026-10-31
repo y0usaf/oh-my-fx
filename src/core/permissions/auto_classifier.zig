@@ -486,8 +486,6 @@ pub const Reviewer = struct {
         } else return .{ .invalid = .invalid_context };
         var target_pending_assistant = review_turn.pending_assistant;
         target_pending_assistant.tool_calls = review_turn.pending_assistant.tool_calls[target_call_index .. target_call_index + 1];
-        // Forward only the exact pending call. Assistant prose and native
-        // attachments are untrusted and do not identify the action.
         target_pending_assistant.images = &.{};
         target_pending_assistant.content = null;
         target_pending_assistant.provider_replay = null;
@@ -561,8 +559,6 @@ pub const Reviewer = struct {
             switch (transport_outcome) {
                 .cancelled => return error.Cancelled,
                 .timed_out, .transient_failure => {
-                    // One retry with a fresh deadline; permanent failures and
-                    // cancellation are never retried.
                     const reason: InvalidReason = if (transport_outcome == .timed_out)
                         .transport_timed_out
                     else

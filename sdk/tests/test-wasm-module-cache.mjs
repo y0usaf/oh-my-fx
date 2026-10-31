@@ -131,7 +131,6 @@ try {
 
   await Promise.all(agents.map((agent) => agent.close()));
   assert.ok(signals.every(({ signal }) => signal instanceof AbortSignal));
-  // Completed catalog reads have already released their abort ownership.
   assert.ok(signals.filter(({ method }) => method !== "GET").every(({ signal }) => signal.aborted));
   const collect = globalThis.gc ?? (() => globalThis.Bun?.gc(true));
   const deadline = Date.now() + 5000;

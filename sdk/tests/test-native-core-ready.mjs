@@ -76,7 +76,6 @@ try {
   assert.equal(initialized[0].id, 1);
   assert.ok(initialized[0].result);
 
-  // Burst writes coalesce, and the next burst races against the previous drain.
   for (let batch = 0; batch < 20; batch++) {
     const ids = Array.from({ length: 50 }, (_, index) => 2 + batch * 50 + index);
     addon.writeCore(core, Buffer.from(ids.map((id) =>
@@ -97,7 +96,6 @@ try {
 }
 
 const beforeFds = readdirSync("/dev/fd").length;
-// Unclaimed readers and pending exit wakes are released with their runtime.
 for (let index = 0; index < 32; index++) {
   const closing = addon.createCore({ apiKey: "ready-close-key", home: "/tmp", workspaceRoot: "/tmp" });
   if (index % 2 === 0) closeSync(addon.takeCoreReadyFd(closing));

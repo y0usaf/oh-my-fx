@@ -37,23 +37,13 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 pub const file_name = "history-cache.bin";
 
-const magic = "fx-history-cache\x1a\n"; // 18 bytes; all offsets use magic.len
-// Image source references extend the binary payload without changing the log schema.
+const magic = "fx-history-cache\x1a\n";
 const format_version: u16 = 3;
 /// Frames carry 32-bit lengths; a single log line can be large (embedded tool
 /// output), so the cap stays generous. Anything larger is a corrupt cache.
 const max_frame_bytes: u32 = 1024 * 1024 * 1024;
 /// Bounds the in-memory frame index built while verifying.
 const max_frames: usize = 4 * 1024 * 1024;
-
-// ---------------------------------------------------------------------------
-// Generic binary codec
-//
-// Handles the exact shapes used by session events: integers, bools, enums,
-// optionals, byte strings, slices of structs/strings, structs, and tagged
-// unions. Anything else fails to compile, so the codec can never silently
-// mis-encode a newly introduced field type.
-// ---------------------------------------------------------------------------
 
 const EncodeError = error{ OutOfMemory, PayloadTooLarge };
 const DecodeError = error{ InvalidCache, OutOfMemory };
@@ -258,17 +248,6 @@ fn freeAny(alloc: Allocator, comptime T: type, value: T) void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Frame layout
-//
-// header: magic ++ u64 cache format version ++ u64 conversation schema
-//         version ++ u64 session id length ++ session id bytes
-// frame:  u32 frame_len (bytes of crc ++ payload that follow)
-//         u32 crc32(payload)
-//         payload: u64 log_offset ++ u32 log_bytes ++ u32 line_crc32 ++
-//                  encoded ConversationEnvelope
-// ---------------------------------------------------------------------------
-
 pub const FrameMeta = struct {
     /// Offset of this frame inside the cache file.
     file_offset: u64,
@@ -303,21 +282,11 @@ fn headerBytes(out: *std.ArrayList(u8), alloc: Allocator, session_id: []const u8
     try out.appendSlice(alloc, session_id);
 }
 
-// The codec normalizes every integer to an 8-byte little-endian value, so the
-// header is magic ++ u64 version ++ u64 fingerprint ++ u64 id length.
 const header_len_min = magic.len + 8 + 8 + 8;
 /// Byte offset of `seq` inside a frame payload: log_offset, log_bytes and
 /// line_crc (8 bytes each, codec-normalized) precede the envelope, whose own
 /// schema_version u64 precedes seq.
 const envelope_seq_offset = 24 + 8;
-
-// ---------------------------------------------------------------------------
-// Writer
-//
-// Appends frames next to the log commit path. Never fails its caller: any
-// error marks the writer broken, and finalize/discard removes the file so the
-// next open rebuilds from scratch.
-// ---------------------------------------------------------------------------
 
 pub const Writer = struct {
     alloc: Allocator,
@@ -428,14 +397,6 @@ pub const Writer = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Verification
-//
-// verify() reads the header and every frame once, CRC-checking as it goes. A
-// torn or corrupt tail ends the valid prefix instead of failing. The result
-// carries the frame index used by Cursor for random access.
-// ---------------------------------------------------------------------------
-
 pub const Verified = struct {
     file: std.Io.File,
     frames: []FrameMeta,
@@ -472,7 +433,7 @@ pub fn openAndVerify(
     defer if (!keep_file) file.close(io_mod.getIo());
 
     var frames: std.ArrayList(FrameMeta) = .empty;
-    defer frames.deinit(alloc); // no-op after a successful toOwnedSlice
+    defer frames.deinit(alloc);
 
     var header: [header_len_min]u8 = undefined;
     const header_read = file.readPositionalAll(io_mod.getIo(), &header, 0) catch return null;
@@ -503,7 +464,7 @@ pub fn openAndVerify(
         const payload = alloc.alloc(u8, frame_len - 4) catch return error.OutOfMemory;
         defer alloc.free(payload);
         const read = file.readPositionalAll(io_mod.getIo(), payload, file_offset + 8) catch |err| return err;
-        if (read != payload.len) break; // torn tail: valid prefix ends here
+        if (read != payload.len) break;
         if (std.hash.Crc32.hash(payload) != want_crc) break;
         if (payload.len < envelope_seq_offset + 8) break;
         const log_offset = std.mem.readInt(u64, payload[0..8], .little);
@@ -511,11 +472,9 @@ pub fn openAndVerify(
         const line_crc_wide = std.mem.readInt(u64, payload[16..24], .little);
         const log_bytes = std.math.cast(u32, log_bytes_wide) orelse break;
         const line_crc = std.math.cast(u32, line_crc_wide) orelse break;
-        // The envelope prefix is schema_version (u64) then seq (u64); reading
-        // seq directly avoids a full decode in the verify pass.
         const seq = std.mem.readInt(u64, payload[envelope_seq_offset..][0..8], .little);
         if (seq != expected_seq) break;
-        if (log_offset != covered_log_bytes) break; // frames must mirror the log prefix exactly
+        if (log_offset != covered_log_bytes) break;
         try frames.append(alloc, .{
             .file_offset = file_offset,
             .log_offset = log_offset,
@@ -530,8 +489,6 @@ pub fn openAndVerify(
     if (frames.items.len == 0) return null;
     if (covered_log_bytes > log_len) return null;
 
-    // Authority check: the last covered log line must still hash to the CRC
-    // recorded when the cache frame was written.
     const tail = frames.items[frames.items.len - 1];
     const tail_bytes = alloc.alloc(u8, tail.log_bytes) catch return error.OutOfMemory;
     defer alloc.free(tail_bytes);
@@ -549,14 +506,6 @@ pub fn openAndVerify(
         .last_seq = expected_seq - 1,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Cursor
-//
-// Sequential and random access over a verified cache. next() decodes frames in
-// order; seekLogOffset() positions the cursor at the frame whose log offset
-// matches, mirroring how the replay seeks into events.jsonl.
-// ---------------------------------------------------------------------------
 
 pub const Cursor = struct {
     file: std.Io.File,
@@ -591,9 +540,9 @@ pub const Cursor = struct {
         const read = self.file.readPositionalAll(io_mod.getIo(), payload, meta.file_offset + 8) catch return error.InvalidCache;
         if (read != payload.len) return error.InvalidCache;
         var cursor = ByteCursor{ .bytes = payload };
-        _ = cursor.takeInt() catch return error.InvalidCache; // log_offset
-        _ = cursor.takeInt() catch return error.InvalidCache; // log_bytes
-        _ = cursor.takeInt() catch return error.InvalidCache; // line_crc
+        _ = cursor.takeInt() catch return error.InvalidCache;
+        _ = cursor.takeInt() catch return error.InvalidCache;
+        _ = cursor.takeInt() catch return error.InvalidCache;
         const envelope = try decodeAny(session_event.ConversationEnvelope, arena, &cursor);
         if (cursor.pos != cursor.bytes.len) return error.InvalidCache;
         self.index += 1;
@@ -645,10 +594,6 @@ pub fn deleteForRebuild(dir: *io_mod.VerifiedDir) void {
     deleteCacheFile(dir);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 fn sampleEnvelope(seq: u64) session_event.ConversationEnvelope {
     return .{
         .seq = seq,
@@ -669,7 +614,6 @@ fn encodeDecodeRoundtrip(alloc: Allocator, envelope: session_event.ConversationE
     try std.testing.expectEqual(@as(u64, 0xdeadbeef), try cursor.takeInt());
     const decoded = try decodeAny(session_event.ConversationEnvelope, arena.allocator(), &cursor);
     try std.testing.expectEqual(payload.items.len, cursor.pos);
-    // Canonical re-encode proves field fidelity without a field-by-field diff.
     var again: std.ArrayList(u8) = .empty;
     defer again.deinit(alloc);
     try encodeFramePayload(&again, alloc, decoded, 42, 128, 0xdeadbeef);
@@ -843,7 +787,6 @@ test "history snapshot verify, cursor, and watermark authority" {
     defer tmp.cleanup();
     var verified_dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
 
-    // Two steering events at log offsets 0 and 10.
     const line1 = "{\"seq\":1}\n";
     const line2 = "{\"seq\":2}\n";
     {
@@ -877,7 +820,6 @@ test "history snapshot verify, cursor, and watermark authority" {
     try std.testing.expectEqual(@as(u64, 2), second.seq);
     try std.testing.expect((try cursor.next(arena.allocator())) == null);
 
-    // Wrong session id, a shrunk log, and a rewritten tail all invalidate.
     try std.testing.expect((try openAndVerify(alloc, &verified_dir, "sess-2", log_file, log_len)) == null);
     try std.testing.expect((try openAndVerify(alloc, &verified_dir, "sess-1", log_file, log_len - 1)) == null);
     {
@@ -917,7 +859,6 @@ test "history snapshot rejects version two image caches before decoding" {
     defer payload.deinit(alloc);
     try encodeFramePayload(&payload, alloc, envelope, 0, line.len, std.hash.Crc32.hash(line));
     payload.items.len = envelope_seq_offset + 8 + 8 + 1;
-    // Frozen version-2 user payload: the image has no source_ref tag.
     const legacy_user = "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ "with image" ++
         "\x01\x00\x00\x00\x00\x00\x00\x00" ++ "\x03\x00\x00\x00\x00\x00\x00\x00" ++
         "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ "/tmp/a.png" ++
@@ -953,7 +894,6 @@ test "history snapshot verification tolerates a torn tail as a shorter prefix" {
 
     var writer = try Writer.beginReplace(alloc, &verified_dir, "sess-1");
     writer.append(sampleEnvelope(1), 0, line1.len, std.hash.Crc32.hash(line1));
-    // Simulate a torn second frame: a plausible frame header with no payload.
     const fake: [8]u8 = .{ 0, 64, 0, 0, 1, 2, 3, 4 };
     const file = writer.file.?;
     try file.writePositionalAll(std.testing.io, &fake, writer.len);

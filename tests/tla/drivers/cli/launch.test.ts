@@ -1,12 +1,3 @@
-// Runs the real fx binary through every launch-flag scenario the
-// LaunchSelection TLA+ model covers (tests/tla/cli/LaunchSelection.tla), then has TLC
-// replay what fx did through the model. No model calls: a local fake Gateway
-// serves the catalog and accepts only models that exist.
-//
-// 1. The binary must conform to exactly one modeled design, current or proposed.
-// 2. Controls: tampered and empty evidence must not be accepted.
-// 3. With FX_TLA_PROPOSED=1: the binary must conform to the proposed design.
-//    This fails until fx validates launch flags.
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -90,7 +81,6 @@ function fixture(s: Scenario): Fixture {
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-    // Kept with the scenario evidence so an unexpected outcome can be traced.
     FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "agent,core,gateway,auth,session",
   });
   return { root, home, workspace, gateway, env, catalogRequests, catalogServed: () => served, rejectedModels };

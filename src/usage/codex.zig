@@ -641,14 +641,10 @@ fn number(value: std.json.Value) ParseError!f64 {
     return f;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 const now: i64 = 1_791_752_000_000;
 
 test "a business plan without limit windows and with unlimited credits" {
-    // The live response for a ChatGPT business plan, trimmed of account ids.
     const body =
         \\{"plan_type":"business","rate_limit":null,"code_review_rate_limit":null,
         \\ "additional_rate_limits":null,
@@ -692,7 +688,6 @@ test "a plan with 5-hour and weekly windows, code review and an extra limit" {
     try testing.expectEqual(@as(f64, 42), u.limits[0].primary.?.used_percent);
     try testing.expectEqual(@as(i64, 18000), u.limits[0].primary.?.window_seconds);
     try testing.expectEqual(@as(?i64, 1_791_759_980_000), u.limits[0].primary.?.resets_at_ms);
-    // No reset_at: computed from reset_after_seconds.
     try testing.expectEqual(@as(?i64, now + 300_000_000), u.limits[0].secondary.?.resets_at_ms);
     try testing.expectEqualStrings("code review", u.limits[1].name);
     try testing.expect(u.limits[1].reached);
@@ -700,7 +695,6 @@ test "a plan with 5-hour and weekly windows, code review and an extra limit" {
     try testing.expectEqualStrings("12.40", u.credits.?.balance.?);
     try testing.expect(u.spend_limit_reached and u.hasWindows());
 
-    // A deep copy survives the original.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const copy = try u.clone(arena.allocator());
@@ -708,7 +702,6 @@ test "a plan with 5-hour and weekly windows, code review and an extra limit" {
 }
 
 test "the profile gives lifetime stats and daily tokens" {
-    // The live shape for a business account, trimmed.
     const body =
         \\{"profile":{"username":"samdoe12345","display_name":"samdoe","profile_picture_url":"https://x"},
         \\ "stats":{"lifetime_tokens":315686778511,"peak_daily_tokens":11594630891,"current_streak_days":132,
@@ -733,13 +726,11 @@ test "the profile gives lifetime stats and daily tokens" {
     try testing.expectEqual(@as(?u64, 11374), p.chats);
     try testing.expectEqualStrings("xhigh", p.reasoning.?);
     try testing.expectEqual(@as(?i64, 20737), p.as_of_day);
-    // Sorted oldest first, whatever order ChatGPT sends.
     try testing.expectEqual(@as(i64, 20726), p.days[0].day);
     const today: i64 = 20737;
     try testing.expectEqual(@as(?u64, 39877412), p.tokensBetween(today, today));
     try testing.expectEqual(@as(?u64, 39877412 + 52293426), p.tokensBetween(today - 6, today));
     try testing.expectEqual(@as(?u64, 39877412 + 52293426 + 1000), p.tokensBetween(20727, today));
-    // A day past ChatGPT's stats is unknown, not zero.
     try testing.expectEqual(@as(?u64, null), p.tokensBetween(today + 1, today + 1));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -783,7 +774,6 @@ test "a malformed profile is rejected" {
 }
 
 test "the breakdown gives each model's and surface's share of a period" {
-    // The live shape, trimmed: ChatGPT sends every surface, most of them 0.
     const body =
         \\{"data":[
         \\ {"date":"2026-10-11","product_surface_usage_values":{"cli":7.0,"desktop_app":10.0,"vscode":0.0,"work_web":1.0,"web":2.0},
@@ -796,7 +786,6 @@ test "the breakdown gives each model's and surface's share of a period" {
     var owned = try parseBreakdown(testing.allocator, body);
     defer owned.deinit();
     const b = owned.breakdown;
-    // Oldest first; zero entries are dropped.
     try testing.expectEqual(@as(i64, 20736), b.days[0].day);
     try testing.expectEqual(@as(usize, 3), b.days[1].models.len);
     try testing.expectEqual(@as(usize, 4), b.days[1].surfaces.len);
@@ -816,7 +805,6 @@ test "the breakdown gives each model's and surface's share of a period" {
     try testing.expectApproxEqAbs(@as(f64, 7.5), both[3].percent, 1e-9);
     try testing.expectEqual(@as(usize, 0), b.modelShares(20738, 20740, &buf).len);
 
-    // Surfaces get readable names, and work and personal web add up.
     const surfaces = b.surfaceShares(20737, 20737, &buf);
     try testing.expectEqual(@as(usize, 3), surfaces.len);
     try testing.expectEqualStrings("desktop app", surfaces[0].name);

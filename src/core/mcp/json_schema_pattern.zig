@@ -176,7 +176,7 @@ const Parser = struct {
         if (min > self.limits.max_repeat or (max orelse min) > self.limits.max_repeat) {
             return error.PatternLimitExceeded;
         }
-        _ = self.consumeByte('?'); // Lazy quantifiers have identical acceptance semantics.
+        _ = self.consumeByte('?');
         if (self.index < self.source.len) switch (self.source[self.index]) {
             '*', '+', '?', '{' => return error.InvalidPattern,
             else => {},

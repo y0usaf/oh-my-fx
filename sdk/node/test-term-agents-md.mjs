@@ -53,9 +53,6 @@ function systemText(body) {
     .join("\n");
 }
 
-// Runs `turns` prompts in a fresh terminal and returns every model request's
-// system text. `respond(requestNumber)` may script a tool call; otherwise the
-// model answers the turn.
 async function systemTextsWith(workspace, label, { turns = 1, respond = () => null } = {}) {
   const terminal = new Terminal({ cols: 100, rows: 30, allowProposedApi: true, scrollback: 2000 });
   const config = new Map([["model", "test/agents-model"], ["mode", "auto"]]);
@@ -155,8 +152,6 @@ if (reads.join(",") !== "/home/visitor/.fx/AGENTS.md,/workspace/AGENTS.md") {
   throw new Error(`readable: unexpected readFile paths: ${reads.join(",")}`);
 }
 
-// A tool call makes later turns rebuild context from history; that rebuild
-// must use the host workspace root, not the WebAssembly process root.
 const toolTurn = { turns: 2, respond: (request) => (request === 1 ? shellCall("call-1", "pwd") : null) };
 const readableAfterTool = await systemTextsWith(workspaceWith(readRules), "readable-after-tool", toolTurn);
 const readableTurnTwo = readableAfterTool.at(-1);

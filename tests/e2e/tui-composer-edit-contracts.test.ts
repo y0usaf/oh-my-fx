@@ -104,7 +104,6 @@ async function startFx(
           id: FAKE_GATEWAY_MODEL,
           type: "language",
           tags: ["vision", "file-input", "tool-use"],
-          // Exercise composer byte limits independently of context compaction.
           context_window: 16_000_000,
           max_tokens: 64_000,
         }],
@@ -557,8 +556,6 @@ tmuxTest(
     stderrPath = join(root, "stderr.log");
     writeFileSync(stderrPath, "");
 
-    // The first answer overflows the viewport so its summary sits mid-line at
-    // the band bottom; the submitted card is taller than the screen.
     const filler = Array.from(
       { length: 240 },
       (_, index) => `FILLER_ANSWER_LINE_${String(index).padStart(3, "0")}`,

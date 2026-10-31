@@ -136,7 +136,6 @@ pub const Client = struct {
         }
         c.wakes.cancel(c.io);
         c.release();
-        // What nobody read.
         var leftover: [1]Posted = undefined;
         while ((c.queue.get(c.io, &leftover, 0) catch 0) == 1) leftover[0].free(c.gpa);
         c.http.deinit();
@@ -197,7 +196,7 @@ pub const Client = struct {
         while (true) {
             const posted = c.queue.getOne(c.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
-                error.Closed => unreachable, // the queue is never closed
+                error.Closed => unreachable,
             };
             if (posted == .wake) {
                 if (posted.wake == c.wake_id and timeout_ms != null) return .timeout;
@@ -253,7 +252,6 @@ pub const Client = struct {
                 return .{ .opened = key };
             },
             .ended => |e| {
-                // A request that was cancelled may still have said it ended.
                 if (!c.inFlight(e.key)) {
                     posted.free(c.gpa);
                     return null;
@@ -302,7 +300,7 @@ pub const Client = struct {
             posted.free(c.gpa);
             return switch (err) {
                 error.Canceled => error.Canceled,
-                error.Closed => unreachable, // the queue is never closed
+                error.Closed => unreachable,
             };
         };
         if (posted != .wake) if (c.options.bell) |b| b.ring();
@@ -346,7 +344,6 @@ pub const Client = struct {
         } else req.sendBodiless() catch return .{ .how = .broken };
         var response = req.receiveHead(&.{}) catch return .{ .how = .broken };
         const status: u16 = @backingInt(response.head.status);
-        // The head's bytes don't outlive reading the body.
         var challenge: std.ArrayList(u8) = .empty;
         defer challenge.deinit(c.gpa);
         var it = response.head.iterateHeaders();
@@ -371,7 +368,6 @@ pub const Client = struct {
             if (status / 100 == 2) try c.put(.{ .opened = key });
             return c.readEvents(key, status, reader);
         }
-        // A JSON body: a JSON-RPC answer, or, with no such body, an HTTP failure.
         const bytes = reader.allocRemaining(c.gpa, .limited(c.options.max_message)) catch return .{ .status = status, .how = .broken };
         if (wire.decode(bytes)) |_| {
             try c.put(.{ .event = .{ .key = key, .status = status, .data = bytes, .event_id = null, .retry_ms = null } });
@@ -442,7 +438,5 @@ pub const Client = struct {
 };
 
 test {
-    // Behavior is tested against real servers by the Bun driver and the
-    // conformance suite; this makes sure every declaration compiles.
     std.testing.refAllDecls(Client);
 }

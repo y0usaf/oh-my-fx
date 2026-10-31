@@ -24,13 +24,10 @@ pub fn setInlineCodeTheme(light: bool) void {
 pub fn applyTheme(theme: shared_theme.Theme) void {
     inline_code_open = theme.inline_code_open;
     task_completed_open = theme.task_completed_open;
-    // Themed slots may carry bold/italic/background; the close must reset
-    // everything the open sets or attributes bleed into following text.
     inline_code_close = shared_theme.closingFor(theme.inline_code_open);
     task_completed_close = shared_theme.closingFor(theme.task_completed_open);
 }
 
-// Keeps table intersections aligned with row separators.
 pub const table_column_sep = " \xe2\x94\x82 ";
 pub const table_horiz = "\xe2\x94\x80";
 pub const table_junction = "\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80";

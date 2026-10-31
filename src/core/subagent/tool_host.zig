@@ -343,7 +343,6 @@ pub const Runtime = struct {
                     defer admitted.deinit(admission_alloc);
                     switch (admitted) {
                         .feedback => |target| {
-                            // Allocate the receipt before handing any text to the worker.
                             if (queued_receipt == null) queued_receipt = try self.encodeManaged(alloc, model_contract.feedbackResult(.queued));
                             const result = steer: {
                                 self.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -443,9 +442,6 @@ pub const Runtime = struct {
         options: ExecuteOptions,
     ) !OverrideModelResolution {
         const raw_model = override.model orelse return .{ .accepted = null };
-        // Only the gateway catalog is an authoritative model list. Configured
-        // providers (OpenAI-compatible endpoints) accept arbitrary model IDs,
-        // so overrides for those children pass through to the provider.
         if (options.defaults.provider != .gateway) {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
             return .{ .accepted = null };
@@ -554,8 +550,6 @@ pub const Runtime = struct {
         options: ExecuteOptions,
         resolved_model: ?[]const u8,
     ) !ManagedAdmission {
-        // A running registry entry must not be exposed before its Slot exists.
-        // Release the registry lock before taking the managed-owner lock.
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
@@ -695,8 +689,6 @@ pub const Runtime = struct {
                         active,
                     );
                     try self.managed.state_store.save(alloc, registry);
-                    // A v2 child lost before its first turn has no log to
-                    // resume, so its next work starts it fresh (D33).
                     if (self.backend == .v2) try self.ensureManagedChildSession(alloc, started.id, active.id, defaults);
                     return managedAdmissionReady(alloc, started.id);
                 }
@@ -733,9 +725,6 @@ pub const Runtime = struct {
     ) !void {
         const sessions = switch (self.backend) {
             .v2 => |children| {
-                // A v2 child reaches the disk with its first turn, under
-                // the id its spawn line names (D34); until then only its
-                // settings wait here.
                 try children.rememberSeed(child_id, .{
                     .preferences = .{
                         .provider = defaults.provider,
@@ -821,7 +810,6 @@ pub const Runtime = struct {
             }) catch |err| {
                 if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
                 if (!self.managed.hasRunningChild(child_id)) {
-                    // A timed-out observation can leave a completed slot to drain.
                     self.managed.cancelAndJoin(child_id);
                     debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=observation_failed_no_runner error={s}", .{ child_id, work_id, @errorName(err) });
                     self.removeYielded(child_id, work_id);
@@ -867,8 +855,6 @@ pub const Runtime = struct {
         return false;
     }
 
-    // Registry is held by admission. Preserve the old work's result before a
-    // newer generation can become observable through this child ID.
     fn capturePriorYielded(self: *Runtime, child: child_state.Child) !void {
         self.yielded_mutex.lockUncancelable(io_mod.getIo());
         defer self.yielded_mutex.unlock(io_mod.getIo());
@@ -1389,7 +1375,6 @@ test "subagent feedback waits for admitted work to install its worker" {
         if (second.result) |result| alloc.free(result.body);
     }
     first_thread = try std.Thread.spawn(.{}, Call.run, .{&first});
-    // Hold result registration after durable admission, before Slot publication.
     var admitted = false;
     for (0..1000) |_| {
         admitted = blk: {
@@ -1512,7 +1497,6 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
         try std.testing.expectEqualStrings(expected, feedback.body);
     }
     runtime.removeYielded("other-child", "other-work");
-    // Keep the regression bounded even when failed starts leave pending work.
     try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
     try std.testing.expect(!try runtime.waitYielded(&worker));
 }
@@ -1573,7 +1557,6 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
     var fixture = Fixture{};
     const runtime = try Runtime.create(alloc, &sessions, "observation-parent", .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
     defer runtime.deinit();
-    // Release the real child before teardown even when a regression assertion fails.
     defer fixture.release.set(io_mod.getIo());
     var worker = worker_runtime.WorkerRuntime{};
     defer worker.deinit(alloc);
@@ -1605,7 +1588,6 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
     try std.testing.expect(!runtime.managed.hasRunningChild("other-child"));
     if (fail_publication) {
         fixture.release.set(io_mod.getIo());
-        // Observe only after slotMain finishes publication; do not reap it here.
         for (0..1000) |_| {
             if (!runtime.managed.hasRunningWork()) break;
             io_mod.sleep(std.time.ns_per_ms);
@@ -1617,7 +1599,6 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
         try std.testing.expectEqual(child_state.Phase.running, saved.findById(child_id).?.phase);
         try std.testing.expectEqualStrings(work_id, saved.findById(child_id).?.active.?.id);
     } else {
-        // A transient read failure while the real runner still borrows parent context.
         var capability = try sessions.openSubagentControlCapabilityWritable(alloc, runtime.root_id, .{});
         defer capability.deinit();
         var entry = try capability.atomicReplace(alloc, .subagent_control, "children.json", "{");
@@ -1632,7 +1613,6 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
     try std.testing.expectEqualStrings("other-work", runtime.yielded.items[runtime.yielded.items.len - 1].work_id);
     runtime.removeYielded(child_id, "other-work");
     if (fail_publication) {
-        // Assert before waitYielded to keep stale-state regressions bounded.
         try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
         try std.testing.expect(!try runtime.waitYielded(&worker));
     } else {
@@ -1718,14 +1698,11 @@ test "creation defaults keep parent values unless the request overrides them" {
     try std.testing.expectEqualStrings("gpt-5.6-sol-fast", overridden.model);
     try std.testing.expectEqualStrings("medium", overridden.effort.label());
     try std.testing.expectEqual(parent.provider, overridden.provider);
-    // Model-only and effort-only overrides leave the other value inherited.
     const model_only = effectiveDefaults(parent, .{ .model = "other-model" }, null);
     try std.testing.expectEqualStrings("other-model", model_only.model);
     try std.testing.expect(model_only.effort.isDefault());
-    // A catalog-resolved model wins over the raw override text.
     const resolved = effectiveDefaults(parent, .{ .model = "terra-fast" }, "openai/gpt-5.6-terra-fast");
     try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", resolved.model);
-    // Without an override there is nothing to resolve.
     const no_override = effectiveDefaults(parent, .{}, "openai/gpt-5.6-terra-fast");
     try std.testing.expectEqualStrings("parent-model", no_override.model);
 }
@@ -1865,7 +1842,6 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra") != null);
     try std.testing.expect(std.mem.find(u8, ambiguous_result.body, "openai/gpt-5.6-terra-fast") != null);
 
-    // Rejections never created or ran a child.
     try std.testing.expectEqual(@as(usize, 0), fixture.runs);
     var lock = try runtime.managed.state_store.acquireLock(alloc);
     defer lock.release();
@@ -1914,8 +1890,6 @@ test "model override passes through for non-gateway providers" {
         .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
     });
 
-    // The configured provider accepts arbitrary model IDs, so the raw override
-    // reaches the child even though the gateway catalog lacks it.
     try std.testing.expect(result.success);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
@@ -2013,8 +1987,6 @@ test "terminal result projects every managed outcome without a lifecycle phase" 
         try std.testing.expectEqualStrings(case.error_code, projected.error_code.?);
     }
 
-    // Work lost before the child started it says so, so the parent can
-    // send it again (D33).
     const lost = terminalResult(.{ .phase = .interrupted, .outcome = .lost }, null);
     try std.testing.expect(!lost.ok);
     try std.testing.expectEqualStrings(lost_result, lost.result.?);

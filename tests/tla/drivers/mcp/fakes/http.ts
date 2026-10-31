@@ -1,28 +1,3 @@
-// Scripted fake Streamable HTTP MCP server (U06, U07), like fakes/stdio.ts.
-//
-// Listens on 127.0.0.1 at a free port and prints {"listening": <port>} first.
-// Every POST request is matched against the rules in order: the first rule
-// whose method (and, if given, version, cursor, or tool name) matches and
-// still has uses left answers it. An unmatched request gets 404 with -32601
-// (the 2026 answer for an unknown method); notifications and replies get 202.
-// Every request is logged with its headers to --log as JSONL, and so is every
-// stream the client closes early.
-//
-// 2025 sessions (U07), with --session: initialize's answer assigns
-// `Mcp-Session-Id: s<n>`. Later requests without it get 400, and with an
-// ended or unknown one 404 with a JSON-RPC error and no id, as the TypeScript
-// SDK answers. A rule's `endSession` ends the session after answering. SSE
-// answers may carry event ids (`ids`), a `retry`, and `poll` closes the stream
-// after its first events, keeping the answer: a GET with Last-Event-ID gets
-// it. A GET without one is the listening stream (--listen 405|open|close).
-// DELETE ends the session (--delete-status, 200 by default).
-//
-// OAuth (U09), with --auth <config.json>: see fakes/oauth.ts. Its endpoints are
-// answered first, and the MCP endpoint's gate runs before any rule.
-//
-// Usage: bun tests/tla/drivers/mcp/fakes/http.ts --script <rules.json> [--log <file>]
-//          [--session | --no-session-id] [--listen 405|open|close] [--delete-status <n>]
-//          [--initialized-delay <ms>] [--auth <config.json>]
 
 import { appendFileSync, readFileSync } from "node:fs";
 import { createAuth, type AuthConfig } from "./oauth";
@@ -90,13 +65,10 @@ const rules = JSON.parse(readFileSync(get("--script") ?? "/dev/null", "utf8") ||
 const used = rules.map(() => 0);
 const logPath = get("--log");
 const sessions = args.includes("--session");
-// Without --session, answers carry a fixed session id (2026 clients must ignore it) unless --no-session-id.
 const noSessionId = args.includes("--no-session-id");
 const listenMode = get("--listen") ?? "405";
 const deleteStatus = Number(get("--delete-status") ?? "200");
-// Holds the 202 to notifications/initialized this long, logging when it was answered.
 const initializedDelay = Number(get("--initialized-delay") ?? "0");
-// Holds the listening GET's head this long (U11).
 const listenDelay = Number(get("--listen-delay") ?? "0");
 const log = (entry: object) => {
   if (logPath) appendFileSync(logPath, JSON.stringify({ t: Date.now(), ...entry }) + "\n");
@@ -105,24 +77,18 @@ const log = (entry: object) => {
 const authPath = get("--auth");
 const auth = authPath ? createAuth(JSON.parse(readFileSync(authPath, "utf8")) as AuthConfig, () => `http://127.0.0.1:${server.port}`, log) : null;
 
-// A rule's result and SSE messages may say "$id" for the request's id, as a
-// listen's subscriptionId must (U10).
 const withId = <T>(value: T, id: unknown): T => JSON.parse(JSON.stringify(value).replaceAll('"$id"', JSON.stringify(id ?? null)));
 
 const encoder = new TextEncoder();
 const sseEvent = (message: unknown, id?: string, retry?: number) =>
   encoder.encode(`${retry !== undefined ? `retry: ${retry}\n` : ""}${id !== undefined ? `id: ${id}\n` : ""}event: message\ndata: ${message === undefined ? "" : JSON.stringify(message)}\n\n`);
 
-// 2025 sessions.
 let sessionCount = 0;
 let currentSession: string | null = null;
 const ended = new Set<string>();
-// Streams kept for a GET with Last-Event-ID: stream name -> the answer still to send.
 const kept = new Map<string, { answer: unknown; next: number }>();
 let streamCount = 0;
-// The open listening GET stream, for `listenLater` (U11).
 let listenController: ReadableStreamDefaultController | null = null;
-// Replies to the server's requests that a rule waits for: JSON of the id -> resolve.
 const replies = new Map<string, () => void>();
 
 function sessionProblem(req: Request, initialize: boolean): Response | null {
@@ -198,7 +164,6 @@ const server = Bun.serve({
     if (denied) return denied;
     const problem = sessionProblem(req, message.method === "initialize");
     if (problem) return problem;
-    // Notifications and replies to server requests.
     if (message.id === undefined || message.method === undefined) {
         if (message.method === undefined && message.id !== undefined) replies.get(JSON.stringify(message.id))?.();
         if (message.method === "notifications/initialized" && initializedDelay > 0) {

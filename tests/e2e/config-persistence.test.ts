@@ -216,7 +216,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     let read = false;
     const fixture = createConfiguredProviderFixture(body => {
       if (!body.tools?.length) return configuredCompletion(body.model, "provider summary");
-      // The first turn reads a file, so compaction has work to summarize.
       if (!read) {
         read = true;
         return configuredToolCompletion(body.model, "read_file", { path: "notes.txt" }, "local-read");
@@ -1082,7 +1081,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("anthropic/claude-opus-4.8", TIMEOUT);
         expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
         await session.sendKeys("Enter");
-        // Gateway order is preserved after fx's default sentinel.
         await session.waitForText("default", TIMEOUT);
         for (let i = 0; i < 2; i += 1) await session.sendKeys("Down");
         await session.waitForText("xhigh", TIMEOUT);

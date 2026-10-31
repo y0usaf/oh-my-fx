@@ -1,5 +1,3 @@
-// "libfx" under bundler resolution without the "node" condition: the
-// "default" export condition, which is the browser entry.
 import { createFxAgent, memory } from "libfx";
 // @ts-expect-error without the "node" condition, "libfx" is the browser entry, which has no getBackendInfo()
 import { getBackendInfo } from "libfx";

@@ -516,13 +516,9 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     try history.ensureTotalCapacity(alloc, base.history.len);
     for (base.history) |turn| history.appendAssumeCapacity(try types.dupeHistoryTurn(alloc, turn));
     var open: ?std.json.Value = null;
-    // The `seq` of the progress `open` came from; null for a snapshot's.
     var open_seq: ?u64 = null;
-    // The open turn's announced calls; the ones its progress answers are
-    // dropped at the end.
     var running: std.ArrayList(std.json.Value) = .empty;
     defer running.deinit(alloc);
-    // The results its calls recorded as each finished.
     var results: std.ArrayList(std.json.Value) = .empty;
     defer results.deinit(alloc);
     var inputs: std.ArrayList(InputState) = .empty;
@@ -532,8 +528,6 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     var yielded = false;
     var cursor = base.cursor;
     if (base.open_turn) |text| {
-        // The snapshot's turn stays open and yielded until the events after
-        // it say otherwise.
         const value = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), text, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidJournal,
@@ -547,12 +541,10 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     }
     for (parsed.array.items) |value| {
         const event = try envelope(value, cursor);
-        // A yield stands only until the turn does anything more.
         if (event.kind != .turn_yielded) yielded = false;
         switch (event.kind) {
             .turn_committed => {
                 const turn = try parseTurn(alloc, event.data orelse return error.InvalidJournal);
-                // The same rule the session applies when it commits the turn.
                 if (replacesHistory(turn)) {
                     for (history.items) |old| types.freeHistoryTurn(alloc, old);
                     history.clearRetainingCapacity();
@@ -570,25 +562,17 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                 endTurnInputs(&inputs);
             },
             .turn_progress => {
-                // A host may leave out a superseded progress's state as
-                // `null`: a later progress in the turn, or its end, replaces
-                // it. A progress that carries only what is new extends the
-                // turn's progress right before it, which must have its state.
                 const data = event.data orelse return error.InvalidJournal;
                 if (data != .object and data != .null) return error.InvalidJournal;
                 const seq = cursor.next_seq;
                 if (event.base) |extended| {
                     if (open == null or open_seq != extended) return error.InvalidJournal;
-                    // A superseded delta's state may be left out like any
-                    // other's; one that has it needs its base's.
                     open = if (data == .null) data else try mergeDelta(arena_state.allocator(), open.?, data);
                 } else {
-                    // A turn's first progress names it.
                     if (open == null) open_id = try turnIdOf(event.turn_id);
                     open = data;
                 }
                 open_seq = seq;
-                // Each placed input was accepted in this turn and is placed once.
                 if (event.inputs) |placed| {
                     if (placed != .array) return error.InvalidJournal;
                     for (placed.array.items) |id| {
@@ -602,7 +586,6 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
             .tool_intent => {
                 const data = event.data orelse return error.InvalidJournal;
                 if (data != .array or data.array.items.len == 0) return error.InvalidJournal;
-                // An intent belongs to an open turn.
                 if (open == null) return error.InvalidJournal;
                 try running.appendSlice(alloc, data.array.items);
             },
@@ -618,10 +601,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
             },
             .tool_result => {
                 const data = event.data orelse return error.InvalidJournal;
-                // A result belongs to a call the open turn announced.
                 if (open == null) return error.InvalidJournal;
-                // A host may leave out the state of one a later progress
-                // answers, as `null`.
                 if (data != .null) {
                     const id = try stringField(data, "id");
                     _ = try stringField(data, "name");
@@ -629,7 +609,6 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                     if (!std.mem.eql(u8, status, "success") and !std.mem.eql(u8, status, "failure")) return error.InvalidJournal;
                     const output = data.object.get("output") orelse return error.InvalidJournal;
                     if (output != .string) return error.InvalidJournal;
-                    // One for a call no intent announced answers nothing.
                     if (announcedCall(running.items, id)) try results.append(alloc, data);
                 }
             },
@@ -652,7 +631,6 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
             },
             .turn_yielded => {
                 if (event.data != null) return error.InvalidJournal;
-                // Only an open turn yields.
                 if (open == null) return error.InvalidJournal;
                 yielded = true;
             },
@@ -762,8 +740,6 @@ fn dropAnswered(alloc: Allocator, calls: []types.ToolCall, execution: types.Exec
         kept[next] = call;
         next += 1;
     }
-    // Each decision reads only earlier calls, so freeing from the end keeps
-    // every call a later decision reads alive.
     var index = calls.len;
     while (index > 0) {
         index -= 1;
@@ -810,7 +786,6 @@ fn envelope(value: std.json.Value, cursor: Cursor) LoadError!Envelope {
     if (kind_value != .string) return error.InvalidJournal;
     const kind = std.meta.stringToEnum(EventType, kind_value.string) orelse return error.InvalidJournal;
     const base: ?u64 = if (object.get("base") != null) try integerField(object, "base") else null;
-    // Version 1 has neither a delta progress nor a call's result.
     if (event_version == plain_version and (base != null or kind == .tool_result)) return error.InvalidJournal;
     if (base != null and kind != .turn_progress) return error.InvalidJournal;
     return .{ .kind = kind, .data = object.get("data"), .inputs = object.get("inputs"), .turn_id = object.get("turnId"), .base = base };
@@ -947,7 +922,6 @@ test "progress after the last commit is the turn a crash left open" {
     try std.testing.expectEqualStrings("send the email", open.open_turn.?.user.text);
     try std.testing.expectEqual(Cursor{ .next_seq = 3, .turn = 2 }, open.cursor);
 
-    // A clear means the turn ended on purpose, so nothing is left to resume.
     const cleared_bytes = try testJournal(alloc, &.{ .{ .turn_committed = first }, .{ .turn_progress = .{ .checkpoint = progress } }, .turn_progress_cleared });
     defer alloc.free(cleared_bytes);
     var cleared = try fold(alloc, cleared_bytes);
@@ -989,7 +963,6 @@ test "compaction during a turn leaves the turn open" {
     defer open.deinit(alloc);
     try std.testing.expectEqualStrings("long task", open.open_turn.?.user.text);
 
-    // Only a commit or a clear ends it.
     const cleared_bytes = try testJournal(alloc, &.{ .{ .turn_progress = .{ .checkpoint = progress } }, .{ .history_replaced = &.{kept} }, .turn_progress_cleared });
     defer alloc.free(cleared_bytes);
     var cleared = try fold(alloc, cleared_bytes);
@@ -1049,7 +1022,6 @@ test "a call the open turn already answered is no longer running" {
     defer after.deinit(alloc);
     const read_calls = [_]types.ToolCall{.{ .id = "call-read", .name = "read_file", .arguments_json = "{}" }};
     const send_calls = [_]types.ToolCall{.{ .id = "call-send", .name = "send_email", .arguments_json = "{}" }};
-    // Progress before the second request holds the read's result.
     const results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-read"),
         .tool_name = @constCast("read_file"),
@@ -1134,8 +1106,6 @@ test "a progress that carries only what is new folds into the same turn as one t
     defer folded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), folded.running_calls.len);
 
-    // A version 1 event never extends another, and a delta extends only the
-    // progress right before it, whose state it needs.
     const as_v1 = try std.mem.replaceOwned(u8, alloc, extended, "{\"v\":2", "{\"v\":1");
     defer alloc.free(as_v1);
     try std.testing.expectError(error.InvalidJournal, fold(alloc, as_v1));
@@ -1175,7 +1145,6 @@ test "a call whose result was recorded as it finished is answered by it" {
     try std.testing.expectEqualStrings("sent", folded.finished[0].output);
     try std.testing.expect(!folded.finished[0].failed);
 
-    // A host may leave out a result's state; it then answers nothing.
     const left_out = try std.mem.replaceOwned(u8, alloc, bytes, "\"data\":{\"id\":\"call-a\",\"name\":\"send_email\",\"status\":\"success\",\"output\":\"sent\"}", "\"data\":null");
     defer alloc.free(left_out);
     try std.testing.expect(!std.mem.eql(u8, left_out, bytes));
@@ -1222,7 +1191,6 @@ test "a yield stands until the open turn does anything more, and needs an open t
     try std.testing.expect(open.open_turn != null);
     try std.testing.expect(open.yielded);
 
-    // The resumed turn's next progress, or its end, supersedes the yield.
     const resumed = try testJournal(alloc, &.{
         .{ .turn_progress = .{ .checkpoint = progress } },
         .turn_yielded,
@@ -1260,13 +1228,10 @@ test "an empty journal is a new session" {
 test "a journal with a gap, a repeat, or a wrong turn is rejected" {
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
-        // seq starts at 1
         \\[{"v":1,"seq":2,"turn":1,"type":"turn_progress_cleared"}]
         ,
-        // a stored event repeated by a retried append
         \\[{"v":1,"seq":1,"turn":1,"type":"turn_progress_cleared"},{"v":1,"seq":1,"turn":1,"type":"turn_progress_cleared"}]
         ,
-        // the turn number must follow commits
         \\[{"v":1,"seq":1,"turn":2,"type":"turn_progress_cleared"}]
         ,
     };
@@ -1446,7 +1411,6 @@ test "a snapshot and the events after it fold into the same session as every eve
     var replayed = try fold(alloc, full);
     defer replayed.deinit(alloc);
 
-    // A snapshot after the first commit, then the tail from seq 2.
     const snapshot = try encodeSnapshot(alloc, 1, 2, null, null, "checkpoint-bytes");
     defer alloc.free(snapshot);
     const parsed = try parseSnapshot(snapshot);
@@ -1475,7 +1439,6 @@ test "a snapshot and the events after it fold into the same session as every eve
     try std.testing.expect(resumed.open_turn != null);
     try std.testing.expectEqualStrings("read the other", resumed.open_turn.?.user.text);
 
-    // The tail must continue the snapshot.
     try std.testing.expectError(error.OutOfOrderJournalEvent, foldFrom(alloc, full, .{
         .history = &.{first},
         .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
@@ -1525,7 +1488,6 @@ test "a snapshot carries the last turn's id to the turns after it" {
     try std.testing.expectEqualStrings("turn-a", parsed.last_turn_id.?);
     try std.testing.expectEqualStrings("checkpoint-bytes", parsed.checkpoint);
 
-    // A turn opened after the snapshot leaves the snapshot's last turn as the last.
     var progress = try testProgress(alloc, "keep going");
     defer progress.deinit(alloc);
     var tail_out: std.Io.Writer.Allocating = .init(alloc);
@@ -1539,7 +1501,6 @@ test "a snapshot carries the last turn's id to the turns after it" {
     try std.testing.expectEqualStrings("turn-a", folded.last_turn_id.?);
     try std.testing.expectEqualStrings("turn-b", folded.open_turn_id.?);
 
-    // An id length that runs past the bytes is refused.
     const cut = try alloc.dupe(u8, snapshot[0 .. snapshot_header_bytes + 2]);
     defer alloc.free(cut);
     cut[snapshot_header_bytes - 1] = 3;
@@ -1564,7 +1525,6 @@ test "a snapshot where a turn yielded restores the turn, and the events after it
         .open_turn = parsed.open_turn,
     };
 
-    // With nothing after it, the turn is open, yielded, and keeps its name.
     var alone = try foldFrom(alloc, "[]", base);
     defer alone.deinit(alloc);
     try std.testing.expect(alone.yielded);
@@ -1572,8 +1532,6 @@ test "a snapshot where a turn yielded restores the turn, and the events after it
     try std.testing.expectEqualStrings("turn-y", alone.open_turn_id.?);
     try std.testing.expectEqualStrings("turn-a", alone.last_turn_id.?);
 
-    // A steer accepted after it is placed by the next progress, and the
-    // turn then commits under its name.
     const turn = try testTurn(alloc, "keep going", "done");
     defer types.freeHistoryTurn(alloc, turn);
     var tail_out: std.Io.Writer.Allocating = .init(alloc);
@@ -1613,22 +1571,18 @@ test "a snapshot's open turn that is cut short, empty, or not a turn is refused"
     try writeOpenTurn(&open_out.writer, null, progress);
     const snapshot = try encodeSnapshot(alloc, 5, 2, null, open_out.written(), "");
     defer alloc.free(snapshot);
-    // A quiet snapshot stays version 1; one with an open turn is version 2.
     try std.testing.expectEqual(snapshot_version, snapshot[snapshot_magic.len]);
     const quiet = try encodeSnapshot(alloc, 5, 2, null, null, "");
     defer alloc.free(quiet);
     try std.testing.expectEqual(snapshot_version_quiet, quiet[snapshot_magic.len]);
     try std.testing.expect((try parseSnapshot(quiet)).open_turn == null);
 
-    // The open turn's length runs past the bytes.
     try std.testing.expectError(error.InvalidJournal, parseSnapshot(snapshot[0 .. snapshot.len - 1]));
     try std.testing.expectError(error.InvalidJournal, parseSnapshot(snapshot[0 .. snapshot_header_bytes + 2]));
-    // An empty open turn.
     const empty = try alloc.dupe(u8, snapshot);
     defer alloc.free(empty);
     std.mem.writeInt(u32, empty[snapshot_header_bytes..][0..4], 0, .little);
     try std.testing.expectError(error.InvalidJournal, parseSnapshot(empty));
-    // An open turn with no progress, or a turn id that is not one.
     try std.testing.expectError(error.InvalidJournal, foldFrom(alloc, "[]", .{ .cursor = .{ .next_seq = 6, .turn = 2 }, .open_turn = "{}" }));
     try std.testing.expectError(error.InvalidJournal, foldFrom(alloc, "[]", .{ .cursor = .{ .next_seq = 6, .turn = 2 }, .open_turn = "{\"turnId\":7,\"progress\":{}}" }));
     try std.testing.expectError(error.InvalidJournal, foldFrom(alloc, "[]", .{ .cursor = .{ .next_seq = 6, .turn = 2 }, .open_turn = "not json" }));
@@ -1670,7 +1624,6 @@ test "a turn's first progress names it, and the turn keeps that name until it en
         .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "t1" } },
         .{ .turn_committed = turn },
         .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "t2" } },
-        // A later progress of the same turn does not rename it.
         .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "other" } },
     });
     defer alloc.free(bytes);
@@ -1679,7 +1632,6 @@ test "a turn's first progress names it, and the turn keeps that name until it en
     try std.testing.expectEqualStrings("t1", folded.last_turn_id.?);
     try std.testing.expectEqualStrings("t2", folded.open_turn_id.?);
 
-    // A turn the host gave no id leaves none, and a cleared turn ends like a commit.
     const unnamed = try testJournal(alloc, &.{
         .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "t1" } },
         .turn_progress_cleared,

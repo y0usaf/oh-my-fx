@@ -1,11 +1,3 @@
-// /fork (D58) through the real binary in a terminal, judged by TLC. Each
-// scenario drives fx in tmux, then check_runtime.py has TLC check what it
-// left: every process's wiring trace against
-// tests/tla/session_manager/Wiring.tla (Fork with ForkIsNewSession,
-// ForkLeavesSource and ForkBetweenTurns), each saved log against
-// TurnLifecycle, and each fork's log against trace/ForkLog.tla: the
-// source's first lines byte for byte, ending at a turn boundary. Faults
-// planted into a kept run must be rejected.
 import { expect, test } from "bun:test";
 import assert from "node:assert/strict";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -139,7 +131,6 @@ const titles = (log: any[]) => log.filter(line => line.kind === "set" && line.ke
 const turnsIn = (log: any[]) => log.filter(line => line.kind === "turn_committed").length;
 
 const ANSWERS = { "Fork prompt one.": "FORK_ONE", "Fork prompt two.": "FORK_TWO", "Fork prompt three.": "FORK_THREE", "A new prompt in the fork.": "FORK_NEW" };
-// The run the planted faults below are made from.
 let kept: { root: string; sessions: string; wiring: string; source: string; fork: string; processes: Process[] } | null = null;
 
 scenario("a fork before the middle prompt holds the turns before it, and the source is unchanged", async f => {
@@ -212,9 +203,6 @@ scenario("/fork while a turn runs waits for it and forks nothing", async f => {
   requireAccepted(await f.judge(["turns", "wiring"]));
 });
 
-// The model forks only with no child running (ForkBetweenTurns). A subagent
-// the parent's reply to steering left working keeps that turn open, so /fork
-// must wait for it too.
 scenario("/fork while a subagent still works after steering waits for it", async f => {
   const child = heldFakeGatewayFinalText();
   let childAsked = false;
@@ -284,8 +272,6 @@ scenario("/fork with no prompt yet says so and saves nothing", async f => {
   requireAccepted(await f.judge(["wiring"], []));
 });
 
-// Without --sessions-v2 fx never opens the session manager, so there is no
-// trace for TLC to judge: the check is that none was written.
 scenario("/fork without --sessions-v2 says it needs it and never opens the session manager", async f => {
   f.script(byLatestPrompt(ANSWERS));
   const app = await f.app([], false);
@@ -296,9 +282,6 @@ scenario("/fork without --sessions-v2 says it needs it and never opens the sessi
   expect(f.sessions()).toHaveLength(0);
   expect(existsSync(f.trace) ? readFileSync(f.trace, "utf8") : "").toBe("");
 });
-
-// Planted faults, made from the first scenario's kept run: each copy changes
-// one thing the model forbids, and TLC must reject it.
 
 function crc32c(data: Buffer): number {
   let crc = 0xffffffff;

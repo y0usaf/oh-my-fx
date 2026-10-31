@@ -1,11 +1,6 @@
-// Shared pieces of the runtime bridge: the ACP stdio client, the
-// client-visible projection of configOptions, the lane a Gateway request
-// asks for, and TLC trace validation against tests/tla/acp/AcpSpeedTrace.tla.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runTlc, sha256Text, writeJson } from "./tlc";
-
-// ------------------------------------------------------------ observation --
 
 export type View = { model: string; fast: string; ultra: string };
 export type Observation = { op: string; arg: string; ok: boolean; speed: string; hasView: boolean; view: View; detail?: unknown };
@@ -34,8 +29,6 @@ export function laneOf(body: string): string {
     return "unparseable";
   }
 }
-
-// -------------------------------------------------------------- ACP client --
 
 export class Acp {
   private buffer = "";
@@ -112,8 +105,6 @@ export class Acp {
     return { exit, stderr: this.stderr };
   }
 }
-
-// ---------------------------------------------------------------- TLC side --
 
 const tla = (value: string) => JSON.stringify(value);
 const tlaSet = (values: string[]) => `{${values.map(tla).join(", ")}}`;

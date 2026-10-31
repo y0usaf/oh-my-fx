@@ -1,11 +1,3 @@
-// Run context for the Bun drivers written as `bun test` files: which fx
-// checkout and binary they drive, where their output goes, and the E2E helpers
-// they borrow from tests/e2e/.
-//
-//   FX_WORKTREE    checkout under test (default: this one)
-//   FX_BIN         binary under test (default: <checkout>/zig-out/bin/fx)
-//   FX_TLA_OUT     output root (default: a folder under the system temp dir)
-//   FX_TLA_REPEAT  how many times a repeatable check runs (default: 1)
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";

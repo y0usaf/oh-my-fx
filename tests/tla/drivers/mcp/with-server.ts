@@ -1,14 +1,3 @@
-// Runs an HTTP server and a client together, as one command for the driver
-// (U06). The server is started first, the client runs against it, and the
-// server is stopped before this exits, with the client's exit code. Nothing
-// outlives the run.
-//
-// Usage: bun tests/tla/drivers/mcp/with-server.ts [--env K=V ...] [--port <n>] -- <server argv...> -- <client argv...>
-//
-// The server either prints a JSON line {"listening": <port>} (the fake HTTP
-// server does), or, when an argument is `{port}`, gets a free port there, or
-// listens on the fixed `--port`; the last two are polled until they accept
-// connections. Client arguments may contain `{port}`.
 
 function freePort(): number {
   const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });

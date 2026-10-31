@@ -250,7 +250,6 @@ test "session files open without waiting on a FIFO" {
     if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
     defer dir.close();
-    // A blocking open of a FIFO waits for a writer that never comes.
     for ([_]session_log.OpenMode{ .read_only, .writable }) |mode| {
         try std.testing.expectError(error.SessionPathUnsafe, openSessionFile(&dir, "events.jsonl", mode));
     }

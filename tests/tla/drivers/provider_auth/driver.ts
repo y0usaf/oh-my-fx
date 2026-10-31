@@ -1,9 +1,3 @@
-// Runs a target worktree's real credential edge (the authorizer libfx's
-// transportFetch calls) through scripted scenarios, recording each event in
-// the vocabulary of ProviderAuth's `ev`. Every endpoint is a local fake; the
-// fakes follow the model's rules: the issuer rotates refresh tokens and
-// refuses spent ones, the provider rejects the host's first token when the
-// scenario says so, and userinfo answers with a token's real account.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Setup } from "./tlc";
@@ -56,7 +50,6 @@ export async function loadEdge(worktree: string) {
     };
   }
   const { createChatgptAuthorizer, isCodexRequest } = await import(join(sdk, "chatgpt.js"));
-  // Before #1210 the authorizer took the credentials callback as `chatgpt`.
   const legacy = (await Bun.file(join(sdk, "chatgpt.js")).text()).includes("createChatgptAuthorizer({ chatgpt,");
   return {
     shape: legacy ? ("chatgpt-legacy" as const) : ("chatgpt" as const),
@@ -154,14 +147,12 @@ export async function runScenario(
   const holds = new Map<string, ReturnType<typeof gate>>();
   const arrivals = new Map<string, ReturnType<typeof gate>>();
   const arrival = (r: string) => { if (!arrivals.has(r)) arrivals.set(r, gate()); return arrivals.get(r)!; };
-  // The redemption a failing refresh task ran, per engine, until its failure is recorded.
   const failing = new Map<string, number>();
   const ep = endpoints[provider];
 
   const authorizers = new Map<string, ReturnType<typeof edge.create>>();
   if (setup.sharedMemory && !edge.memory) throw new Error("this worktree has no shared credential memory");
   const shared = setup.sharedMemory ? edge.memory!() : undefined;
-  // One lock for every engine, as servers sharing a host lock would have.
   let held: Promise<unknown> = Promise.resolve();
   const refreshLock = (_info: unknown, refresh: () => Promise<void>) => {
     const run = held.then(refresh);
@@ -192,7 +183,6 @@ export async function runScenario(
         const at = tokenNumber(provider, new Headers(init.headers).get("authorization"));
         const acct = acctOf.get(at) ?? "none";
         events.push({ k: "verify", e: engine, at, acct });
-        // The task fails if the account changed; otherwise it goes on to save.
         if (acct === "A") failing.delete(engine);
         return Response.json({ sub: `acct-${acct}`, email: "user@example.com" });
       }
@@ -251,7 +241,6 @@ export async function runScenario(
     arrived(r) { return arrival(r).opened; },
   };
   await script(world);
-  // `bypass` is recorded after the call returns; the model records it on entry.
   for (let n = 0; n < events.length; n++) {
     const event = events[n]!;
     if (event.k !== "bypass") continue;

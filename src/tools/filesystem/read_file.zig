@@ -11,11 +11,8 @@ const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
 
-// Allow freshness snapshots for files larger than read_file can show the model.
 const max_snapshot_file_bytes: usize = 10 * 1024 * 1024;
-// Keep one tool result under common model input limits without a tokenizer.
 const max_model_output_bytes: usize = 256 * 1024;
-// Bound tiny-line files so one read cannot dominate a turn.
 const max_line_count: usize = 2000;
 const line_truncated_suffix = "... (line truncated)";
 

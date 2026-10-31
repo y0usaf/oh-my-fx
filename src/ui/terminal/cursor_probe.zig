@@ -14,9 +14,6 @@ pub const Protocol = enum {
     ansi_tagged,
 };
 
-// A resize probe emits adjacent reports at columns 1 and 2. A single
-// CPR-shaped input sequence is forwarded; only the matching pair is terminal
-// protocol traffic.
 pub const first_tag_column: u16 = 1;
 pub const confirmation_tag_column: u16 = 2;
 const max_response_bytes = 16;

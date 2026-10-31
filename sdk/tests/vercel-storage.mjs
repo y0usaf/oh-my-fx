@@ -1,13 +1,3 @@
-// Vercel's World for runs, events and streams, with world-local's queue in
-// this process, for tests that drive libfx from one machine: they and the
-// processes they crash receive their own messages, while every record, lease
-// and stream line goes through Vercel. Delivery through Vercel Queues is
-// covered by the deployed demo.
-//
-// Needs a Vercel access token in WORKFLOW_VERCEL_AUTH_TOKEN, and
-// VERCEL_PROJECT_ID, VERCEL_PROJECT_NAME, VERCEL_TEAM_ID and a
-// VERCEL_DEPLOYMENT_ID of that project. This local fixture uses the
-// api-workflow proxy, which does not accept a deployment's OIDC token.
 import { local } from "../durable/local.mjs";
 
 const required = ["WORKFLOW_VERCEL_AUTH_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_PROJECT_NAME", "VERCEL_TEAM_ID", "VERCEL_DEPLOYMENT_ID"];
@@ -26,7 +16,6 @@ export function vercelStorage(options) {
     name: "vercel",
     world() {
       const queued = base.world();
-      // The deadline the test sets, not a function's.
       const { getRuntimeDeadline, ...stored } = createWorld({
         ...(process.env.WORKFLOW_VERCEL_AUTH_TOKEN ? { token: process.env.WORKFLOW_VERCEL_AUTH_TOKEN } : {}),
         projectConfig: {

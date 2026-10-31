@@ -241,7 +241,6 @@ fn prepareInternal(
         return .{ .semantic_failure = total_content_too_large_message };
     }
 
-    // External anchors show the resolved target so a symlink redirect cannot look local.
     const approval_path = switch (policy_targets.anchor.scope) {
         .external => policy_targets.canonical_target_path,
         .workspace => input.path(),
@@ -612,9 +611,6 @@ fn applyWithTestControls(
         return error.ResultContractViolation;
     }
 
-    // The fresh descriptor binds the final entry checks and rename to the
-    // revalidated parent. The platform cannot freeze its namespace after
-    // these checks, so a competing move can still win the remaining window.
     commit_parent.rename(
         temp_name,
         commit_parent,
@@ -1973,8 +1969,6 @@ test "prepare preserves exact edit semantic failures" {
 test "zero-occurrence edit failure explains recovery and leaves the file untouched" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The field is already gone, so a repeated removal must fail with
-    // guidance rather than a bare mismatch.
     try createFile(&tmp, "strategy.ts", "export interface RacePlan {\n  laps: number;\n}\n");
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

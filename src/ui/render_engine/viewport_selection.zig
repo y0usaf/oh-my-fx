@@ -458,9 +458,6 @@ fn selectTail(line_visual_rows: []const u16, visible_rows: u16) TailSelection {
     while (start_line > 0) {
         const line_rows = line_visual_rows[start_line - 1];
         if (line_rows > rows_budget) {
-            // Include the overflowing predecessor partially so the top
-            // of the viewport is painted with current content instead
-            // of exposing stale cells from a previous frame.
             if (rows_budget > 0) {
                 start_line -= 1;
                 partial_skip_rows = line_rows - rows_budget;

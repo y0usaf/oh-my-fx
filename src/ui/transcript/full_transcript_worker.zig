@@ -154,7 +154,6 @@ pub const Source = struct {
 pub const InstalledSource = struct {
     request: full_transcript_page.Request,
     range: full_transcript_page.SourceRange,
-    // Stored projection segments borrow the snapshot's result and handle bytes.
     details: std.ArrayList(transcript_blocks.ToolDetailRecord) = .empty,
     capability: ?session_child_store.SessionChildCapability = null,
 
@@ -425,7 +424,6 @@ test "installed projection retains saved output and fallback after source dispos
     try std.testing.expect(std.mem.find(u8, rendered, "SAVED_TAIL") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "Full saved result unavailable.") == null);
 
-    // A newly built view must still have a readable preview if the file disappears.
     try result_store.deleteManaged(&installed.capability.?, installed.details.items[0].result_handle.?);
     var missing = try full_transcript_screen.buildProjection(
         alloc,

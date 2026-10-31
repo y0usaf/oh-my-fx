@@ -14,7 +14,6 @@ LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/ll
 LIBLLVM = (LLVM_BIN.parent / "lib" / "libLLVM.dylib").resolve()
 AVAILABLE = (LLVM_BIN / "llvm-as").is_file() and LIBLLVM.is_file()
 
-# The production module layout; alignment decisions depend on it.
 TARGET = (
     'target datalayout = "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"\n'
     'target triple = "aarch64-apple-macosx15.0.0-unknown"\n'
@@ -134,7 +133,6 @@ class IrSizeTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn('"marked_functions": 5', result.stdout)
-        # The pipeline validates this output before it records the identity.
         _require_bitcode_header(output)
         ir = subprocess.run(
             [str(LLVM_BIN / "llvm-dis"), str(output), "-o", "-"], check=True, capture_output=True, text=True

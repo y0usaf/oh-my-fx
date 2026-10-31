@@ -62,7 +62,6 @@ async function runPrompt(agent) {
   return turn.result;
 }
 
-// A model with an advertised fast path accepts fast and sends it on the wire.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: { id: "sdk/fast-model", fast: true } });
@@ -74,7 +73,6 @@ async function runPrompt(agent) {
   await agent.close();
 }
 
-// An intrinsically fast model already satisfies fast: true.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/intrinsic-model-fast", fast: true });
@@ -84,7 +82,6 @@ async function runPrompt(agent) {
   await agent.close();
 }
 
-// A model without a fast path rejects fast: true and names the model.
 {
   const gateway = mockGateway();
   await assert.rejects(
@@ -101,8 +98,6 @@ async function runPrompt(agent) {
   assert.equal(gateway.state.catalogFetches, 1);
 }
 
-// An unsupported model option in auto mode is a product error, not a reason
-// to retry creation on another backend.
 if (backend === "native") {
   const gateway = mockGateway();
   await assert.rejects(
@@ -112,7 +107,6 @@ if (backend === "native") {
   assert.equal(gateway.state.catalogFetches, 1);
 }
 
-// Non-boolean fast values are rejected before any runtime or network work.
 {
   const gateway = mockGateway();
   await assert.rejects(
@@ -127,7 +121,6 @@ if (backend === "native") {
   assert.equal(gateway.state.chatBodies.length, 0);
 }
 
-// Disabling fast needs no validation fetch and sends no speed key.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/fast-model", fast: false });
@@ -137,7 +130,6 @@ if (backend === "native") {
   await agent.close();
 }
 
-// Without the option, creation and prompts behave exactly as before.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/fast-model" });

@@ -116,13 +116,8 @@ pub fn resolve(
                 };
             }
         }
-        // Slack registers no clients: without an app of the user's own, fx's
-        // Slack app signs in, through fx.sh as v1 did.
         if (auth.client_id == null and slack.isSlack(s.url)) auth.client_id = slack.client_id;
         s.bridge = if (auth.client_id) |id| std.mem.eql(u8, id, slack.client_id) else false;
-        // fx.sh asks Slack for the resource with a trailing slash, so the
-        // token exchange asks for the same; MCP-v2 takes it only if it is
-        // the server's own.
         if (s.bridge and auth.resource == null) if (s.url) |url| {
             auth.resource = try arena.print("{s}/", .{origin(url)});
         };
@@ -165,9 +160,7 @@ fn transportFor(
             const argv = try arena.alloc([]const u8, 1 + c.args.len);
             argv[0] = c.command orelse return null;
             @memcpy(argv[1..], c.args);
-            // An editor's project server starts in its project.
             const cwd = if (c.cwd) |dir| try arena.dupe(u8, dir) else null;
-            // No map means the process gets fx's environment as it is.
             if (c.env.len == 0) return .{ .stdio = .{ .argv = argv, .cwd = cwd } };
             const map = try arena.create(std.process.Environ.Map);
             map.* = try inherited.clone(arena);

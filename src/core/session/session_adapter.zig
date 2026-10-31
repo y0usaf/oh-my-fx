@@ -123,9 +123,6 @@ pub const ChildLine = union(enum) {
     finished: struct { child: []const u8, work_id: []const u8, outcome: ChildOutcome, data: ?[]const u8 = null },
 };
 
-// ---------------------------------------------------------------------------
-// Wiring trace
-
 /// One step of `Wiring.tla`, as a `wiring` trace line that trace validation
 /// reads back: the store opening and closing (the process's start and
 /// exit), a host session opening and closing, and the turn and child lines
@@ -138,9 +135,6 @@ fn processId() i64 {
     if (comptime builtin.target.os.tag == .wasi) return 0;
     return std.c.getpid();
 }
-
-// ---------------------------------------------------------------------------
-// Store: one per process
 
 pub const Store = struct {
     manager: *sm.Manager,
@@ -168,8 +162,6 @@ pub const Store = struct {
 
     /// Touches no disk: a session's folder appears with its first turn.
     pub fn open(alloc: Allocator, home: []const u8) !Store {
-        // Resolved as v1 resolves its sessions root, so a home reached
-        // through a symlink (macOS `/var`) passes the no-follow opens below.
         const owned_home = io_mod.realpathAlloc(alloc, home) catch |err| blk: {
             debug_trace.logf("session", "event=sessions_v2_home_unresolved err={s} using=given", .{@errorName(err)});
             break :blk try alloc.dupe(u8, home);
@@ -368,9 +360,6 @@ fn traceDiagnostic(_: ?*anyopaque, event: sm.Diagnostic) void {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Commands: `fx session {id}`, `fx session recover`, doctor
-
 /// What the session commands report, in the names fx's CLI knows.
 pub const CommandError = error{
     SessionNotFound,
@@ -395,7 +384,6 @@ pub fn commandError(err: anyerror) CommandError {
         error.Busy, error.SessionBusy => error.SessionBusy,
         error.UnsupportedVersion => error.UnsupportedSessionSchema,
         error.Corrupt => error.InvalidSessionFormat,
-        // `recover` of a session whose first turn never ended whole (D15).
         error.InvalidForkPoint => error.SessionRecoveryBoundaryInvalid,
         error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
@@ -470,7 +458,6 @@ pub fn listPage(
     for (v1_roots.summaries.items) |summary| {
         if (workspace) |root| if (!std.mem.eql(u8, summary.workspace_root orelse continue, root)) continue;
         if (continuation) |position| if (!session_summary_codec.summaryFollowsContinuation(summary, position)) continue;
-        // After `limit` newer ones, this one and every later one is off the page.
         if (countBefore(candidates.items[0..v2_count], summary) + added > limit) break;
         if (holdsV2(store, alloc, summary.id)) continue;
         try candidates.ensureUnusedCapacity(alloc, 1);
@@ -496,8 +483,6 @@ fn v2Window(
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const filter: sm.Filter = if (workspace) |root| .{ .workspace = root } else .all;
-    // From the continuation's time with its ties: those v1 orders first
-    // are dropped below.
     var cursor: ?sm.ListCursor = if (continuation) |position| .{ .updated_ms = std.math.cast(u64, position.updated_at_ms) orelse return } else null;
     var kept: usize = 0;
     var cut: ?u64 = null;
@@ -550,7 +535,6 @@ pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    // Line 1 names the session's kind and workspace, however damaged the rest is.
     var first = store.manager.read(sa, id, .start, .forward, 1) catch |err| return switch (err) {
         error.NotFound, error.InvalidArgument => error.SessionNotFound,
         else => err,
@@ -638,9 +622,6 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
     try store.sweepFiles(alloc, &report, now_ms);
     return report;
 }
-
-// ---------------------------------------------------------------------------
-// Session: one per open session
 
 /// Settings a new session starts with; held in memory until its first turn.
 pub const Seed = struct {
@@ -823,7 +804,6 @@ const BlobHost = struct {
         var names: std.ArrayList([]const u8) = .empty;
         try names.ensureTotalCapacity(arena, host.records.count() + host.moved.count());
         for (host.records.keys()) |name| names.appendAssumeCapacity(try arena.dupe(u8, name));
-        // `movedFolder(.tool_results)`'s names.
         const prefix = "tool-results/";
         var moved = host.moved.keyIterator();
         while (moved.next()) |key| {
@@ -863,7 +843,6 @@ const BlobHost = struct {
     const RecordsDue = struct { map_json: []const u8, added: []const Hash, generation: u64 };
 
     fn storeFailed(host: *BlobHost, err: sm.AppendError) session_child_store.BlobError {
-        // A body is stored only while the session is on disk (D44).
         if (err == error.InvalidTransition) debug_trace.logf("session", "event=sessions_v2_body_before_turn session={s}", .{host.id});
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -1036,9 +1015,6 @@ pub const Session = struct {
     import_ts: ?u64 = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
-        // Every v2 write needs a writable open, and both start here or in
-        // resumeSession: E2E tests use this to prove read-only paths never
-        // reach one.
         io_mod.e2eFailIfDurableMutationAttempted();
         const handle = try newHandle(store, workspace, host);
         errdefer handle.release();
@@ -1096,7 +1072,6 @@ pub const Session = struct {
             defer scratch.deinit();
             const state = try handle.state(scratch.allocator());
             self.last_turn = state.last_turn;
-            // Every child starts with its preferences (`appendSeed`).
             const raw = state.prefs orelse return error.InvalidSessionFormat;
             self.instructions = try decodeInstructions(alloc, raw);
             if (seed.instructions.len > 0 and !std.mem.eql(u8, seed.instructions, self.childInstructions())) {
@@ -1157,13 +1132,10 @@ pub const Session = struct {
     /// D61, `tests/tla/session_manager/V1Conversion.tla`): every host opens through here.
     fn resumeWaiting(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host, lock_wait_ms: ?u64) !*Session {
         io_mod.e2eFailIfDurableMutationAttempted();
-        // A reason belongs to this open only, never an earlier one's.
         store.problem = .{};
         const started = io_mod.nanoTimestamp();
         switch (target) {
             .id => |session_id| return openOrConvert(alloc, store, session_id, workspace, host, lock_wait_ms, started),
-            // The newest of the listing, which holds v1's unconverted roots
-            // too (D61).
             .last => {
                 const newest = (try newestListed(store, alloc, workspace)) orelse return error.NoSavedSessions;
                 defer alloc.free(newest);
@@ -1176,7 +1148,6 @@ pub const Session = struct {
                     error.NotFound => {},
                     else => return resumeError(err, target),
                 }
-                // v1's remembered session, when v2 has none (D56).
                 const remembered = (try v1_conversion.rememberedId(alloc, store.home, workspace)) orelse return error.NoRememberedSession;
                 defer alloc.free(remembered);
                 return openOrConvert(alloc, store, remembered, workspace, host, lock_wait_ms, started);
@@ -1200,7 +1171,6 @@ pub const Session = struct {
         defer conversion.deinit();
         const outcome = try conversion.family(session_id, lock_wait_ms orelse v1_conversion.lock_wait_ms);
         const handle = store.manager.openResume(resume_options) catch |err| return resumeError(err, target);
-        // Held: another process converted it, and may have left v1 state.
         const self = try opened(alloc, store, handle, outcome == .held);
         if (outcome == .converted) {
             const ms = @as(f64, @floatFromInt(io_mod.nanoTimestamp() - started)) / std.time.ns_per_ms;
@@ -1310,7 +1280,6 @@ pub const Session = struct {
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
-        // Before `release`: the id lives in the handle.
         if (!self.saved()) self.removeUnsavedFiles();
         self.handle.release();
         self.destroyInner();
@@ -1364,8 +1333,6 @@ pub const Session = struct {
         self.running.clearRetainingCapacity();
     }
 
-    // -- bodies --------------------------------------------------------------
-
     /// The capability over this session's blobs (D44): it stores and reads
     /// large bodies, routes terminal state to `~/.fx/terminal/{id}` (D45),
     /// and has no side folder. Borrowed until `close`.
@@ -1382,8 +1349,6 @@ pub const Session = struct {
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
     }
-
-    // -- turns ---------------------------------------------------------------
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
     /// is a blob of a session on disk (D44). Caller holds the mutex.
@@ -1433,7 +1398,6 @@ pub const Session = struct {
         for (execution.tool_steps) |step| for (step.tool_results) |*result| {
             if (result.output_handle != null) continue;
             const stored = self.stored_results.get(result.tool_call_id) orelse continue;
-            // The name is the content's hash, so a match means the same bytes.
             const handle = try result_store.blobHandle(self.alloc, result.output);
             if (!std.mem.eql(u8, handle, stored)) {
                 self.alloc.free(handle);
@@ -1459,7 +1423,6 @@ pub const Session = struct {
         const pieces = events.items[0 .. events.items.len - 1];
         const end = events.items[events.items.len - 1];
 
-        // The end piece joins the others; its line ends the turn.
         const all = events.items;
         const encoded = try a.alloc([]u8, all.len);
         for (all, encoded) |piece, *bytes| bytes.* = try encodePiece(a, piece);
@@ -1477,8 +1440,6 @@ pub const Session = struct {
         const language_tag = language.view();
         const language_changed = self.language == null or !std.mem.eql(u8, self.language.?, language_tag);
         if (language_changed) try tail.append(a, .{ .set = .{ .key = .language, .value = try jsonString(a, language_tag) } });
-        // A new session's first turn names it, or a resumed one's first
-        // prompt, which a crash may have left in an interrupted turn (D52).
         const derived_title = if (!self.root or self.titled)
             null
         else if (self.first_title) |title|
@@ -1523,9 +1484,7 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
-        // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
-        // On a missing handle the list keeps the pieces before it.
         session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
             else => return err,
@@ -1597,7 +1556,6 @@ pub const Session = struct {
                     try self.stored_results.put(self.alloc, key, stored);
                     break :blk stored;
                 };
-                // Copied: a superseded turn frees the cache before its pieces are written.
                 result.output_handle = try a.dupe(u8, handle);
                 result.stored_output_bytes = result.output.len;
                 if (result.preview == null) result.preview = try result_store.previewText(a, result.output, result_store.preview_bytes);
@@ -1633,8 +1591,6 @@ pub const Session = struct {
         self.last_turn += 1;
         self.turn_open = true;
     }
-
-    // -- a conversion's import (D56) -----------------------------------------
 
     /// Writes a turn as v1 framed it: its pieces, then its end. One v1
     /// never ended gets the end v1's next writable open gives it, a failed
@@ -1724,8 +1680,6 @@ pub const Session = struct {
         };
     }
 
-    // -- compaction ----------------------------------------------------------
-
     /// Records a compaction. The history after it starts with the summary,
     /// then the retained turns, which the log already holds.
     pub fn commitCompaction(
@@ -1758,7 +1712,6 @@ pub const Session = struct {
             .keep_from_turn = keep_from,
         };
         _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
-        // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
         errdefer kept.deinit(self.alloc);
         try kept.append(self.alloc, null);
@@ -1780,15 +1733,11 @@ pub const Session = struct {
         return numbers.len;
     }
 
-    // -- settings ------------------------------------------------------------
-
     pub fn setPreferences(self: *Session, preferences: session_codec.DurableSessionPreferences) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
     }
-
-    // -- children (D22) ------------------------------------------------------
 
     /// Every child of this session as its log folds them, in first-spawn
     /// order. Free with `freeChildren`.
@@ -1841,8 +1790,6 @@ pub const Session = struct {
         defer self.alloc.free(value);
         _ = try self.write(&.{.{ .set = .{ .key = .permissions, .value = value } }});
     }
-
-    // -- an ACP client's settings (D46) ---------------------------------------
 
     /// The system prompt the ACP client gave this session, or null. Caller
     /// owns it.
@@ -1927,8 +1874,6 @@ pub const Session = struct {
         self.titled = true;
         return true;
     }
-
-    // -- resume --------------------------------------------------------------
 
     /// Rebuilds fx's history and settings from the open log (`restoreFrom`),
     /// and keeps what later appends compare against: the last turn, the turn
@@ -2087,8 +2032,6 @@ pub const Session = struct {
         return .{ .store = self.store, .id = self.id(), .handle = self.handle, .host = self.host, .files_path = self.files_path };
     }
 
-    // -- the move off the side folder (D47) -----------------------------------
-
     /// Makes an older session one manager folder (D47,
     /// `tests/tla/session_manager/MoveSideFiles.tla`) on its first writable
     /// open, then loads the map its old handles resolve through. Every body
@@ -2113,7 +2056,6 @@ pub const Session = struct {
             break :blk try self.moveOut(&side);
         };
         files_root.dir.deleteTree(io_mod.getIo(), self.id()) catch |err| {
-            // The next open redoes the move; every step is repeatable.
             debug_trace.logf("session", "event=sessions_v2_move_folder_kept session={s} err={s}", .{ self.id(), @errorName(err) });
             return;
         };
@@ -2169,8 +2111,6 @@ pub const Session = struct {
         const Value = struct { map: []const u8 };
         const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
         const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
-            // A lost or damaged map damages the session, as a lost blob
-            // does (D39); its old handles read as gone.
             error.NotFound, error.Corrupt, error.InvalidArgument => {
                 debug_trace.logf("session", "event=sessions_v2_moved_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
                 return;
@@ -2197,8 +2137,6 @@ pub const Session = struct {
         const Value = struct { map: []const u8 };
         const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
         const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
-            // A lost or damaged map damages the session, as a lost blob
-            // does (D39); its records read as gone.
             error.NotFound, error.Corrupt, error.InvalidArgument => {
                 debug_trace.logf("session", "event=sessions_v2_records_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
                 return;
@@ -2263,8 +2201,6 @@ fn sideFileLines(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, fo
 
     var events: std.ArrayList(sm.Event) = .empty;
     const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
-    // One line per chunk of blobs keeps each line well under the limit;
-    // the last one names the map, so the value is the same on each.
     var refs: std.ArrayList([]const u8) = .empty;
     try refs.appendSlice(a, moved.values());
     try refs.append(a, map_hash);
@@ -2354,7 +2290,6 @@ fn putBodies(handle: sm.Session, bodies: []Body) PutBodyError!void {
     var threads: [3]?std.Thread = @splat(null);
     for (&threads, 1..) |*thread, count| {
         if (bodies.len <= count) break;
-        // Without a thread the others, and this one, do its share.
         thread.* = std.Thread.spawn(.{}, Putter.run, .{&putter}) catch null;
     }
     putter.run();
@@ -2461,8 +2396,6 @@ const Source = struct {
         } else false;
         if (!listed) return piece.data;
         return src.store.manager.getBlob(pa, src.id, hash) catch |err| switch (err) {
-            // A blob the log names that is gone or damaged damages the
-            // session, as a bad line does (D39).
             error.NotFound, error.Corrupt => {
                 debug_trace.logf("session", "event=sessions_v2_blob_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
                 return error.InvalidSessionFormat;
@@ -2471,9 +2404,6 @@ const Source = struct {
         };
     }
 };
-
-// ---------------------------------------------------------------------------
-// Converting v1 sessions (D55 to D61, `tests/tla/session_manager/V1Conversion.tla`)
 
 /// A conversion that runs past this tells the host why the open is slow.
 const slow_conversion_ns: i128 = 150 * std.time.ns_per_ms;
@@ -2570,8 +2500,6 @@ const Conversion = struct {
             switch (err) {
                 error.SessionBusy => debug_trace.logf("convert", "action=Busy session={s}", .{root_id}),
                 error.InvalidSessionFormat => c.traceUnreadable(root_id, root_id),
-                // Another process converted it while this one waited, and
-                // removed its v1 folder once v2 held it (D61).
                 error.SessionNotFound => if (holdsV2(store, c.alloc, root_id)) return traceHeld(root_id),
                 else => {},
             }
@@ -2581,10 +2509,6 @@ const Conversion = struct {
         if (holdsV2(store, c.alloc, root_id)) return traceHeld(root_id);
         try c.sweep(&v1, &locks);
 
-        // Every member to copy is checked before any is staged, keeping
-        // nothing (TLA CStage, D62), so one v1 cannot read refuses the family
-        // with nothing staged; then each is read again and staged in turn,
-        // so memory holds one member at a time.
         const members = locks.members.items;
         var checked: std.ArrayList(Checked) = .empty;
         defer {
@@ -2599,7 +2523,6 @@ const Conversion = struct {
         errdefer for (staged.items) |member| c.discard(member);
         defer for (staged.items) |member| if (member.session) |session| session.dropImport();
         try staged.ensureTotalCapacity(c.alloc, members.len);
-        // The children first: the root's child lines name them.
         for (members[1..], checked.items[1..]) |*member, *item| {
             const instructions = childInstructionsOf(locks.registry, member.id);
             staged.appendAssumeCapacity(try c.stage(&v1, item, member, .{ .child = .{ .parent = root_id, .instructions = instructions } }));
@@ -2617,7 +2540,6 @@ const Conversion = struct {
             debug_trace.logf("convert", "action={s} session={s} member={s}", .{ if (root) "PublishedRoot" else "PublishedChild", root_id, member.id });
         }
         c.phase();
-        // The root's v1 state first, so v1 stops listing the family.
         removeMember(&v1, root_id, staged.items[staged.items.len - 1]);
         for (staged.items[0 .. staged.items.len - 1]) |member| removeMember(&v1, root_id, member);
         c.members = members.len;
@@ -2781,11 +2703,8 @@ const Conversion = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var newest = member.created_ms;
-        // The v2 turn of each of the member's turns, for `keep_from`.
         var turns: std.ArrayList(u64) = .empty;
         try turns.ensureTotalCapacity(a, member.steps.len);
-        // Each turn is encoded in its own scratch, so a long session never
-        // holds every turn's encoding at once (D62).
         var step_arena = std.heap.ArenaAllocator.init(c.alloc);
         defer step_arena.deinit();
         for (member.steps) |step| {
@@ -3114,7 +3033,6 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
             try report.left_out.ensureUnusedCapacity(alloc, conversion.left_out.items.len);
             for (conversion.left_out.items, 0..) |file, index| {
                 const owned_root = alloc.dupe(u8, id) catch |err| {
-                    // Those moved so far are the report's now.
                     const rest = conversion.left_out.items[index..];
                     @memmove(conversion.left_out.items[0..rest.len], rest);
                     conversion.left_out.shrinkRetainingCapacity(rest.len);
@@ -3335,7 +3253,6 @@ fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: [
     errdefer alloc.free(origin);
     const workspace_copy = try alloc.dupe(u8, workspace);
     errdefer alloc.free(workspace_copy);
-    // Every session starts with its preferences (`create`).
     const preferences = restored.preferences orelse return error.InvalidSessionFormat;
     restored.preferences = null;
     const resumed: Resumed = .{
@@ -3348,7 +3265,6 @@ fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: [
             .conversation_language = restored.language,
             .preferences = preferences,
             .history = restored.history,
-            // v1 reloads its totals as zero as well.
             .total_input_tokens = 0,
             .total_output_tokens = 0,
             .permission_state = restored.permission_state orelse .{},
@@ -3368,8 +3284,6 @@ fn lastStarted(entry: sm.Entry) ?u64 {
     };
 }
 
-// Borrows its context for the synchronous replay call. Turn callbacks take
-// ownership even on failure; summary bytes remain owned by the current page.
 const ReplaySink = struct {
     context: *anyopaque,
     turn_fn: *const fn (*anyopaque, types.HistoryTurn, ?u64) anyerror!void,
@@ -3416,14 +3330,10 @@ noinline fn replay(
     var superseded = false;
     var piece_arena = std.heap.ArenaAllocator.init(alloc);
     defer piece_arena.deinit();
-    // The open turn's calls saved as running, and the call ids its pieces
-    // already answer or hold (D28).
     var turn_arena = std.heap.ArenaAllocator.init(alloc);
     defer turn_arena.deinit();
     var running: std.ArrayList(session_event.ConversationToolCall) = .empty;
     var represented: std.ArrayList([]const u8) = .empty;
-    // The text of the message whose calls are running, until a finished
-    // step's own assistant piece supersedes it (D51).
     var running_text: ?[]const u8 = null;
     var from = start;
     while (true) {
@@ -3451,7 +3361,6 @@ noinline fn replay(
                     }
                     const ta = turn_arena.allocator();
                     if (std.mem.eql(u8, piece.type, running_type)) {
-                        // Kept for the whole turn: copies, not views of the page.
                         const call = try decodePiece(ta, .tool_call, try src.pieceData(ta, piece), .alloc_always);
                         try running.append(ta, call.tool_call);
                         continue;
@@ -3466,8 +3375,6 @@ noinline fn replay(
                         continue;
                     };
                     const data = try src.pieceData(pa, piece);
-                    // The builder copies what it keeps, as it does for v1's
-                    // reader, so strings may point into the page.
                     switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
                         .user => |value| try builder.begin(try src.withMovedImages(pa, value)),
                         .assistant => |value| {
@@ -3637,9 +3544,6 @@ fn historyToolCall(call: session_event.ConversationToolCall) types.ToolCall {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Listing
-
 const list_page_size: usize = 256;
 
 /// Every saved root session, newest first, as v1's picker summaries, leaving
@@ -3661,7 +3565,6 @@ pub fn listSummaries(
     defer scratch.deinit();
     if (cancel.load(.acquire)) return error.Cancelled;
     {
-        // One read of the index, not one per page of it (D62).
         var page = try store.manager.list(alloc, .all, null, std.math.maxInt(usize));
         defer page.deinit();
         try list.ensureTotalCapacity(alloc, page.items.len);
@@ -3671,7 +3574,6 @@ pub fn listSummaries(
             list.appendAssumeCapacity(try summaryOf(alloc, scratch.allocator(), item));
         }
     }
-    // And v1's roots not converted yet (D59), which v2 wins on an id.
     if (cancel.load(.acquire)) return error.Cancelled;
     var v1_roots = try v1_conversion.listRoots(alloc, store.home, active_id);
     defer v1_roots.deinit(alloc);
@@ -3735,7 +3637,6 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
             .last => error.NoSavedSessions,
             .last_opened => error.NoRememberedSession,
         },
-        // A child is resumed only through its parent, as in v1.
         error.ChildSession => error.SessionNotFound,
         error.Busy => error.SessionBusy,
         error.Corrupt => error.InvalidSessionFormat,
@@ -3784,9 +3685,6 @@ fn compactedData(page: *const sm.Page) ?[]const u8 {
         else => null,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Encodings (pure)
 
 /// The item `type` of each v1 piece kind.
 fn itemType(kind: PieceKind) ?[]const u8 {
@@ -4003,7 +3901,6 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
 fn decodePreferences(alloc: Allocator, raw: []const u8) !session_codec.DurableSessionPreferences {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
-    // v1's codec knows every field but a child's instructions.
     if (parsed.value == .object) _ = parsed.value.object.swapRemove(instructions_key);
     return session_codec.parse_preferences(alloc, parsed.value);
 }
@@ -4036,9 +3933,6 @@ fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u
     if (!display.present or std.mem.eql(u8, display.title, session_display_metadata.fallback_title)) return null;
     return display.title;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
 
 const testing = std.testing;
 
@@ -4089,8 +3983,6 @@ const TestHome = struct {
     store: Store,
 
     fn init(t: *TestHome) !void {
-        // Iterable, so Linux gives a real descriptor that `fsync` accepts
-        // when a test makes `.fx` here (`io_mod.syncVerifiedDir`).
         t.tmp = testing.tmpDir(.{ .iterate = true });
         errdefer t.tmp.cleanup();
         t.home = try io_mod.dirRealpathAlloc(testing.allocator, t.tmp.dir, ".");
@@ -4147,7 +4039,6 @@ test "a new session commits turns, and resume gives them back with its settings"
     try testing.expectEqual(types.InterruptedTerminalReason.failed, restored.history[1].interrupted.terminal_reason);
     try testing.expectEqualStrings("test-model", restored.preferences.?.model);
     try testing.expect(restored.created_at_ms > 0);
-    // The first turn named the session.
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
@@ -4203,7 +4094,6 @@ test "a child opens under the id its parent names, and its parent folds its line
     try testing.expectEqualStrings("{\"kind\":\"persistent\"}", children[0].spawn_data.?);
     try testing.expectEqualStrings("{}", children[0].finish_data.?);
 
-    // Read by id, without the child's lock.
     const history = try t.store.childHistory(alloc, child_id);
     defer types.freeHistoryTurnSlice(alloc, history);
     try testing.expectEqual(@as(usize, 1), history.len);
@@ -4212,7 +4102,6 @@ test "a child opens under the id its parent names, and its parent folds its line
     defer preferences.deinit(alloc);
     try testing.expectEqualStrings("test-model", preferences.model);
 
-    // New instructions replace the stored ones; none keeps them.
     {
         const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Be thorough."));
         defer child.close();
@@ -4227,7 +4116,6 @@ test "a child opens under the id its parent names, and its parent folds its line
         try testing.expectEqualStrings("test-model", restored.preferences.?.model);
         try testing.expectEqual(@as(usize, 1), restored.history.len);
     }
-    // Children stay out of the session list.
     var page = try t.store.manager.list(alloc, .all, null, 10);
     defer page.deinit();
     try testing.expectEqual(@as(usize, 1), page.items.len);
@@ -4247,7 +4135,6 @@ test "the manager guards child lines, and a child without a log reopens under it
     try testing.expectError(error.InvalidTransition, parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w2" } }}));
     try testing.expectError(error.InvalidTransition, parent.appendChildLines(&.{.{ .finished = .{ .child = child_id, .work_id = "w9", .outcome = .ok } }}));
 
-    // Closed before its first turn, as a crash would leave it: nothing on disk.
     (try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Stay short."))).close();
     try testing.expectError(error.NotFound, t.store.childHistory(alloc, child_id));
     const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", testSeed(&model));
@@ -4338,7 +4225,6 @@ test "streamed pieces are written once, and the commit adds only the rest" {
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("streamed question") };
     try s.appendProgress(user, .{}, .{});
-    // The first piece published the session.
     try testing.expect(s.saved());
     try s.appendProgress(user, .{}, .{});
     try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("streamed answer") } }, types.ConversationLanguage.default());
@@ -4380,7 +4266,6 @@ test "a running tool call is saved once, and resume answers it as possibly run" 
     defer testing.allocator.free(id);
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, running_type));
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "user"));
-    // Closing in the middle of the turn ends it `closed`.
     s.close();
 
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
@@ -4414,7 +4299,6 @@ test "a crash while a tool runs keeps the text of the message that issued it (D5
     const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{\"command\":\"bash build.sh\"}" };
     const plan = "It makes .build and prints forty steps. Running it now.";
     try s.appendProgress(user, .{}, .{ .calls = &.{call}, .assistant = plan });
-    // Saved once with its calls; the same step reported again adds nothing.
     try s.appendProgress(user, .{}, .{ .calls = &.{call}, .assistant = plan });
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -4445,7 +4329,6 @@ test "text an earlier step finished with never lands on a later running step wit
     const first: types.ToolCall = .{ .id = "call-1", .name = "shell", .arguments_json = "{}" };
     const second: types.ToolCall = .{ .id = "call-2", .name = "bash", .arguments_json = "{\"command\":\"sleep 9\"}" };
     try s.appendProgress(user, .{}, .{ .calls = &.{first}, .assistant = "plan A" });
-    // The first step finishes with its text; the second runs with none.
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-1"),
         .tool_name = @constCast("shell"),
@@ -4493,7 +4376,6 @@ test "a crash answers only the running calls its turn does not already hold" {
         .{ .item = .{ .type = "user", .data = user_piece } },
         .{ .item = .{ .type = running_type, .data = first } },
         .{ .item = .{ .type = running_type, .data = second } },
-        // The turn already holds call_1, as its one pending call.
         .{ .item = .{ .type = "tool_call", .data = first } },
         .{ .turn_interrupted = .crash },
     }, 2000);
@@ -4584,7 +4466,6 @@ test "a fork holds the turns before its prompt under a new id and leaves the sou
     try testing.expectEqual(@as(usize, 2), restored.history.len);
     try testing.expectEqualStrings("second", restored.history[1].assistant.user.text);
     try testing.expectEqualStrings("Plan (fork)", restored.title.?);
-    // The fork goes on as any session does; the source is still untouched.
     try commitPrompt(copy, "a different third");
     try testing.expectEqual(source_lines, try lineCount(t.store.manager, s.id()));
 }
@@ -4617,7 +4498,6 @@ test "a session whose first turn never ended takes its first prompt as title at 
     try s.appendProgress(.{ .text = @constCast("Why is the sky orange at dusk?") }, .{}, .{});
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
-    // The first turn never ends through fx, as when fx is killed.
     s.close();
     try testing.expectEqual(@as(usize, 0), try countTitleSets(t.store.manager, id));
 
@@ -4631,7 +4511,6 @@ test "a session whose first turn never ended takes its first prompt as title at 
     const title = (try storedTitle(r)) orelse return error.TestExpectedTitle;
     defer testing.allocator.free(title);
     try testing.expectEqualStrings("Why is the sky orange at dusk?", title);
-    // Written once; later turns leave it.
     try r.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("again") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
     try testing.expectEqual(@as(usize, 1), try countTitleSets(t.store.manager, id));
 }
@@ -4670,7 +4549,6 @@ test "a finished turn keeps no trace of its running calls" {
     const call: types.ToolCall = .{ .id = "call_9", .name = "bash", .arguments_json = "{}" };
     try s.appendProgress(user, .{}, .{ .calls = &.{call} });
     try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("answered") } }, types.ConversationLanguage.default());
-    // The next turn starts with nothing saved as running.
     try testing.expectEqual(@as(usize, 0), s.running.items.len);
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -4719,23 +4597,18 @@ test "the history visit shows every turn, even those a compaction summarized" {
     try s.visitHistory(testing.allocator, &visitor);
     try testing.expectEqual(@as(usize, 3), visitor.prompts.items.len);
     for (visitor.prompts.items, [_][]const u8{ "one", "two", "three" }) |got, want| try testing.expectEqualStrings(want, got);
-    // The visit leaves what resume and compaction rely on unchanged.
     try testing.expectEqualSlices(?u64, numbers, s.turn_numbers.items);
 
-    // A visitor that fails stops the visit without leaking its turn.
     var failing: Visitor = .{ .fail_at = 1 };
     defer failing.deinit();
     try testing.expectError(error.ConsumerFailed, s.visitHistory(testing.allocator, &failing));
     try testing.expectEqual(@as(usize, 1), failing.prompts.items.len);
 
-    // A visitor may call back into the session, as the app does to read a
-    // command replay's side file while it draws a turn.
     const Reentrant = struct {
         session: *Session,
         visits: usize = 0,
 
         pub fn append(self: *@This(), _: types.HistoryTurn) !void {
-            // Fails rather than hangs if the visit holds the adapter's lock.
             if (!self.session.mutex.tryLock()) return error.VisitHeldSessionLock;
             self.session.mutex.unlock(io_mod.getIo());
             _ = try self.session.childCapability();
@@ -4746,7 +4619,6 @@ test "the history visit shows every turn, even those a compaction summarized" {
     try s.visitHistory(testing.allocator, &reentrant);
     try testing.expectEqual(@as(usize, 3), reentrant.visits);
 
-    // Resume still starts from the summary.
     var restored = try s.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), restored.history.len);
@@ -4762,7 +4634,6 @@ test "a tool result backed only by its command replay streams as it commits" {
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("run it") };
     var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "shell", .arguments_json = "{}" }};
-    // As a shell result arrives with `.required` command replay: no result file yet.
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call-1"),
         .tool_name = @constCast("shell"),
@@ -4779,15 +4650,12 @@ test "a tool result backed only by its command replay streams as it commits" {
     const streamed = s.stored_results.get("call-1").?;
     const written = try (try s.childCapability()).readBlob(testing.allocator, .tool_results, streamed, 1024);
     defer testing.allocator.free(written);
-    // The commit gets the agent's own turn, still without a result file;
-    // preparing it fills in the handle and preview.
     try testing.expectEqual(@as(?[]u8, null), results[0].output_handle);
     try testing.expectEqualStrings("REPLAY_ONLY_OUTPUT", written);
     var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
     try s.prepareTurn(&turn);
     defer testing.allocator.free(results[0].output_handle.?);
     defer testing.allocator.free(results[0].preview.?);
-    // The same blob: its name is its content's hash.
     try testing.expectEqualStrings(streamed, results[0].output_handle.?);
     try s.commitTurn(turn, types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
@@ -4837,7 +4705,6 @@ test "a turn ended by a close or a crash comes back interrupted" {
     defer arena.deinit();
     const user_piece = try encodePiece(arena.allocator(), .{ .user = .{ .text = "unfinished" } });
 
-    // A close in the middle of a turn: the manager ends it `closed`.
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     try s.commitTurn(assistantTurn("done", "yes"), language);
@@ -4855,7 +4722,6 @@ test "a turn ended by a close or a crash comes back interrupted" {
         try testing.expectEqual(types.InterruptedTerminalReason.cancelled, restored.history[1].interrupted.terminal_reason);
     }
 
-    // A crash, written through the API as the v1 converter writes one.
     const crashed_id = "1786460757753-crash";
     const imported = try t.store.manager.openImport(.{ .id = crashed_id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
     _ = try imported.appendAt(&.{ .turn_started, .{ .item = .{ .type = "user", .data = user_piece } }, .{ .turn_interrupted = .crash } }, 2000);
@@ -4907,8 +4773,6 @@ test "each later compaction keeps only the turns after its cut" {
     try s.commitTurn(assistantTurn("two", "2"), language);
     var first = "turn one".*;
     try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 1, .compaction_count = 1 }, false, .{ .turns = 1 });
-    // From here fx's history starts with the summary, and each cut counts
-    // only the raw turns after it, so `.turns = 1` keeps the newest turn.
     try s.commitTurn(assistantTurn("three", "3"), language);
     var second = "turns one and two".*;
     try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 2, .compaction_count = 2 }, false, .{ .turns = 1 });
@@ -4945,8 +4809,6 @@ test "resume refuses a session whose compaction line is damaged" {
     defer testing.allocator.free(id);
     s.close();
 
-    // One byte of the summary changes, so its line fails its check. Open
-    // reads past it: a snapshot follows every compaction.
     const io = io_mod.getIo();
     const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
     defer testing.allocator.free(log_path);
@@ -4970,7 +4832,6 @@ test "fx session lists every turn with each summary where it happened, as v1 cou
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     try s.commitTurn(assistantTurn("one", "1"), language);
     try s.commitTurn(assistantTurn("two", "2"), language);
-    // fx's own count differs from the log's; the listing counts the log.
     var first = "turn one".*;
     try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 1, .compaction_count = 1 }, false, .{ .turns = 1 });
     try s.commitTurn(assistantTurn("three", "3"), language);
@@ -5001,7 +4862,6 @@ test "fx session lists every turn with each summary where it happened, as v1 cou
         } else try testing.expectEqualStrings(w.prompt.?, got.assistant.user.text);
     }
 
-    // Resume still starts at the newest summary.
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
     defer r.close();
     var restored = try r.restore(testing.allocator);
@@ -5043,7 +4903,6 @@ test "a failed resume reports v1's error names" {
     try testing.expectEqual(error.InvalidSessionFormat, resumeError(error.Corrupt, .last));
     try testing.expectEqual(error.UnsupportedSessionFormat, resumeError(error.UnsupportedVersion, .last));
     try testing.expectEqual(error.Io, resumeError(error.Io, .last));
-    // An OS cause reaches the user as itself (D29).
     try testing.expectEqual(error.NoSpaceLeft, resumeError(error.NoSpaceLeft, .last));
     try testing.expectEqual(error.ReadOnlyFileSystem, resumeError(error.ReadOnlyFileSystem, .{ .id = "AAAAAAAAAAAA" }));
 }
@@ -5071,7 +4930,6 @@ test "a resumed session gives v1's state and the title the user chose" {
     try testing.expectEqualStrings("Chosen title", resumed.title.?);
     try testing.expect(resumed.state.created_at_ms > 0);
     try testing.expect(resumed.state.updated_at_ms >= resumed.state.created_at_ms);
-    // A generated title does not replace the one the user chose.
     try testing.expect(!try r.installGeneratedTitle(resumed.state.history, "Generated"));
 }
 
@@ -5085,7 +4943,6 @@ test "the picker lists saved root sessions newest first, without the open one" {
     const first_id = try testing.allocator.dupe(u8, first.id());
     defer testing.allocator.free(first_id);
     first.close();
-    // A session with no turn is not saved, so it is never listed (D2).
     const empty = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
     empty.close();
     io_mod.sleep(2 * std.time.ns_per_ms);
@@ -5181,7 +5038,6 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
     }};
     var steps: [1]types.ToolExecutionStep = undefined;
     var turn = toolTurn("run it", &results, &steps);
-    // Streaming the result stores its body before any piece opened the turn.
     try s.appendProgress(user, turn.assistant.execution, .{});
     try s.prepareTurn(&turn);
     defer testing.allocator.free(results[0].output_handle.?);
@@ -5200,7 +5056,6 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
     const body = try t.store.manager.getBlob(testing.allocator, id, hash);
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("a body kept as a blob", body);
-    // Listed on an item, so verify finds it and a fork links it.
     try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
     const fork = try t.store.manager.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .ask });
     const fork_id = try testing.allocator.dupe(u8, fork.id());
@@ -5210,7 +5065,6 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
     defer testing.allocator.free(forked);
     try testing.expectEqualStrings("a body kept as a blob", forked);
 
-    // Resumed, the stores read it back by its handle.
     {
         const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
         defer r.close();
@@ -5219,7 +5073,6 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
         try testing.expect(std.mem.find(u8, page, "kept as a blob") != null);
     }
 
-    // Because an item lists it, a lost body damages the session (D39).
     const blob_path = try t.store.manager.blobPath(testing.allocator, id, hash);
     defer testing.allocator.free(blob_path);
     try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), blob_path);
@@ -5276,8 +5129,6 @@ test "a session that never reached the disk takes its terminal folder, and a sav
     saved.close();
     try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, saved_id }));
 
-    // A first write that landed although the adapter never saw it succeed
-    // keeps its folder.
     const landed = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     const landed_id = try testing.allocator.dupe(u8, landed.id());
     defer testing.allocator.free(landed_id);
@@ -5331,7 +5182,6 @@ test "recover copies the folders outside the manager, never a link, and says whe
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
 
-    // The copy is a root session of its own; the source is unchanged.
     var copied = try readSession(&t.store, testing.allocator, recovered.id);
     defer copied.deinit(testing.allocator);
     try testing.expectEqualStrings("q", copied.state.history[0].assistant.user.text);
@@ -5431,10 +5281,8 @@ test "an older session moves off its side folder on its first writable open, and
 
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .acp);
     defer r.close();
-    // One manager folder, and terminal state where the terminal store looks.
     try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name, id }));
     try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "terminal-1.json" }));
-    // Old handles resolve through the map.
     const capability = try r.childCapability();
     const body = try capability.readBlob(testing.allocator, .tool_results, OldSideFolder.result_handle, 1024);
     defer testing.allocator.free(body);
@@ -5442,8 +5290,6 @@ test "an older session moves off its side folder on its first writable open, and
     var replay_file = try capability.openBlobFile(testing.allocator, .command_artifacts, OldSideFolder.replay_handle);
     replay_file.close(io_mod.getIo());
     try testing.expectError(error.BlobNotFound, capability.readBlob(testing.allocator, .tool_results, "result-shell-0-0.txt", 1024));
-    // The compactor still lists and reads its old record, until a newer one
-    // of the same name replaces it (D50).
     {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
@@ -5460,7 +5306,6 @@ test "an older session moves off its side folder on its first writable open, and
         for (try records.list(arena)) |name| count += @intFromBool(std.mem.eql(u8, name, "compacted-T9.txt"));
         try testing.expectEqual(@as(usize, 1), count);
     }
-    // The image is inside the turn now, and the client's settings are settings.
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     const image = restored.history[0].assistant.user.images[0];
@@ -5473,7 +5318,6 @@ test "an older session moves off its side folder on its first writable open, and
     try testing.expect(std.mem.find(u8, identities, "mcp_mini_read") != null);
     try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
 
-    // An image whose blob is lost keeps its old path, as a lost snapshot does.
     const image_hash = r.host.moved.get("images/" ++ OldSideFolder.image_name).?;
     const image_blob = try t.store.manager.blobPath(testing.allocator, id, &image_hash);
     defer testing.allocator.free(image_blob);
@@ -5495,14 +5339,12 @@ test "compactor records on v2 are recorded by one setting with the next write, a
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     try s.beginTurn();
-    // Mid-turn, as auto compaction keeps them; a name kept twice is replaced.
     const records = result_store.compactorStore(try s.childCapability());
     try records.write(testing.allocator, "compacted-T1.txt", "T1 shell: ls\nResult:\nfirst\n");
     try records.write(testing.allocator, "compacted-M1.txt", "M1 the first turn\n");
     try records.write(testing.allocator, "compacted-T1.txt", "T1 shell: ls\nResult:\nreplaced\n");
     try testing.expectEqual(@as(usize, 0), try countSettings(t.store.manager, s.id(), .compaction_records));
     try testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try records.read(arena, "compacted-T1.txt", 1024));
-    // The turn's next write records them, once.
     try s.commitTurn(assistantTurn("compact it", "done"), types.ConversationLanguage.default());
     try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, s.id(), .compaction_records));
     try s.beginTurn();
@@ -5514,7 +5356,6 @@ test "compactor records on v2 are recorded by one setting with the next write, a
     try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
     try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
 
-    // A new process reads them back by name, and lists them.
     {
         const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
         defer r.close();
@@ -5523,13 +5364,11 @@ test "compactor records on v2 are recorded by one setting with the next write, a
         try testing.expectEqual(@as(usize, 2), names.len);
         try testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try again.read(arena, "compacted-T1.txt", 1024));
         try testing.expectEqualStrings("M1 the first turn\n", try again.read(arena, "compacted-M1.txt", 1024));
-        // read_tool_result opens a record by its ID.
         const page = try result_store.readByRangeManaged(testing.allocator, try r.childCapability(), "compacted-M1.txt", 1, 64);
         defer testing.allocator.free(page);
         try testing.expect(std.mem.find(u8, page, "the first turn") != null);
     }
 
-    // A fork carries the records with the turns that kept them.
     const fork = try t.store.manager.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .ask });
     const fork_id = try testing.allocator.dupe(u8, fork.id());
     defer testing.allocator.free(fork_id);
@@ -5575,15 +5414,12 @@ test "a move cut short is redone on the next open, and old names still resolve (
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
     try OldSideFolder.commitTurn(&t, s);
-    // The side folder appears while the session is open, and the move stops
-    // after its batch and the terminal rename, before the folder goes.
     try OldSideFolder.write(&t, id);
     {
         var files_root = (try t.store.openProfileFolder(files_dir_name)).?;
         defer files_root.close();
         var side = (try io_mod.openVerifiedPrivateDirIfPresent(&files_root, id)).?;
         defer side.close();
-        // A tool result, a compactor record, a replay and an image.
         try testing.expectEqual(@as(usize, 4), try s.moveOut(&side));
     }
     s.close();
@@ -5607,7 +5443,6 @@ test "an ACP client's prompt and tool identities are settings, written only when
     defer t.deinit();
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .acp, testSeed(&model));
-    // Held with the session until its first turn, like the seed.
     try testing.expectEqual(@as(?[]u8, null), try s.clientPrompt(testing.allocator));
     try s.setClientPrompt("You run inside Mini.");
     try s.setClientPrompt("You run inside Mini.");
@@ -5841,7 +5676,6 @@ test "a v1 session converts on its first open, and its v1 folder goes (D55, D60)
     try testing.expectEqualStrings("v1/model", restored.preferences.?.model);
     try testing.expectEqual(@as(i64, 1_000), restored.created_at_ms);
     try testing.expect(!V1Home.exists(&t, "v1-basic"));
-    // Its turns kept their times.
     var page = try t.store.manager.read(testing.allocator, "v1-basic", .start, .forward, 64);
     defer page.deinit();
     var starts: std.ArrayList(u64) = .empty;
@@ -5887,7 +5721,6 @@ test "a converted v1 session's side files keep their old names, and its prompt i
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    // As v1's log names a prompt image: by its folder and digest.
     const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var images = [_]types.ImageAttachment{.{
         .id = 1,
@@ -5980,7 +5813,6 @@ test "a v1 turn left open comes back unfinished exactly as v1 shows it (D56)" {
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    // Each turn but the first stops after its prompt, as a crash leaves it.
     for ([_][]const u8{ "v1-checkpoint", "v1-stale", "v1-open" }) |id| {
         var writer = try v1.start(id);
         defer writer.deinit(alloc);
@@ -5988,7 +5820,6 @@ test "a v1 turn left open comes back unfinished exactly as v1 shows it (D56)" {
         const done = writer.conversation_writer.last_seq;
         if (!std.mem.eql(u8, id, "v1-stale")) _ = try writer.conversation_writer.append(alloc, 3_000, .{ .user = .{ .text = "stalled" } });
         if (std.mem.eql(u8, id, "v1-checkpoint")) try writeRecovery(&v1, id, writer.conversation_writer.last_seq, "stalled", "a partial reply");
-        // A checkpoint whose turn the log has since ended: v1 drops it.
         if (std.mem.eql(u8, id, "v1-stale")) try writeRecovery(&v1, id, done - 1, "q", "never shown");
     }
 
@@ -6010,7 +5841,6 @@ test "a v1 turn left open comes back unfinished exactly as v1 shows it (D56)" {
         try testing.expectEqual(@as(usize, 1), restored.history.len);
     }
     {
-        // No checkpoint: v1's next writable open fails the turn.
         const s = try openConverted(&t, "v1-open");
         defer s.close();
         var restored = try s.restore(alloc);
@@ -6048,7 +5878,6 @@ test "a v1 family converts together: its children first, and one whose folder is
     };
     try (child_state.Store{ .backend = .{ .v1 = &v1.store }, .parent_id = "v1-parent" }).save(alloc, registry);
 
-    // A v1 child opens only through its parent.
     try testing.expectError(error.SessionNotFound, openConverted(&t, "v1-kid"));
     const s = try openConverted(&t, "v1-parent");
     defer s.close();
@@ -6104,7 +5933,6 @@ test "an unreadable v1 session is refused with its file and reason, and nothing 
     var buffer: [64]u8 = undefined;
     try testing.expectEqualStrings(try std.mem.print(&buffer, "events.jsonl line {d} is not valid JSON", .{line}), t.store.conversionProblem().?);
     try testing.expectError(error.NotFound, t.store.manager.peek(alloc, "v1-torn"));
-    // No staging left behind, if any was made.
     if (t.tmp.dir.openDir(io_mod.getIo(), ".fx/sessions/v2/.tmp", .{ .iterate = true })) |opened_staging| {
         var staging = opened_staging;
         defer staging.close(io_mod.getIo());
@@ -6128,12 +5956,10 @@ test "a leftover v1 folder goes on a later open only while it is what was conver
     defer copy.deinit();
     (try openConverted(&t, "v1-left")).close();
 
-    // As a refused delete leaves it: the next open deletes it.
     try copy.restore(&v1, "v1-left");
     (try openConverted(&t, "v1-left")).close();
     try testing.expect(!V1Home.exists(&t, "v1-left"));
 
-    // Changed since by an older build: kept, and never reaches the v2 copy.
     try copy.restore(&v1, "v1-left");
     try v1.put("v1-left", null, "events.jsonl", "changed\n");
     const s = try openConverted(&t, "v1-left");
@@ -6162,7 +5988,6 @@ test "-c opens the session v1 remembers while v2 has none, and --resume last the
     const fresh = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
     try fresh.commitTurn(assistantTurn("v2 question", "v2 answer"), types.ConversationLanguage.default());
     fresh.close();
-    // Written after the v2 session's turn, so listed as newer.
     try v1.session("v1-newest", &.{assistantTurn("q", "a")});
     const s = try Session.resumeSession(alloc, &t.store, .last, "/w", .ask);
     defer s.close();
@@ -6200,8 +6025,6 @@ test "the listing's pages, read from part of the index, are the whole listing in
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    // Tied on their update time: v2 orders them by id ascending, v1's pages
-    // by id descending.
     for ([_][]const u8{ "tie-c", "tie-a", "tie-e", "tie-b", "tie-d" }) |id| {
         const s = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
         defer s.release();
@@ -6209,8 +6032,6 @@ test "the listing's pages, read from part of the index, are the whole listing in
         try s.publishImport();
     }
     try v1.session("v1-only", &.{assistantTurn("q", "a")});
-    // Converted, its v1 folder left behind as a refused delete leaves it:
-    // listed once.
     try v1.session("v1-held", &.{assistantTurn("q", "a")});
     var copy = try V1Copy.take(&t, "v1-held");
     defer copy.deinit();
@@ -6351,7 +6172,6 @@ test "a child an earlier try published is reused as it is, its v1 folder kept on
     defer v1.deinit();
     try v1.session("v1-root", &.{assistantTurn("q", "a")});
     try v1Children(&v1, "v1-root", &.{ "v1-same", "v1-changed" });
-    // A try that published the children and stopped before the root.
     {
         var v1_store = try session_store.Store.initReadOnlyFromHome(alloc, t.store.home, "/");
         defer v1_store.deinit(alloc);
@@ -6365,7 +6185,6 @@ test "a child an earlier try published is reused as it is, its v1 folder kept on
             try staged.session.?.handle.publishImport();
         }
     }
-    // An older build changes one child since; a damaged one reads the same.
     try v1.put("v1-changed", null, "events.jsonl", "{ not json\n");
 
     const s = try openConverted(&t, "v1-root");
@@ -6525,7 +6344,6 @@ test "an older format's inline result converts as v1's migration stores it: unde
     const shown = try result_store.formatStoredResultOutput(alloc, handle, "the whole old output", 20);
     defer alloc.free(shown);
     try testing.expectEqualStrings(shown, result.output);
-    // The handle still reads the whole output.
     const body = try (try s.childCapability()).readBlob(alloc, .tool_results, handle, 1024);
     defer alloc.free(body);
     try testing.expectEqualStrings("the whole old output", body);
@@ -6556,7 +6374,6 @@ test "a v1 prompt image that cannot be read refuses the session, and one that is
     const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("look"), .images = &images }, .assistant = @constCast("seen") } };
     try v1.session("v1-image-bad", &.{turn});
     try v1.session("v1-image-gone", &.{turn});
-    // A folder where the image should be: not a lost snapshot, a fault.
     var dir = (try io_mod.openVerifiedPrivateDirIfPresent(&v1.store.canonical_root.sessions.?, "v1-image-bad")).?;
     defer dir.close();
     try dir.dir.createDirPath(io_mod.getIo(), "images/shot.bin");
@@ -6609,7 +6426,6 @@ test "the sweep drops what an earlier try staged for a child whose folder is gon
     try v1.session("v1-parent", &.{assistantTurn("q", "a")});
     try v1Children(&v1, "v1-parent", &.{"v1-went"});
     const staging = try t.store.manager.openImport(.{ .id = "v1-went", .workspace = "/w", .host = .ask, .role = .child, .parent = "v1-parent", .created_ms = 1 });
-    // An import's staging appears with its first blob.
     _ = try staging.putBlob("staged before the folder went");
     staging.release();
     try t.tmp.dir.deleteTree(io_mod.getIo(), ".fx/sessions/v1-went");
@@ -6705,7 +6521,6 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
         try commands.writeFile(io, .{ .sub_path = "small.bin", .data = "kept", .flags = .{ .permissions = .fromMode(0o600) } });
         var file = try commands.createFile(io, "replay.bin", .{});
         defer file.close(io);
-        // Sparse: no disk for the hole.
         try file.setLength(io, sm.max_blob_bytes + 1);
     }
     var told: std.ArrayList(u8) = .empty;
@@ -6717,7 +6532,6 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
         }
     }.emit };
 
-    // Opened: the host is told what was left out.
     const s = try openConverted(&t, "v1-huge");
     defer s.close();
     var expected: [256]u8 = undefined;
@@ -6729,7 +6543,6 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
     defer restored.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), restored.history.len);
 
-    // Converted by `fx sessions convert`: the report names it.
     var report = try convertAll(&t.store, alloc);
     defer report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), report.converted);
@@ -6743,7 +6556,6 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
 }
 
 test "only the adapter imports the session manager" {
-    // Set by `zig build test`.
     const root = @import("test_paths").source_root;
     const io = io_mod.getIo();
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });

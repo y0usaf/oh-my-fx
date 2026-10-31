@@ -1490,8 +1490,6 @@ pub const SkillMenu = struct {
     fn moveVisibleRowsCount(self: *SkillMenu, item_count: usize, delta: i32, visible_rows: u16) bool {
         if (!self.active or item_count == 0) return false;
         const max_rows: u16 = @max(visible_rows, 1);
-        // Clamp at both ends instead of wrapping: at the top the selection
-        // stays on the first skill, at the bottom on the last.
         const current: i32 = @intCast(self.selected_index % item_count);
         var next = current + delta;
         if (next < 0) next = 0;
@@ -3780,7 +3778,6 @@ test "an empty launch catalog fills from a refresh before its startup notice is 
     defer runtime.deinit(alloc);
     const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
 
-    // The launch records only the managed directory, then refreshes into it.
     try runtime.replaceLoaded(alloc, try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "skills" }), &.{}, &.{});
     const generation = try runtime.requestRefresh(alloc, home, home, policy);
     try runtime.queueRefreshAction(alloc, generation, .startup_notice);
@@ -3884,12 +3881,10 @@ test "skill menu opens focuses moves and clamps loaded items" {
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.selected_index);
     try std.testing.expectEqualStrings("managed", runtime.selectedMenuSkill().?.name);
 
-    // Up from the top clamps instead of wrapping to the last item.
     try std.testing.expect(runtime.moveMenuSelection(-1));
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.selected_index);
     try std.testing.expectEqualStrings("managed", runtime.selectedMenuSkill().?.name);
 
-    // Down past the last item clamps on the last skill.
     try std.testing.expect(runtime.moveMenuSelection(1));
     try std.testing.expect(runtime.moveMenuSelection(1));
     try std.testing.expect(runtime.moveMenuSelection(1));
@@ -5138,8 +5133,6 @@ test "linked metadata outside authority is rejected before descriptor open" {
     try std.testing.expect(!mark.called);
 }
 
-// The FIFO reader stays open until the blocked writer joins, as
-// `tests/tla/session_manager/rollout/pr-1099/PR1099FIFO.tla` models.
 test "linked metadata FIFO is rejected before descriptor open" {
     const MarkOpen = struct {
         called: bool = false,
@@ -5192,9 +5185,6 @@ test "linked metadata FIFO is rejected before descriptor open" {
     var writer = BlockedWriter{ .path = fifo_path_z };
     const writer_thread = try std.Thread.spawn(.{}, BlockedWriter.run, .{&writer});
     defer {
-        // The reader stays open until the join. The blocked writer wakes
-        // only while a reader exists, so a reader closed at once can be
-        // gone before the writer runs, and the join then never returns.
         var reader: ?std.Io.File = null;
         if (!writer.finished.load(.seq_cst)) {
             const reader_fd = std.posix.openatZ(
@@ -5908,8 +5898,6 @@ test "loadVisibleSkills discovers a linked candidate resolved via external symli
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The skill source lives outside the home/workspace, simulating a Nix
-    // store path. The symlink in the skills directory points to it.
     try writeTempFile(
         &tmp,
         "external-store/linked-skill/SKILL.md",
@@ -5980,7 +5968,6 @@ test "loadVisibleSkills discovers a linked candidate through configured symlink 
     const env = try TestEnviron.install(alloc);
     defer env.deinit();
 
-    // Relative and `..` entries never grant authority, matching the env var.
     try setConfiguredSymlinkAuthorities(&.{ "external-store", dotdot_authority });
     defer setConfiguredSymlinkAuthorities(&.{}) catch {};
     {

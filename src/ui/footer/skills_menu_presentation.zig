@@ -14,8 +14,6 @@ const SkillsMenuProjection = render_input.SkillsMenuProjection;
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
 const title_rows: u16 = 1;
-// Each skill is a single line now, so there is no separate description row
-// or gap.
 const description_rows: u16 = 0;
 const item_gap_rows: u16 = 0;
 
@@ -260,7 +258,6 @@ pub fn composeSkillsMenuRow(
     const display_index = prepared.window_start + visible_offset;
     const skill = (prepared.skillAtVisibleOffset(visible_offset) orelse return row).*;
 
-    // item_stride is 1: every skill is a single row.
     return composeSkillTitleRow(
         alloc,
         skill,
@@ -281,8 +278,6 @@ fn matching_name_column_width(projection: SkillsMenuProjection) usize {
     return col;
 }
 
-// Widest source-scope label across the visible skills, so the scope column
-// lines up vertically instead of drifting with each row's own width.
 fn scopeColumnWidth(
     projection: SkillsMenuProjection,
     window_start: usize,
@@ -391,8 +386,6 @@ fn composeSkillTitleRow(
     else
         content_width - prefix_width - scope_width - 2;
 
-    // Selection by brightness: bold bright white when selected, dim gray
-    // otherwise, applied to the whole row (name and scope). No marker glyph.
     const style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
     try row.appendSlice(alloc, style);
     try row_text.appendSingleLineEllipsized(alloc, &row, skill.name, name_budget);
@@ -483,7 +476,6 @@ test "skills menu renders source tabs and single-line results" {
     var prepared = try prepareSkillsMenu(alloc, projection, 20);
     defer prepared.deinit(alloc);
     const rows = prepared.rowCount();
-    // header + top gap + one row per skill.
     try std.testing.expectEqual(@as(u16, 4), rows);
 
     var header = try composeSkillsMenuRow(alloc, prepared, 0, 120);
@@ -496,7 +488,6 @@ test "skills menu renders source tabs and single-line results" {
     defer gap.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), gap.items.len);
 
-    // Selected skill on a single line: name + scope, no marker, no description.
     var selected = try composeSkillsMenuRow(alloc, prepared, 3, 120);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "workspace") != null);
@@ -568,7 +559,6 @@ test "skills menu navigation budget counts whole items" {
     };
     const projection: SkillsMenuProjection = .{ .active = true, .items = &skills };
 
-    // Single-line rows: header + gap (2) leave 8 for items, capped at 4 skills.
     try std.testing.expectEqual(@as(u16, 4), visibleNavigationRowsForBudget(projection, 10));
 }
 
@@ -666,7 +656,6 @@ test "skills menu keeps the selected whole item in its window" {
     var prepared = try prepareSkillsMenu(alloc, projection, 8);
     defer prepared.deinit(alloc);
 
-    // Selected skill "three" (index 2) lands on its own single row.
     var title = try composeSkillsMenuRow(alloc, prepared, 4, 80);
     defer title.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, title.items, "three") != null);

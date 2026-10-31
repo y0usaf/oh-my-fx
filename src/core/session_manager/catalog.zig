@@ -54,9 +54,6 @@ pub const Record = union(enum) {
     del: struct { id: []const u8, ts_ms: u64 },
 };
 
-// ---------------------------------------------------------------------------
-// Pure core
-
 /// Appends one framed index line.
 pub fn encodeRecord(gpa: std.mem.Allocator, out: *std.ArrayList(u8), record: Record) log_mod.FrameError!void {
     var payload: std.ArrayList(u8) = .empty;
@@ -185,7 +182,6 @@ pub const Index = struct {
     /// are still the newest of their id.
     pub fn liveBytes(index: *const Index, folded_bytes: usize) usize {
         if (index.lines == 0) return 0;
-        // At most `folded_bytes`, so the cast holds.
         return @intCast(@as(u128, folded_bytes) * @min(index.entries.count(), index.lines) / index.lines);
     }
 
@@ -213,7 +209,6 @@ pub const Index = struct {
             .put => |summary| {
                 const slot = try index.entries.getOrPut(arena, summary.id);
                 if (slot.found_existing) {
-                    // A tombstone is final.
                     if (slot.value_ptr.deleted) return;
                     var merged = summary;
                     for (&merged.opened_ms, slot.value_ptr.summary.opened_ms) |*ts, old| ts.* = @max(ts.*, old);
@@ -241,9 +236,6 @@ pub const Index = struct {
         return entry.deleted;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Effectful shell
 
 pub const Error = error{ Busy, OutOfMemory } || storage.IoFault;
 
@@ -376,7 +368,6 @@ pub const Catalog = struct {
                     .last_opened => |host| entry.summary.opened_ms[@backingInt(host)],
                 };
                 if (key == 0 and target == .last_opened) continue;
-                // A tie resolves as `list` sorts: the smaller id first (D11).
                 const better = best == null or key > best_key or
                     (key == best_key and std.mem.lessThan(u8, entry.summary.id, best.?.id));
                 if (better) {
@@ -386,7 +377,6 @@ pub const Catalog = struct {
             }
             const found = best orelse return null;
             if (try cat.healIfGone(found.id)) return try gpa.dupe(u8, found.id);
-            // Gone: its tombstone is in the file now; forget it here too.
             index.entries.getPtr(found.id).?.deleted = true;
         }
     }
@@ -420,7 +410,6 @@ pub const Catalog = struct {
             const id = try arena.dupe(u8, entry.name);
             var summary = session_mod.readSummary(env, id) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                // Damaged or unreadable: listed by id so it can be recovered.
                 else => {
                     try fresh.apply(.{ .put = .{ .id = id, .role = .root, .host = .app, .workspace = "", .created_ms = 0, .updated_ms = 0, .turns = 0 } });
                     sessions += 1;
@@ -459,8 +448,6 @@ pub const Catalog = struct {
         }
     }
 
-    // -- internals -----------------------------------------------------------
-
     fn append(cat: Catalog, record: Record) Error!void {
         const env = cat.env;
         const s = env.s;
@@ -479,7 +466,6 @@ pub const Catalog = struct {
         };
         defer s.closeDerived(file);
         const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
-        // A crash may have left half a line; never glue a record onto it.
         const end = log_mod.lastLineEnd(s, file, len) catch |io_err| return storage.ioFault(io_err);
         if (end != len) s.setLength(file, end) catch |io_err| return storage.ioFault(io_err);
         s.writeAt(file, line.items, end) catch |io_err| return storage.ioFault(io_err);
@@ -489,9 +475,6 @@ pub const Catalog = struct {
         defer gpa.free(bytes);
         var index = try Index.fold(gpa, bytes);
         defer index.deinit();
-        // Rewritten once at least half its lines are stale; otherwise looked
-        // at again only once it has doubled, so each fold is paid for by as
-        // many appended bytes and a live index is not rewritten every time.
         if (bytes.len >= 2 * index.liveBytes(bytes.len)) try cat.writeFresh(&index) else cat.lock.baseline_bytes.store(bytes.len, .monotonic);
     }
 
@@ -541,7 +524,6 @@ pub const Catalog = struct {
         errdefer bytes.deinit(gpa);
         try bytes.resize(gpa, @intCast(len));
         const n = s.readAt(file, bytes.items, 0) catch |io_err| return storage.ioFault(io_err);
-        // Shorter only if a writer cut a torn tail meanwhile.
         bytes.shrinkRetainingCapacity(n);
         return bytes.toOwnedSlice(gpa);
     }
@@ -554,7 +536,6 @@ pub const Catalog = struct {
         const file = cat.lock.file orelse blk: {
             const opened_file = s.openFile(env.root, lock_name, .read_write) catch |err| switch (err) {
                 error.NotFound => s.createFile(env.root, lock_name) catch |create_err| switch (create_err) {
-                    // Another process created it first.
                     error.AlreadyExists => s.openFile(env.root, lock_name, .read_write) catch |io_err| return storage.ioFault(io_err),
                     else => |io_err| return storage.ioFault(io_err),
                 },
@@ -608,8 +589,6 @@ pub const Catalog = struct {
             if (cursor) |c| if (!isAfter(entry.summary, c)) continue;
             try out.append(arena, &entry.summary);
         }
-        // Ids are unique, so the order is total: no stable sort, which
-        // moves whole summaries, is needed.
         std.mem.sortUnstable(*const Summary, out.items, {}, newerFirst);
         return out.items;
     }
@@ -697,9 +676,6 @@ pub fn summaryFrom(arena: std.mem.Allocator, summary: *const session_mod.Summary
     };
 }
 
-// ---------------------------------------------------------------------------
-// Tests (pure)
-
 const testing = std.testing;
 
 fn sample(id: []const u8, updated: u64) Summary {
@@ -739,8 +715,8 @@ test "the fold keeps the newest put, merges open times, and a tombstone is final
     try encodeRecord(a, &out, .{ .put = newer });
     try encodeRecord(a, &out, .{ .put = sample("s2", 2) });
     try encodeRecord(a, &out, .{ .del = .{ .id = "s2", .ts_ms = 4 } });
-    try encodeRecord(a, &out, .{ .put = sample("s2", 9) }); // stale writer: ignored
-    try out.appendSlice(a, "{\"op\":\"put\",\"id\":\"torn"); // torn tail
+    try encodeRecord(a, &out, .{ .put = sample("s2", 9) });
+    try out.appendSlice(a, "{\"op\":\"put\",\"id\":\"torn");
     var index = try Index.fold(testing.allocator, out.items);
     defer index.deinit();
     try testing.expectEqual(@as(u64, 0), index.damaged_lines);
@@ -749,7 +725,6 @@ test "the fold keeps the newest put, merges open times, and a tombstone is final
     try testing.expectEqual(@as(u64, 5), s1.opened_ms[@backingInt(schema.Host.app)]);
     try testing.expect(index.isDeleted("s2"));
 
-    // A flipped byte in a middle line is counted, never folded.
     out.items[20] ^= 1;
     var damaged = try Index.fold(testing.allocator, out.items);
     defer damaged.deinit();
@@ -764,7 +739,6 @@ test "open times decode without a second parse as written, and any other spellin
     for ([_][]const u8{ "[1,0,0,0]", "[1,0,0,0,0,0]", "[01,0,0,0,0]", "[1, 0,0,0,0]", "[-1,0,0,0,0]", "[1,0,0,0,]", "[]", "1" }) |raw| {
         try testing.expect(plainTimes(raw) == null);
     }
-    // A spelling this module never writes still decodes, through JSON.
     var out: std.ArrayList(u8) = .empty;
     try log_mod.appendFramed(a, &out, "{\"op\":\"put\",\"id\":\"s1\",\"role\":\"root\",\"host\":\"app\",\"workspace\":\"/w\",\"created\":1,\"updated\":2,\"turns\":1,\"opened\":[3, 0, 0, 0, 9]");
     const put = (try decodeRecord(a, out.items)).?.put;
@@ -856,12 +830,10 @@ const catalog_model_tests = struct {
             }
             const i = t.slot(id);
             switch (what) {
-                // Updates of an indexed session are not spec actions.
                 .index_put => if (std.mem.eql(u8, t.pending[i], "put")) {
                     t.pending[i] = "none";
                     t.emit("IndexPut", labels[i]);
                 },
-                // A heal's tombstone is reported by `.healed`.
                 .index_del => if (std.mem.eql(u8, t.pending[i], "del")) {
                     t.pending[i] = "none";
                     t.emit("IndexDel", labels[i]);
@@ -987,7 +959,6 @@ const catalog_model_tests = struct {
         const s2 = try publish(m);
         defer gpa.free(s2);
 
-        // s3: the process dies between its publish and its index put.
         {
             const s = try m.openNew(.{ .workspace = "/w", .host = .app });
             tracer.kill_after = .{ .what = .published, .id = s.id() };
@@ -997,14 +968,10 @@ const catalog_model_tests = struct {
         }
         try testing.expectEqual(@as(usize, 2), try listCount(m));
 
-        // A clean delete, then one that dies between trash and tombstone.
         try m.delete(s1);
         tracer.kill_after = .{ .what = .trashed, .id = s2 };
         try testing.expectError(error.Io, m.delete(s2));
         tracer.crash();
-        // list heals the stale entry, then rebuild purges .trash and finds s3.
-        // The planted run rebuilds straight away: a tombstone from the heal
-        // would otherwise stop the planted bug (tombstones survive rebuild).
         if (planted == .none) try testing.expectEqual(@as(usize, 0), try listCount(m));
         _ = try m.rebuild();
         if (planted == .none) {

@@ -263,7 +263,6 @@ def run_checked(
     stdout_thread.start()
     stderr_thread.start()
 
-    # POSIX timed waits poll; observe exit before supervision and log-drain delays.
     completed = threading.Event()
     completed_at = started
     wait_error: BaseException | None = None

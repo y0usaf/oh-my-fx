@@ -261,27 +261,21 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
   try {
     await session.waitForComposer(10_000);
 
-    // One completed turn so the full transcript has content to open.
     await session.sendLiteral("hello");
     await session.sendKeys("Enter");
     await session.waitForText("ctrl-o probe target", 10_000);
 
-    // Control: a printable byte in the main view starts and settles the probe.
     await session.sendLiteral("a");
     await waitForTrace(trace_path, "native_clear_probe requested");
     await session.waitForPane((pane) => composerContains(pane, "a"), 10_000);
     const baseline_requests = readFileSync(trace_path, "utf8")
       .split("native_clear_probe requested").length - 1;
 
-    // While the full transcript owns the alternate screen, the terminal cursor
-    // no longer reflects the main-grid footer row, so the probe must not begin.
     await session.sendKeys("C-o");
     await session.waitForText("ctrl+o close", 10_000);
     await session.sendLiteral("j");
 
     // The typed byte still reaches the composer through the modal fallthrough.
-    // Waiting for it first proves the byte traversed the input path while the
-    // transcript owned the screen, so the no-probe assertion needs no sleep.
     await session.sendKeys("C-o");
     await session.waitForPane((pane) => composerContains(pane, "aj"), 10_000);
 

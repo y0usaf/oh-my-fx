@@ -162,8 +162,6 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
       if (!compacting && workingRequests === 3) {
         return Response.json({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }, { status: 400 });
       }
-      // The first turn reads a file before its reply, so compaction has work
-      // to note and must ask this provider for the notes.
       if (!compacting && workingRequests === 1) {
         return new Response(
           `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "call_provider_facts", name: "read_file" } })}\n\n` +
@@ -1424,7 +1422,6 @@ tmuxTest("grok fast mode sends the priority service tier", async () => {
       (request) => request.path === "/v1/responses" && request.body?.includes("Use the default tier."),
     );
     expect(JSON.parse(standardRequest?.body ?? "{}").service_tier).toBeUndefined();
-    // Wait for the model catalog to be ready before toggling fast mode.
     await session.sendLiteralText("/model");
     await session.sendKeys("Tab");
     await session.waitForPane(
@@ -2843,7 +2840,6 @@ tmuxTest(
     expect(root).toContain("vercel · current");
     expect(root).not.toContain("Connections");
 
-    // Right acts as Enter on the highlighted row: into the method column.
     await session.sendKeys("Right");
     const methods = await session.waitForPane(
       (pane) => pane.includes("oauth") && pane.includes("api-key"),
@@ -2851,13 +2847,10 @@ tmuxTest(
     );
     expect(methods).toContain("api-key · current");
 
-    // oauth with a live session opens the team column; the env key is doing
-    // inference, so no team is marked current.
     await session.sendKeys("Right");
     const teams = await session.waitForText("vercel-labs", TIMEOUT);
     expect(teams).not.toContain("vercel-labs · current");
 
-    // Left reopens the previous column with the old choice highlighted.
     await session.sendKeys("Left");
     await session.waitForPane(
       (pane) => pane.includes("oauth") && pane.includes("api-key"),
@@ -3159,9 +3152,6 @@ async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
   );
 }
 
-// The inline picker replaced the hub's Credential source screen. Selecting the
-// fx login now goes through the oauth method; with no teams to refine it, the
-// choice commits the credential directly.
 async function selectFxLoginCredential(pickerSession: TmuxSession): Promise<void> {
   await openProviderPicker(pickerSession);
   await pickerSession.sendKeys("Enter");
@@ -3180,8 +3170,6 @@ async function selectFxLoginCredential(pickerSession: TmuxSession): Promise<void
   }
 }
 
-// Selecting the environment key goes through the api-key method's which-key
-// column, which lists it as `env`.
 async function selectEnvKeyCredential(pickerSession: TmuxSession): Promise<void> {
   await openProviderPicker(pickerSession);
   await pickerSession.sendKeys("Enter");
@@ -3221,9 +3209,6 @@ profileStoredKeyTmuxTest(
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
-    // Typing the full path exercises both space-advance columns: the space
-    // after "vercel" opens the methods, the space after "api-key" opens the
-    // which-key column, and Enter on "new" opens the masked field.
     await session.sendText("/provider vercel api-key new");
     await session.waitForText("Paste or type a key", TIMEOUT);
     await session.sendLiteralText(STORED_TOKEN);
@@ -3457,8 +3442,6 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    // The switch above is remembered, so the restart keeps fx login rather than
-    // letting AI_GATEWAY_API_KEY reclaim it through precedence.
     await session.waitForText("auth=fx login", TIMEOUT);
     expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
     await session.sendText("use the remembered credential after restart");
@@ -3466,8 +3449,6 @@ tmuxTest(
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
-    // Acquiring a fresh login needs a signed-out state first; the remembered
-    // seeded login would otherwise resolve straight into the team column.
     await session.sendText("/logout");
     await session.waitForText("Signed out of fx.", TIMEOUT);
     const oauthBase = oauth.requests.length;
@@ -4164,7 +4145,6 @@ test("Codex without a model explains the fix and fx provider codex saves one", a
   expect((JSON.parse(askJson.stdout) as { error: string }).error).toBe("CodexModelNotSelected");
   expect(codexResponseModels(chatgptOauth)).toEqual([]);
 
-  // FX_PROVIDER=codex makes Codex the selected provider, but it has no saved model yet.
   const repair = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
   expect(repair.code, `stdout: ${repair.stdout}\nstderr: ${repair.stderr}`).toBe(0);
   expect(repair.stdout).not.toContain("already selected");
@@ -4806,7 +4786,6 @@ tmuxTest(
       expect(grokResponse).toBeDefined();
       expect(gateway.requests.filter((request) => request.path.includes("responses"))).toHaveLength(0);
       expect(JSON.parse(grokResponse!.body ?? "{}")).toMatchObject({ model: "grok-4.20" });
-      // The flag stays launch-scoped: the configured provider is untouched.
       expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"provider":"gateway"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
@@ -6121,7 +6100,6 @@ test(
           }),
         )
           .toEqual(Array(5).fill(direct.workingModel));
-        // The fourth request is the compaction's own, sent without tools.
         expect(direct.bodies.map((body) => ((JSON.parse(body) as { tools?: unknown[] }).tools?.length ?? 0) === 0))
           .toEqual([false, false, false, true, false]);
         expect(direct.authorizations).toEqual(Array(5).fill(`Bearer ${direct.accessToken}`));
@@ -6387,8 +6365,6 @@ tmuxTest(
     await session.sendText("prove environment auth remains active");
     await session.waitForText(ENV_RESPONSE, TIMEOUT);
     expect(gateway.requests[1].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
-    // The invalid revocation endpoint must never be called, and logout must
-    // not attempt a token refresh on its way out.
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toEqual([]);
     expect(oauth.requests.filter((request) => request.path === "/oauth/revoke")).toEqual([]);
     expect(catcher.requests).toEqual([]);
@@ -6606,8 +6582,6 @@ tmuxTest(
     stderrPath = join(home, "stderr.log");
     const tracePath = join(home, "trace.log");
     writeFileSync(stderrPath, "");
-    // The first turn reads a file, so compaction has work to summarize and
-    // asks the model with the refreshed login.
     writeFileSync(join(home, "compact-auth-notes.txt"), "notes\n");
     gateway = startFakeGateway([
       fakeGatewayToolCall("compact-auth-read", "read_file", { path: "compact-auth-notes.txt" }),
@@ -6643,7 +6617,6 @@ tmuxTest(
     await session.sendText("/compact");
     await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
     await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
-    // Success is silent; wait for durable publication and the activity row to clear.
     await session.waitForPane((pane) =>
       pane.includes("PRESERVE_COMPACTION_DRAFT") &&
       !/Preparing compaction|Compacting|Stopping compaction/.test(pane) &&

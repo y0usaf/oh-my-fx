@@ -673,7 +673,6 @@ fn complete_projected_tool_exchanges(
             }
         }
 
-        // Only result rows move; assistant anchors retain their source indices.
         const results = try alloc.dupe(ChatMessage, projected[index + 1 .. end]);
         defer alloc.free(results);
         var next = index + 1;
@@ -1138,8 +1137,6 @@ test "rejected subagent arguments keep their call and result during projection" 
         .{ .role = .tool, .tool_call_id = "rejected", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
         .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
     };
-    // Rewriting a malformed call into an assistant-role summary would leave
-    // the next request ending in assistant prefill.
     for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
         calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
@@ -3292,9 +3289,6 @@ fn finishPendingParallelCancelled(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            // Same ownership transfer as assembleParallelToolResults: the
-            // parallel run is deinitialized after this scope, while history
-            // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
             try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
@@ -3981,8 +3975,6 @@ fn persistRecoveryCheckpoint(
     trace_ctx: TraceContext,
 ) !void {
     if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
-    // Every sink copies or serializes the borrowed checkpoint synchronously.
-    // Retaining these full-history reconstructions in the turn arena is quadratic.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer mem_utils.deinit_arena(scratch);
     const arena = scratch.allocator();
@@ -3992,7 +3984,6 @@ fn persistRecoveryCheckpoint(
     );
     const projected = try finalization.compacted_execution.project(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
-    // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
@@ -4193,7 +4184,6 @@ test "running tool calls reach append_turn_piece before they run" {
         .{ .role = .assistant, .content = "Running both now.", .tool_calls = &running },
     };
 
-    // Without the hook, as on v1, nothing is built or sent.
     try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
     try std.testing.expectEqual(@as(usize, 0), sink.appends);
 
@@ -4201,15 +4191,12 @@ test "running tool calls reach append_turn_piece before they run" {
     deps.append_turn_piece = Sink.append;
     try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
     try std.testing.expectEqual(@as(usize, 1), sink.appends);
-    // The finished step travels as execution memory, the running calls beside it.
     try std.testing.expectEqual(@as(usize, 1), sink.finished_steps);
     try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
     try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
     try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
-    // With the text of the message that issued them, not an earlier one (D51).
     try std.testing.expectEqualStrings("Running both now.", sink.running_text.?);
 
-    // A step with no calls sends nothing.
     try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});
     try std.testing.expectEqual(@as(usize, 1), sink.appends);
 }
@@ -4287,8 +4274,6 @@ fn pushNetworkRecord(
         debug_trace.logf("agent", "network record format failed err={s}", .{@errorName(err)});
         return;
     };
-    // The event channel owns its payload: dupe before transfer, free on
-    // publication failure.
     const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
         .topic = "network",
         .tone = if (streamSucceeded(result.*)) .neutral else .warning,
@@ -5233,9 +5218,6 @@ fn finishRecoveryStalled(
         .required_action = .surface_stall,
         .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
     });
-    // A stall-stopped turn is terminally dead: without clearing the durable
-    // checkpoint, the next resume would auto-continue it and re-spend attempts
-    // on a turn the UI already called stopped.
     if (deps.recovery_checkpoint) |effect| {
         effect.clear(deps.ctx) catch |err| {
             debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
@@ -5259,9 +5241,6 @@ fn pushUnsafeNoRetryStatus(
     });
 }
 
-// Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
-// negative under NTP correction; a backward step reads as zero elapsed,
-// never a trap.
 fn recoveryElapsedNs(recovery_started_at_ms: ?i64) ?u64 {
     const started = recovery_started_at_ms orelse return null;
     const delta_ms = io_mod.milliTimestamp() - started;
@@ -5295,10 +5274,6 @@ fn restorePromptAfterTerminalFailure(
     };
 }
 
-// A user-cancelled turn's durable checkpoint dies with it; otherwise the next
-// resume would auto-continue a turn the user explicitly stopped. Covers the
-// model-response cancel paths, including a cancel during an episode's first
-// retry wait; no-ops when no checkpoint exists.
 fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
     const effect = deps.recovery_checkpoint orelse return;
     effect.clear(deps.ctx) catch |err| {
@@ -5654,8 +5629,6 @@ fn processQueuedPromptInner(
         );
     }
 
-    // The overlay arena is reset for every model step so refreshed env,
-    // background snapshots do not accumulate for the whole turn.
     var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer mem_utils.deinit_arena(overlay_arena_state);
 
@@ -5882,8 +5855,6 @@ fn processQueuedPromptInner(
         &stop_state,
         agent,
     ) catch |err| {
-        // A turn that yielded stays open for the host to resume, so nothing
-        // it did is finished as a failure.
         if (err == error.TurnYielded) return err;
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
@@ -6384,7 +6355,6 @@ fn compactWithProgress(
         "origin={s} removed_turns={d} compaction_count={d} summary_bytes={d} tools={d}",
         .{ @tagName(request.activity_origin), result.cut.turns, result.checkpoint.compaction_count, result.model_text.len, result.tool_count },
     );
-    // A successful acknowledgement wins even if cancellation arrived during publication.
     if (progress.operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{
         .outcome = .succeeded,
         .stage = .publication,
@@ -6409,7 +6379,6 @@ const CompactionProgress = struct {
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {
         const self: *CompactionProgress = @ptrCast(@alignCast(context));
-        // An operation exists only when the activity effect is bound.
         const effect = self.deps.compaction_activity;
         switch (step) {
             .chosen => {
@@ -6477,7 +6446,6 @@ test "compaction activity automatic error provenance excludes secondary finaliza
             var agent: runtime_agent.Agent = .{};
             defer agent.deinit(alloc);
             try agent.restoreHistory(alloc, job.history);
-            // The conversation's model fails, then the fallback model does too.
             const expected: anyerror = if (secondary_failure) error.ContextCapacityExceeded else error.ModelFailed;
             try std.testing.expectError(expected, processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job));
             try std.testing.expectEqual(@as(usize, 2), gateway.index);
@@ -6592,7 +6560,6 @@ test "automatic compaction interruption persists transport cancellation and pres
         try agent.restoreHistory(alloc, job.history);
         const result = processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job);
         if (case.committed) {
-            // The next request build observes cancellation outside the committed transaction.
             try std.testing.expectError(error.Cancelled, result);
             try std.testing.expectEqual(types.TurnPresentationOutcome.failed, host.fake.finalized_outcome.?);
             try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_history_count);
@@ -6728,9 +6695,6 @@ test "compaction activity transaction settles only after publication and preserv
         defer alloc.free(dir);
         var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
         defer capability.deinit();
-        // A tool call leaves work to summarize, so the model is asked. Its
-        // output is larger than the kept budget, so the turn is compacted,
-        // while its user message still fits word for word.
         const notes = text_utils.repeat("recorded notes ", 400);
         const calls = [_]types.ToolCall{.{ .id = "record-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
         const results = [_]types.PersistedToolResult{.{
@@ -6802,7 +6766,6 @@ test "compaction activity transaction settles only after publication and preserv
         host.worker.finishProcessing();
         try std.testing.expectEqualDeep(terminal, host.worker.compactionActivitySnapshot());
 
-        // Unbound callers keep the same original cancellation result and no presentation output.
         deps.compaction_activity = null;
         provenance = null;
         host.cancel.store(true, .seq_cst);
@@ -6860,13 +6823,9 @@ fn processQueuedPromptLoop(
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
-    // The provider's count of the first request after a compaction is traced,
-    // so its size can be checked against the room compaction had.
     var trace_count_after_compaction = false;
     var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
-    // Request-token calibration lives on the agent so the first request of a
-    // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -6976,17 +6935,12 @@ fn processQueuedPromptLoop(
     var fast_unavailable_notified = false;
     var ultrafast_unconfirmed_notified = false;
     var tool_image_strip_notified = false;
-    // Attachment pixel sizes probed during this turn, so each step does not
-    // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
         restored_attempts;
     var retry_pacing: model_response_recovery.RetryPacingState = .idle;
-    // Wall-clock state for autonomous recovery: when this turn entered
-    // recovery (drives the billable-retry throttle), and the no-progress
-    // detector that stops identical-failure restart loops.
     var recovery_started_at_ms: ?i64 = null;
     var recovery_last_progress: ?usize = null;
     var recovery_no_progress_streak: usize = 0;
@@ -7193,10 +7147,6 @@ fn processQueuedPromptLoop(
                 pending_auto_retry_status = null;
                 return;
             }
-            // The provider-attempt budget is deliberately not a turn limit:
-            // transient failures keep recovering autonomously (throttled past
-            // the billable window, stall-stopped when nothing progresses, and
-            // always esc-cancellable). Only a lifecycle pause flag parks a turn.
 
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
             if (skip_next_preflight_refresh) {
@@ -7369,11 +7319,6 @@ fn processQueuedPromptLoop(
             if (request_messages.ptr != image_projection.messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
             }
-            // Tool images withheld because the catalog could not confirm image
-            // input are invisible in the transcript otherwise. Tell the user
-            // once per turn, and only when the catalog itself is known to be
-            // down; a confirmed model without image input relies on the
-            // model-facing notice instead.
             if (image_projection.stripped and !tool_image_strip_notified and
                 request_capabilities.image_input_support == .unknown and
                 deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
@@ -7388,10 +7333,6 @@ fn processQueuedPromptLoop(
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
-            // Fast drops silently when the catalog cannot confirm support.
-            // Tell the user once per turn, but only when the catalog itself is
-            // known to be down; a reachable catalog that simply lacks fast
-            // metadata for the model stays quiet.
             if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
                 deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
             {
@@ -7454,8 +7395,6 @@ fn processQueuedPromptLoop(
                 request_cost_for_attempt = request_cost;
                 const has_new_compactable_context = !just_rebuilt_request;
                 const overflow_pending = context_overflow_recovery == .pending;
-                // The same request without the conversation, measured the same
-                // way: the part compaction cannot shrink.
                 var fixed_request = request_data;
                 fixed_request.messages = &.{};
                 agent.request_fixed_tokens = if (try deps.agent_stream_provider.buildRequest(overlay_arena, fixed_request)) |fixed_body| fixed: {
@@ -7500,7 +7439,6 @@ fn processQueuedPromptLoop(
                         return error.ContextCapacityExceeded;
                     };
                 } else {
-                    // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
                         .user = .{ .text = job.prompt, .images = job.images },
                         .assistant = @constCast(""),
@@ -7536,9 +7474,6 @@ fn processQueuedPromptLoop(
                         .max_output_tokens = request_data.max_output_tokens,
                         .capabilities_context = deps.ctx,
                         .capabilities_fn = deps.available_model_capabilities,
-                        // The request just built starts like the one sent
-                        // before it, so the provider has most of it cached.
-                        // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
                     };
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
@@ -7606,8 +7541,6 @@ fn processQueuedPromptLoop(
                         );
                         agent.request_token_calibration = null;
                         skip_next_preflight_refresh = true;
-                        // A message queued while the compaction ran must ride the
-                        // rebuilt request, not wait for the reply after it.
                         const post_compaction_action = try observe_steering_boundary(
                             deps,
                             arena,
@@ -8159,11 +8092,6 @@ fn processQueuedPromptLoop(
                     }
                 }
                 agent.observeUsage(completion.usage);
-                // The completion buffer is step-scoped, so no cross-step
-                // dedupe: each completion reports its serving provider once.
-                // The push_event callback takes ownership of the payload on
-                // every outcome, including error returns, so this scope never
-                // frees `owned` after the call.
                 if (completion.resolved_provider) |provider| {
                     if (std.heap.c_allocator.dupe(u8, provider)) |owned| {
                         deps.push_event(deps.ctx, .{ .provider_resolved = owned }) catch |err| {
@@ -8237,9 +8165,6 @@ fn processQueuedPromptLoop(
             else
                 compacted_suffix_len < within_turn_suffix.items.len;
             if (response_failure) |failure| {
-                // A size rejection with images aboard retries with a lower
-                // limit, which leaves out the oldest images instead of
-                // compacting the conversation.
                 if (request_cost_for_attempt) |rejected| if (shouldRetryWithFewerImages(
                     failure,
                     request_images_for_attempt,
@@ -8393,10 +8318,6 @@ fn processQueuedPromptLoop(
                     streamReplaySafe(&stream_ctx),
                     step_ctx,
                 );
-                // HTTP-status failures (5xx, 429) carry no stream progress, so
-                // they are exempt from the no-progress detector and keep
-                // retrying patiently. The billable retry window still applies:
-                // past it, the cadence throttles instead of hammering.
                 if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
                 const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 const decision = model_response_recovery.decide(.{
@@ -8728,9 +8649,6 @@ fn processQueuedPromptLoop(
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
                 const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
-                // Interrupted streams and provider-error completions carry
-                // progress evidence; bare HTTP status failures (5xx, 429) and
-                // gateway timeout metadata are exempt from the stall detector.
                 const failure_progress = stream_ctx.streamed_output_bytes;
                 const track_progress = cause == .response_interrupted or
                     (attempt_disposition == .provider_failure and cause == .provider_unavailable);
@@ -8888,8 +8806,6 @@ fn processQueuedPromptLoop(
                             attempt_completion,
                             &stream_ctx,
                         );
-                        // Probes and connectivity waits are not provider
-                        // attempts: nothing billable was sent.
                         if (decision.reserve_provider_attempt) semantic_attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
@@ -9031,7 +8947,6 @@ fn processQueuedPromptLoop(
 
         var completion = streamCompletion(stream_result);
         const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
-            // Later requests borrow these turn-arena bytes after response cleanup.
             stream_result.completed.completion.provider_state_json = null;
             break :replay .{ .source = .{ .provider = job.provider, .model = gateway_model }, .parts_json = parts };
         } else null;
@@ -10020,7 +9935,6 @@ fn processQueuedPromptLoop(
                 .none => false,
                 .read_only => root_action_permission_mode == .auto or
                     root_action_permission_mode == .yolo,
-                // Each call is reviewed before the group starts.
                 .subagent, .host => true,
             };
             const parallel_candidate_len = if (parallel_permission_eligible)
@@ -10446,8 +10360,6 @@ fn processQueuedPromptLoop(
                 ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
                     if (parallel_call.argument_integrity != .valid) continue;
-                    // Results that failed the tool's own preflight/content
-                    // checks are tool failures, not permission rejections.
                     switch (execution.failure_kind) {
                         .preflight, .apply => try runtime_tool_admission.recordFailedToolCall(
                             deps,
@@ -11012,9 +10924,6 @@ fn processQueuedPromptLoop(
                 }
             }
             const is_file_mutation = file_mutation_contract.isToolName(tool_call.name) and
-                // A host tool may reuse a reserved file-mutation name; it owns
-                // its own execution and never enters the builtin contract. A
-                // missing registry entry keeps the contract's own failure path.
                 (deps.tool_registry.lookup(tool_call.name) == null or
                     deps.tool_registry.lookup(tool_call.name).?.executor_kind != .host);
             var prepared_file_mutation: ?tooling_tool_admission.PreparedFileMutationCall = null;
@@ -11044,8 +10953,6 @@ fn processQueuedPromptLoop(
                 };
                 switch (admission) {
                     .tool_failure => break :fresh false,
-                    // A host tool reuses a reserved mutation name; it has no
-                    // builtin mutation targets to keep fresh.
                     .not_file_mutation => break :fresh false,
                     .prepared => |prepared| {
                         prepared_file_mutation = prepared;
@@ -11463,8 +11370,6 @@ fn processQueuedPromptLoop(
                     prepared_failure.memory,
                     .{ .increment_error = true },
                 );
-                // A permission-stage tool_failure ran the tool's preflight
-                // content checks and failed them; record a tool failure.
                 try runtime_tool_admission.recordFailedToolCall(
                     deps,
                     arena,
@@ -12167,8 +12072,6 @@ fn processQueuedPromptLoop(
                     .finalizing,
                 );
                 switch (terminal_action) {
-                    // The turn is already ending; an ineligible prompt runs as
-                    // the next turn after the normal terminal finish.
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
                 }

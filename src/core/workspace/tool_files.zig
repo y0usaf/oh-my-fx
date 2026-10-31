@@ -117,8 +117,6 @@ fn subtreePath(entry: indexer.Entry, subtree: []const u8) ?[]const u8 {
 
 fn collect(arena: Allocator, tree: *const indexer.Tree, subtree: []const u8, options: Options) Allocator.Error!Listing {
     const keep_hidden = options.include_hidden or (options.include_hidden_in_repository and tree.repository);
-    // Reserve once for every file in the subtree, so the list never grows.
-    // Only the cheap checks run here; hidden paths are left out while filling.
     var upper: usize = 0;
     for (tree.entries) |entry| upper += @intFromBool(subtreePath(entry, subtree) != null);
     const files = try arena.alloc([]const u8, upper);
@@ -130,7 +128,6 @@ fn collect(arena: Allocator, tree: *const indexer.Tree, subtree: []const u8, opt
         count += 1;
     }
     return .{
-        // The unused tail belongs to the arena like the rest of the listing.
         .files = files[0..count],
         .candidate_cap = options.candidate_cap,
         .incomplete = tree.incomplete or tree.cap_reached,
@@ -203,8 +200,6 @@ test "listing sees a file created a moment earlier and honors hidden and custom 
     }
     const root = try @import("../shared/io.zig").dirRealpathAlloc(arena, tmp.dir, "root");
 
-    // The temporary folder sits below an ignored path, so the skipped names
-    // apply; `build` is skipped by default.
     const first = try list(std.testing.allocator, arena, root, root, .{});
     try std.testing.expectEqual(@as(usize, 3), first.files.len);
     try std.testing.expectEqualStrings("a.txt", first.files[0]);
@@ -251,7 +246,6 @@ test "a tree cut at the cap answers only a whole-workspace search with the same 
         .{ .path = "tools", .kind = .directory },
     };
     var tree: indexer.Tree = .{ .root = "/w", .root_inode = 1, .scan_started_ns = 0, .repository = true, .incomplete = false, .cap_reached = false, .skipped_overlong = 0, .skipped_names = &.{}, .entries = &entries, .folders = &.{}, .sources = &.{} };
-    // Folder rows do not count: two files fit a cap of two.
     try std.testing.expect(capAllowsReuse(&tree, "", 2));
     try std.testing.expect(capAllowsReuse(&tree, "src", 2));
     try std.testing.expect(!capAllowsReuse(&tree, "", 1));

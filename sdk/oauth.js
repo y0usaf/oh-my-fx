@@ -1,5 +1,3 @@
-// Pieces the subscription sign-ins share: PKCE secrets, reading a pasted
-// redirect address, and waiting between device code polls.
 
 const maxAddressBytes = 16 * 1024;
 const encoder = new TextEncoder();

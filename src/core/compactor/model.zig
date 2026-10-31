@@ -103,8 +103,6 @@ pub const Summarizer = struct {
     fn summarizeWith(context: *anyopaque, alloc: Allocator, prompt: summarize.Prompt) summarize.ModelError![]u8 {
         const self: *Summarizer = @ptrCast(@alignCast(context));
         self.summaries += 1;
-        // Only the conversation's own model has it cached; when it fails,
-        // the summary step writes the turns out instead.
         if (prompt.after_conversation) return self.ask(alloc, prompt, prompt.model);
         var primary_error: ?summarize.ModelError = null;
         if (self.ask(alloc, prompt, prompt.model)) |text| {
@@ -114,9 +112,6 @@ pub const Summarizer = struct {
             if (err == error.Cancelled or err == error.OutOfMemory) return err;
             primary_error = err;
         }
-        // Only the gateway can route to another model family with this
-        // credential. Elsewhere an empty reply becomes the summary step's
-        // EmptySummary error.
         if (self.caller.provider != .gateway) {
             if (primary_error) |err| return err;
             return alloc.dupe(u8, "");
@@ -224,7 +219,6 @@ test "a failed or empty summary falls back to another family at its lowest reaso
         try std.testing.expectEqualStrings("openai/gpt-6-sol", scripted.calls.items[1].model);
         try std.testing.expect(scripted.calls.items[1].reasoning.?.eql(types.ReasoningEffort.literal("none")));
     }
-    // Only the gateway can reach another family.
     var direct: ScriptedCaller = .{ .replies = &.{null} };
     defer direct.calls.deinit(std.testing.allocator);
     var summarizer: Summarizer = .{ .caller = direct.caller(.codex), .cancel_flag = &cancel, .trace_ctx = .{} };

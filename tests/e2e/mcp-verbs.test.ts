@@ -5,8 +5,6 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
-// `fx mcp` on MCP-v2. Sign-in is covered in mcp-auth.test.ts.
-
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
 let cleanup: string | null = null;
@@ -73,7 +71,6 @@ const fixtureServer = (extra: Record<string, unknown> = {}) => ({
 
 describe("fx mcp on MCP-v2", () => {
   test("add writes each file and keeps every key it doesn't know", async () => {
-    // Raw text, so the number's spelling reaches fx as written.
     const root = createRoot('{"theme":"dark","mcp":{"old":{"command":"true","environment":{"A":"1"},"startup_timeout_ms":1.50}}}');
     writeFileSync(root.projectPath, '{"mcpServers":{},"note":"shared"}');
     chmodSync(root.projectPath, 0o640);
@@ -163,7 +160,6 @@ describe("fx mcp on MCP-v2", () => {
     ]);
     expect(servers[4]).toMatchObject({ source: "project", file: root.projectPath, transport: "stdio", tools: null, error: null });
 
-    // A server whose ${VAR} isn't set is skipped, and list says why.
     writeFileSync(root.projectPath, JSON.stringify({ mcpServers: { docs: { command: "x", args: ["${FX_VERBS_UNSET}"] } } }));
     await mcp(root, "approve", "docs");
     const noted = await mcp(root, "list");
@@ -171,7 +167,6 @@ describe("fx mcp on MCP-v2", () => {
     expect(noted.stderr).toBe("note: .mcp.json server 'docs' field argument requires environment variable 'FX_VERBS_UNSET'; set it or use ${FX_VERBS_UNSET:-default}.\n");
     expect(noted.stdout).not.toContain("docs");
 
-    // fx won't send a token written into an Authorization header.
     writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { bad: { type: "http", url: "https://b/mcp", headers: { Authorization: "Bearer x" } } } }));
     const refused = await mcp(root, "list");
     expect(refused.code).toBe(1);
@@ -301,7 +296,6 @@ describe("fx mcp on MCP-v2", () => {
 
 describe("/mcp in the shell on MCP-v2", () => {
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
-    // The shell can ask questions, so it says so to servers.
     const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both" } }) } });
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
@@ -313,7 +307,6 @@ describe("/mcp in the shell on MCP-v2", () => {
     });
     await tui.waitForComposer(15_000);
 
-    // Servers start on their own once the first frame is up, and the status line counts them.
     await tui.waitForText("mcp 1/1", 10_000);
     await tui.sendText("/mcp list");
     await tui.waitForText("fixture  ~/.fx/mcp.json  stdio      ready, 1 tool", 10_000);
@@ -321,7 +314,6 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
     await tui.waitForText("version    2026-07-28", 5_000);
 
-    // Completion: the verbs, then the servers each verb takes.
     await tui.sendLiteral("/mcp ");
     await tui.waitForText("connect to a server and list its tools", 10_000);
     await tui.sendLiteral("show ");
@@ -335,7 +327,6 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.sendText("/mcp add web https://w.example/mcp");
     await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
     await tui.sendText("/mcp list");
-    // Added, it starts too; this address never answers.
     await tui.waitForText(/web +~\/\.fx\/mcp\.json +http +(connecting|retrying|failed)/, 10_000);
     await tui.waitForText("ready, ", 5_000);
 
@@ -361,25 +352,20 @@ describe("/mcp in the shell on MCP-v2", () => {
       height: 36,
       env: { ...root.env, DOCS_TOKEN: undefined, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
     });
-    // Not a prompt: the composer is free, and the status line says what's waiting.
     await tui.waitForComposer(15_000);
     await tui.waitForText("2 MCP servers need you · /mcp", 10_000);
-    // One left, it's named; it stays until it's handled.
     await tui.sendText("/mcp reject broken");
     await tui.waitForText("proj is waiting for approval · /mcp", 10_000);
     await tui.sendText("/mcp reject proj");
-    // Then the config problem, which /mcp list shows.
     await tui.waitForText("MCP config has 1 problem · /mcp list", 10_000);
     await tui.sendText("/mcp list");
     await tui.waitForText("server 'docs' field argument requires environment variable 'DOCS_TOKEN'", 10_000);
-    // None of it was printed above the composer on its own.
     const scrollback = await tui.captureFullScrollback();
     expect(scrollback).not.toContain("waiting for approval: broken");
     expect(scrollback).not.toContain("Use /mcp approve");
   }, 60_000);
 
   test.skipIf(!tmuxAvailable())("quitting waits for no server: each gets SIGTERM", async () => {
-    // Only SIGTERM ends it: it never reads stdin, and never answers.
     const root = createRoot({
       mcpServers: { slow: { command: "/bin/sh", args: ["-c", "echo $$ > slow.pid; trap 'exit 0' TERM; while :; do sleep 0.05; done"] } },
     });
@@ -403,7 +389,6 @@ describe("/mcp in the shell on MCP-v2", () => {
       const start = Date.now();
       await tui.sendKeys("C-c");
       while (tui.isAlive() && Date.now() - start < 5_000) await Bun.sleep(20);
-      // A graceful stop would wait 1.5 s on the closed stdin before SIGTERM.
       expect(Date.now() - start).toBeLessThan(1_000);
       for (let i = 0; i < 50 && isRunning(pid); i++) await Bun.sleep(20);
       expect(isRunning(pid)).toBe(false);
@@ -432,29 +417,24 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.waitForText(/proj +waiting for approval +project/, 5_000);
     await tui.waitForText("↑↓ navigate     enter open     esc close", 5_000);
 
-    // Typing filters; Enter connects the server and lists its tools.
     await tui.sendLiteral("fix");
     await tui.waitForText("MCP servers  1 of 3", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
     await tui.waitForText("› Remove        /mcp remove fixture", 5_000);
-    // Typing filters its tools, by name or description; the list's filter waits.
     await tui.sendLiteral("zz");
     await tui.waitForText("No tools match.", 5_000);
     await tui.sendKeys("BSpace BSpace");
     await tui.sendLiteral("THROUGH");
     await tui.waitForText("Tools 1 of 1", 5_000);
     await tui.waitForText("Echo text through the modern MCP fixture", 5_000);
-    // ↓ goes on into the tools, where Enter has nothing to run.
     await tui.sendKeys("Down");
     await tui.waitForText("↑↓ navigate     esc back", 5_000);
-    // Esc goes back, then closes and clears the filter.
     await tui.sendKeys("Escape");
     await tui.waitForText("MCP servers  1 of 3", 5_000);
     await tui.sendKeys("Escape");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("fix"), 5_000);
 
-    // Ctrl+C closes the menu from a server's screen, without arming the exit.
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  3", 10_000);
     await tui.sendKeys("Enter");
@@ -463,7 +443,6 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     expect(await tui.capturePane()).not.toContain("press ctrl+c again to exit");
 
-    // A choice that changes something asks first; anything but Enter is no.
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  3", 10_000);
     await tui.sendKeys("Down Down Enter");
@@ -477,21 +456,17 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(await tui.capturePane()).not.toContain("Approved proj");
 
-    // Confirmed, it runs `/mcp approve proj`, which prints in the conversation.
     await tui.sendKeys("Enter");
     await tui.waitForText("enter confirm     esc cancel", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Approved proj, which runs: node proj.js --port 4100", 10_000);
-    // The reload follows, and the screen with it.
     await tui.waitForText("› Reject        /mcp reject proj", 10_000);
 
-    // Remove asks which file it edits; Esc keeps the server, Enter removes it.
     await tui.sendKeys("Escape");
     await tui.waitForText("MCP servers  3", 5_000);
     await tui.sendKeys("Up Enter");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
-    // It asks in the hint line; the server's screen stays as it was.
     await tui.waitForText("Remove web from ~/.fx/mcp.json?     enter yes     esc no", 5_000);
     expect(await tui.capturePane()).toContain("› Remove        /mcp remove web");
     await tui.sendKeys("Escape");
@@ -501,7 +476,6 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.waitForText("Remove web from ~/.fx/mcp.json?", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Removed web from ~/.fx/mcp.json.", 10_000);
-    // Its screen goes with it, back to the list.
     await tui.waitForText("MCP servers  2", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
   }, 90_000);

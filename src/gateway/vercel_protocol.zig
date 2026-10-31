@@ -678,11 +678,6 @@ fn write_tool_result_group(
 
 const tool_image_followup_text = "Attached image(s) from the tool result.";
 
-// Retained tool images ride in a user message following the contiguous tool
-// run: user-position file parts are the one image position every gateway
-// provider route renders as vision input, while tool-result-position images
-// are ignored by several routes (and the legacy "image-data" part type was
-// removed from the gateway spec). Writes nothing when the run has no images.
 fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMessage, budget: ?BuildBudget) !void {
     var has_images = false;
     for (results) |result| {
@@ -698,8 +693,6 @@ fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMe
     try std.json.Stringify.value(tool_image_followup_text, .{}, writer);
     try writer.writeByte('}');
     for (results) |result| {
-        // Mirror the tool-result gate: images from permission-denied results
-        // never leave the process.
         const failed = if (result.tool_result_status) |status| status == .failure else false;
         if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
         const memory = result.tool_result_memory orelse continue;
@@ -728,10 +721,6 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
     const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
     const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
     if (tool_images.len > 0 and !denied) {
-        // Retained tool images are delivered in a follow-up user message (see
-        // write_tool_image_user_message). Tool-result-position image parts are
-        // ignored by several gateway provider routes, so only the text
-        // acknowledgment stays here.
         try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
         const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
@@ -1478,10 +1467,8 @@ test "Gateway request replays separated messages as their own text" {
     try std.testing.expectEqualStrings("final_answer", parts[1].object.get("providerOptions").?.object.get("openai").?.object.get("phase").?.string);
 
     for ([_]struct { content: []const u8, parts_json: []const u8 }{
-        // Only the exact separator may sit between replayed spans.
         .{ .content = "Checking.\nDone.", .parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9},{\"type\":\"text\",\"offset\":10,\"length\":5}]" },
         .{ .content = "Checking.xxDone.", .parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9},{\"type\":\"text\",\"offset\":11,\"length\":5}]" },
-        // A separator never precedes the first message.
         .{ .content = "\n\nDone.", .parts_json = "[{\"type\":\"text\",\"offset\":2,\"length\":5}]" },
     }) |case| {
         const invalid = [_]ChatMessage{.{ .role = .assistant, .content = case.content, .provider_replay = .{
@@ -2046,7 +2033,6 @@ fn check_grouped_request_allocations(alloc: std.mem.Allocator) !void {
         .{ .role = .tool, .tool_call_id = "b", .tool_name = "read_file", .content = "second" },
     };
     const body = buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true }, .auto) catch |err| switch (err) {
-        // The allocation checker expects OOM; this writer has no other failure source.
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };

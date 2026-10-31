@@ -342,7 +342,6 @@ pub const Runtime = struct {
         request_id: ?RequestId,
     ) EnqueueError!void {
         return self.enqueueEntry(alloc, text, request_id, null) catch |err| switch (err) {
-            // Only an input id can be invalid, and none is given here.
             error.InvalidInputId => unreachable,
             else => |other| other,
         };
@@ -394,9 +393,6 @@ pub const Runtime = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.user_cancelled) return .{ .texts = &.{}, .request_ids = &.{} };
-        // A boundary comes before the next step's request: until that step
-        // streams, a compaction or the request itself may run, and neither is
-        // a reply a steer cuts short.
         self.step = null;
         if (self.messages.items.len == 0) {
             if (close_if_empty) self.accepting = false;
@@ -424,7 +420,6 @@ pub const Runtime = struct {
             request_ids[index] = if (entry.request_id) |id| try dupeRequestId(result_alloc, id) else null;
             copied += 1;
         }
-        // Capacity for every queued request was reserved at enqueue.
         for (self.messages.items) |entry| {
             backing.free(entry.text);
             if (entry.input_id) |id| backing.free(id);
@@ -618,13 +613,10 @@ test "a libfx steer interrupts a streaming reply and the cancel boundary continu
     var cancel_flag = std.atomic.Value(bool).init(false);
     runtime.open(alloc);
 
-    // No step has started: nothing to interrupt yet.
     try runtime.enqueueInput(alloc, "use tabs", "in_1");
     try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
-    // The reply starts streaming with the steer queued: it interrupts at once.
     try std.testing.expect(runtime.notePhase(1, .reply, &cancel_flag));
     try std.testing.expect(cancel_flag.load(.seq_cst));
-    // One interrupt at a time.
     try runtime.enqueueInput(alloc, "be brief", "in_2");
     try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
 
@@ -636,8 +628,6 @@ test "a libfx steer interrupts a streaming reply and the cancel boundary continu
     try std.testing.expectEqual(@as(usize, 2), drained.texts.len);
     try std.testing.expectEqualStrings("in_1", drained.input_ids[0].?);
 
-    // Between the boundary and the next step's reply nothing is cut short;
-    // that reply is.
     try runtime.enqueueInput(alloc, "also this", "in_3");
     try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
     try std.testing.expect(runtime.notePhase(2, .reply, &cancel_flag));
@@ -653,19 +643,14 @@ test "a libfx steer waits while the step works on tool calls or a tool runs" {
     try std.testing.expect(!runtime.notePhase(1, .tools, &cancel_flag));
     try runtime.enqueueInput(alloc, "use tabs", "in_1");
     try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
-    // Text after a tool call's arguments in the same step is still that step.
     try std.testing.expect(!runtime.notePhase(1, .reply, &cancel_flag));
     runtime.noteToolStarted(alloc, "call-1");
     runtime.noteToolStarted(alloc, "call-1");
-    // A tool still runs while the next step starts.
     try std.testing.expect(!runtime.notePhase(2, .reply, &cancel_flag));
-    // An end for a call that never started changes nothing.
     runtime.noteToolEnded(alloc, "call-9");
     try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
     runtime.noteToolEnded(alloc, "call-1");
     try std.testing.expect(!cancel_flag.load(.seq_cst));
-    // The boundary before the next request takes the steer; with it queued
-    // instead, the next streaming reply is cut short.
     try std.testing.expect(runtime.notePhase(3, .reply, &cancel_flag));
     try std.testing.expect(cancel_flag.load(.seq_cst));
 }
@@ -683,7 +668,6 @@ test "a user cancel overrides a libfx steer's interrupt and keeps queued inputs 
     try std.testing.expect(runtime.claimInterrupt(&cancel_flag));
     runtime.cancelForUser(&cancel_flag);
     try std.testing.expect(cancel_flag.load(.seq_cst));
-    // The cancel boundary ends the turn, which takes nothing more.
     try std.testing.expectEqual(@as(?Runtime.Interrupt, null), runtime.takeInterrupt(&cancel_flag));
     try std.testing.expect(cancel_flag.load(.seq_cst));
     const drained = try runtime.takeAll(alloc, alloc, false);
@@ -691,8 +675,6 @@ test "a user cancel overrides a libfx steer's interrupt and keeps queued inputs 
     try std.testing.expectEqual(@as(usize, 0), drained.texts.len);
     try std.testing.expectError(error.SteeringNotActive, runtime.enqueueInput(alloc, "late", "in_2"));
 
-    // As the turn ends, the libfx input is handed back; the rest stays for
-    // the turn's end to report.
     const unplaced = try runtime.takeUnplacedInputs(alloc, alloc);
     defer {
         for (unplaced) |id| alloc.free(id);
@@ -706,7 +688,6 @@ test "a user cancel overrides a libfx steer's interrupt and keeps queued inputs 
     defer finished.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
 
-    // The next turn starts with no cancel and no interrupt.
     runtime.open(alloc);
     try std.testing.expect(!runtime.user_cancelled);
     try runtime.enqueueInput(alloc, "next", "in_3");
@@ -719,15 +700,12 @@ test "a libfx handoff ends a streaming reply at once and a tool step at its boun
     var cancel_flag = std.atomic.Value(bool).init(false);
     runtime.open(alloc);
 
-    // While the model streams a reply, a handoff cuts it short, and the cancel
-    // boundary that follows ends the turn with the cancel still set.
     _ = runtime.notePhase(1, .reply, &cancel_flag);
     try std.testing.expect(runtime.requestHandoff(&cancel_flag));
     try std.testing.expect(cancel_flag.load(.seq_cst));
     try std.testing.expectEqual(Runtime.Interrupt.handoff, runtime.takeInterrupt(&cancel_flag).?);
     try std.testing.expect(cancel_flag.load(.seq_cst));
 
-    // While the step works on a tool call, the handoff waits for the boundary.
     cancel_flag.store(false, .seq_cst);
     runtime.open(alloc);
     try std.testing.expect(!runtime.notePhase(1, .tools, &cancel_flag));
@@ -735,7 +713,6 @@ test "a libfx handoff ends a streaming reply at once and a tool step at its boun
     try std.testing.expect(!cancel_flag.load(.seq_cst));
     try std.testing.expect(runtime.handoffPending());
 
-    // A cancelled turn takes no handoff.
     runtime.open(alloc);
     runtime.cancelForUser(&cancel_flag);
     try std.testing.expect(!runtime.requestHandoff(&cancel_flag));
@@ -749,13 +726,11 @@ test "a libfx steer's interrupt is spent once its steer is placed or its turn en
     var cancel_flag = std.atomic.Value(bool).init(false);
     runtime.open(alloc);
 
-    // A model announcing a tool call ends what a steer may cut short.
     _ = runtime.notePhase(1, .reply, &cancel_flag);
     runtime.noteToolsPhase();
     try runtime.enqueueInput(alloc, "use tabs", "in_1");
     try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
 
-    // An interrupt a boundary no longer needs is spent; a user cancel is not.
     try std.testing.expect(runtime.notePhase(2, .reply, &cancel_flag));
     runtime.releaseInterrupt(&cancel_flag);
     try std.testing.expect(!cancel_flag.load(.seq_cst));
@@ -764,7 +739,6 @@ test "a libfx steer's interrupt is spent once its steer is placed or its turn en
     runtime.releaseInterrupt(&cancel_flag);
     try std.testing.expect(cancel_flag.load(.seq_cst));
 
-    // After the turn's end hands back its inputs, a late steer is refused.
     runtime.open(alloc);
     try runtime.enqueueInput(alloc, "late enough", "in_2");
     const unplaced = try runtime.takeUnplacedInputs(alloc, alloc);
@@ -813,6 +787,5 @@ test "libfx steering withdraws a queued input until the turn takes it" {
     try std.testing.expectEqualStrings("in_1", drained.input_ids[0].?);
     try std.testing.expectEqualStrings("be brief", drained.texts[1]);
     try std.testing.expectEqualStrings("in_3", drained.input_ids[1].?);
-    // Taken for a model request: too late to withdraw.
     try std.testing.expect(!runtime.withdraw(alloc, "in_1"));
 }

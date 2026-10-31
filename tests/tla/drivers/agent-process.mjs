@@ -1,10 +1,3 @@
-// One process of drive-agents.mjs, in a worker thread so it has a module
-// instance and a globalThis of its own, as a process does: its agents, on
-// one durability over the walk's world-local directory that makes each of
-// them a World of its own, as the durability of agents created without one
-// does. Every message its agents queue goes to the driver, which holds them
-// all until a step delivers one here, to the queue handler of the World the
-// driver picks.
 import { parentPort, workerData } from "node:worker_threads";
 import { createDurableAgentFactory, foldSessionLog } from "../../../sdk/durable.js";
 import { world } from "../../../sdk/durable/world.mjs";
@@ -14,10 +7,8 @@ const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/
 const encoder = new TextEncoder();
 const inner = Symbol("handler");
 
-// The turns this process ran since the driver last asked, as [sessionId, agent name].
 let ran = [];
 
-// A harness whose every turn is one step, recorded with the agent's name.
 const createAgent = createDurableAgentFactory({
   name: "createRoutingAgent",
   defaultDurability: async () => { throw new Error("the driver passes a durability"); },
@@ -49,7 +40,6 @@ const createAgent = createDurableAgentFactory({
   }),
 });
 
-// Calls to the driver, which answers each by its id.
 const waiting = new Map();
 let asked = 0;
 const ask = (message) => new Promise((resolve) => {
@@ -61,10 +51,8 @@ const ask = (message) => new Promise((resolve) => {
 let walk = null;
 
 const methods = {
-  // A walk over `dir`: this process's agents, each listening.
   async open({ dir }) {
     const handlers = [];
-    // Each agent's World, which libfx starts and closes with the agent.
     const createInstance = () => {
       const index = handlers.push(null) - 1;
       return {
@@ -86,16 +74,12 @@ const methods = {
     ran = [];
   },
   newSessionId: () => walk.agents[names[0]].newSessionId(),
-  // Opens every agent's backend, so each listens, as one does once it has
-  // served a request.
   async listen({ sessionId }) {
     for (const agent of Object.values(walk.agents)) await agent[Symbol.for("libfx.durableInternals")].openLog(sessionId);
   },
   async prompt({ agent, sessionId, input, messageId }) {
     await walk.agents[agent].session(sessionId).prompt(input, { messageId }).accepted;
   },
-  // Delivers a queued message to the World `world` of this process, by
-  // index; a name this process has no agent for is a miss.
   async deliver({ world: index, payload, meta }) {
     try {
       await walk.handlers[index % walk.handlers.length](payload, meta);
@@ -105,7 +89,6 @@ const methods = {
       return { delivered: false, missed: error.agent, ran: ran.splice(0) };
     }
   },
-  // The agent each session belongs to, as its log has it.
   async owners({ sessionIds }) {
     const internals = walk.agents[names[0]][Symbol.for("libfx.durableInternals")];
     const owners = {};

@@ -1,9 +1,3 @@
-// Credentials: real `fx mcp list --json`, `fx mcp logout` and `fx mcp login`
-// runs against a scratch HOME (FX_DISABLE_KEYCHAIN=1, so the file backend),
-// each command's effect on ~/.fx/mcp-credentials read back, and the trace
-// checked against Credentials.tla through CredentialsTrace.tla. No server is
-// contacted: list never connects, these logins have no revocation endpoint,
-// and a login on an unreadable store stops before it opens a listener.
 import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,9 +5,6 @@ import { artifacts, binary } from "../lib/context";
 import { fixture, fxEnv, observeStores, runFx, save, v1Entry, v2Path, writeProfile, writeV1, type Fixture } from "./driver";
 import { checkTrace, type TraceRecord } from "./trace";
 
-// Tests marked NEXT_MCP check the MCP host fixes from the next MCP-v2
-// version, which src/core/mcp_host/ does not have yet. They run only with
-// FX_TLA_NEXT_MCP=1.
 const NEXT_MCP = process.env.FX_TLA_NEXT_MCP === "1";
 
 
@@ -88,7 +79,6 @@ test.skipIf(!NEXT_MCP)("a newer fx's store is never written over; sign-in and si
   save(join(s.f.base, "store-before.json"), before);
   expect(s.observe()).toEqual({ kind: "unreadable", entries: ["web"], imported: true, marked: false, v1: [] });
 
-  // `fx mcp list` never connects; it reads web's credential to start the host.
   const list = await s.run("get", ["mcp", "list", "--json"]);
   expect(list.ran.code).toBe(0);
   const logout = await s.run("logout", ["mcp", "logout", "web"], "web");
@@ -97,12 +87,10 @@ test.skipIf(!NEXT_MCP)("a newer fx's store is never written over; sign-in and si
   const login = await s.run("put", ["mcp", "login", "--no-browser", "web"], "web");
   expect(login.ran.code).toBe(1);
   expect(login.ran.stderr).toBe(`Can't sign in to web: ${UNREADABLE}`);
-  // Independent oracle: the file is byte for byte what the newer fx wrote.
   save(join(s.f.base, "store-after.json"), readFileSync(v2Path(s.f), "utf8"));
   expect(readFileSync(v2Path(s.f), "utf8")).toBe(before);
   expect(login.o).toEqual({ kind: "unreadable", entries: ["web"], imported: true, marked: false, v1: [] });
 
-  // Readable again (version 1), the login is still there and still used.
   rewriteAsVersion(s.f, 1);
   s.fault("repair");
   s.observe();
@@ -127,7 +115,6 @@ test.skipIf(!NEXT_MCP)("a logout stays when the store becomes unreadable (trace 
   expect(s.observe().kind).toBe("unreadable");
   const back = await s.run("get", ["mcp", "list", "--json"]);
   const verdict = await s.check(["absent"], []);
-  // Independent oracle: nothing was imported or written.
   expect(back.o).toEqual({ kind: "unreadable", entries: [], imported: true, marked: true, v1: ["web"] });
   expect(readFileSync(v2Path(s.f), "utf8")).toBe(before);
   expect(verdict.verdict).toBe("ACCEPTED");
@@ -144,7 +131,6 @@ test.skipIf(!NEXT_MCP)("deleting the v2 file doesn't bring back a login signed o
   s.observe();
   const back = await s.run("get", ["mcp", "list", "--json"]);
   const verdict = await s.check(["absent"], []);
-  // Independent oracle: v1's copy stayed out, and only the note remains.
   expect(back.o.entries).toEqual([]);
   expect(back.o).toEqual({ kind: "absent", entries: [], imported: false, marked: true, v1: ["web"] });
   expect(verdict.verdict).toBe("ACCEPTED");

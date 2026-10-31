@@ -398,7 +398,6 @@ fn probeTerminal(
     no_color: bool,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    // A light/dark pin was applied before presentation setup; leave it alone.
     const theme_locked = ui_render.themeInputLocked();
     if (!theme_locked) {
         const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
@@ -412,8 +411,6 @@ fn probeTerminal(
     if (!no_color and !theme_locked) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
         if (shared_theme.sourceName()) |name| {
-            // Custom themes resolve after detection picks the variant, same
-            // rule as the interactive shell.
             const custom = shared_theme.resolveNamed(std.heap.c_allocator, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
             if (custom) |resolved| {
                 ui_render.applyTheme(resolved, theme.rgb);

@@ -1,10 +1,3 @@
-// `libfx/grok`: sign in with a Grok plan for a Grok agent. Two flows, both
-// plain data between steps so a website can start in one request and finish in
-// another:
-//
-// - Device code: the user enters a short code on xAI's page.
-// - Paste the address: the user signs in on xAI, lands on a page at
-//   127.0.0.1 that does not load, and pastes its address back.
 import { grokAccountId, grokClientId, grokIssuer, normalizeGrokCredentials, refreshGrokCredentials } from "./grok.js";
 import { hostFetch, pkceChallenge, randomSecret, readSignInAddress, signInError, wait } from "./oauth.js";
 
@@ -33,7 +26,6 @@ async function credentialsFor(tokens, { fetch, signal }) {
 export async function startSignIn() {
   const verifier = randomSecret();
   const state = randomSecret();
-  // xAI accepts any loopback port. Nothing listens there: the user copies the address.
   const port = 1024 + (crypto.getRandomValues(new Uint16Array(1))[0] % (65536 - 1024));
   const redirectUri = `http://127.0.0.1:${port}/callback`;
   const url = new URL(`${grokIssuer}/oauth2/authorize`);

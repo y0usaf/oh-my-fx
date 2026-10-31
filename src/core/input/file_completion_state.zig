@@ -177,8 +177,6 @@ pub const State = struct {
         self.lookup_len = if (lookup) |bytes| bytes.len else null;
         if (lookup) |bytes| @memcpy(self.lookup_query[0..bytes.len], bytes);
         if (same_lookup and !self.lookup_dirty) {
-            // Reuse bytes for another occurrence, never its old presentation
-            // authority. Ownership moves into the unacknowledged slot.
             if (self.prepared == null) {
                 self.prepared = self.presented;
                 self.presented = null;
@@ -335,7 +333,6 @@ test "file picker navigation scrolls within the rows the last frame painted" {
     state.acknowledge(alloc, receipt, &index, &window);
     for (0..7) |_| state.navigate(&index, &window, 1);
     try std.testing.expectEqual(@as(usize, 2), window);
-    // Moving back up keeps the window until the selection reaches its top.
     for (0..5) |_| state.navigate(&index, &window, -1);
     try std.testing.expectEqual(@as(usize, 2), window);
     state.navigate(&index, &window, -1);

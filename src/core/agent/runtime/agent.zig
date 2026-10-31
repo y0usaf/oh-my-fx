@@ -91,7 +91,6 @@ pub const Agent = struct {
     pub fn clearHistory(self: *Agent, alloc: Allocator) void {
         for (self.history.items) |turn| types.freeHistoryTurn(alloc, turn);
         self.history.clearRetainingCapacity();
-        // Cleared history no longer resembles the calibrated request.
         self.request_token_calibration = null;
         self.request_byte_limit = null;
     }
@@ -170,7 +169,6 @@ pub const Agent = struct {
         self.history = replacement;
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
-        // Replaced history no longer resembles the calibrated request.
         self.request_token_calibration = null;
         self.request_byte_limit = null;
         self.fresh = false;
@@ -221,12 +219,9 @@ test "Agent request token calibration survives startTurn and dies with cleared h
     try std.testing.expectEqualStrings("fixture/model", agent.request_token_calibration.?.modelSlice());
     try std.testing.expectEqual(@as(usize, 90), agent.request_token_calibration.?.cost.exact_input_tokens);
 
-    // startTurn must not reset the calibration: the next turn's first request
-    // is exactly what it exists for.
     agent.startTurn();
     try std.testing.expect(agent.request_token_calibration != null);
 
-    // An unmatchable model id clears rather than stores.
     agent.storeRequestTokenCalibration(text_utils.repeat("x", max_request_calibration_model_bytes + 1), cost);
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
 
@@ -234,7 +229,6 @@ test "Agent request token calibration survives startTurn and dies with cleared h
     agent.clearHistory(alloc);
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
 
-    // A replaced history invalidates the calibration too.
     agent.storeRequestTokenCalibration("fixture/model", cost);
     try agent.restoreHistory(alloc, &.{});
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);

@@ -940,8 +940,6 @@ fn refreshCredentialsCore(
     );
     defer response.deinit(alloc);
     if (response.status != .ok) {
-        // Only OAuth's terminal grant rejection means re-authenticate; a 429
-        // or 5xx from the token endpoint is transient and retries as-is.
         if (response.status == .bad_request and try refreshRejectionIsFinal(alloc, response.body)) {
             return error.McpRefreshRejected;
         }
@@ -1136,8 +1134,6 @@ fn listenPinnedCallback(address: std.Io.net.IpAddress) std.Io.net.IpAddress.List
         };
     }
 
-    // Zig's reuse_address also enables SO_REUSEPORT on POSIX. Pinned OAuth
-    // callbacks need TIME_WAIT reuse without allowing concurrent listeners.
     const reuse_address: u32 = 1;
     const reuse_bytes = std.mem.asBytes(&reuse_address);
     while (true) switch (posix.errno(posix.system.setsockopt(

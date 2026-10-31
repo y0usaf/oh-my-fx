@@ -270,9 +270,6 @@ fn paintFileApproval(
     defer out.deinit();
 
     try out.writer.writeAll("\x1b[?25l\x1b[H");
-    // A normal file review rewrites every visible row. Avoid clearing the
-    // alternate buffer on wheel and arrow redraws so unchanged chrome does
-    // not flash before the review is repainted.
     if (clear_display or layout.rows < file_screen_min_rows) {
         try out.writer.writeAll("\x1b[2J");
     }
@@ -557,9 +554,6 @@ fn commandMaxScrollRows(command: []const u8, content_width: usize, row_count: u1
     return visual_rows -| @as(usize, row_count);
 }
 
-// The wider tiers keep the wheel-scroll notice as long as it fits (it is the
-// only cue that the review scrolls); the tail tiers reuse the shared approval
-// ladder so reworded copy cannot drift.
 const command_review_amendment_hints = [_][]const u8{
     "1–3 choose now    ↑↓ options    tab amend    wheel scroll    enter confirm    esc cancel",
     "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
@@ -1325,7 +1319,6 @@ fn writeComposedRow(
     text: []const u8,
 ) !void {
     try writer.print("\x1b[{d};1H", .{row});
-    // Clear before writing so a full-width transcript row cannot erase itself after a wrap reset.
     try writer.writeAll(ui_render.reset_style);
     try writer.writeAll("\x1b[K");
     try writer.writeAll(text);
@@ -1410,9 +1403,6 @@ fn appendReviewPrefix(
         writer,
         reviewNumberWidth(line) -| display_width.visibleWidth(number_text),
     );
-    // The number and +/- sign carry the marker accent (green/red); the line
-    // text stays neutral. Falls back to the neutral statusline color when no
-    // marker style is set.
     const marker_style = reviewMarkerStyle(line.op);
     try writer.writeAll(if (marker_style.len != 0) marker_style else ui_render.statusline_style);
     try writer.writeAll(number_text);

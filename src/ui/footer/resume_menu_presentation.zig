@@ -18,8 +18,6 @@ const title_rows: u16 = 1;
 pub const max_visible_items: u16 = 20;
 pub const max_inline_rows: u16 = header_rows + roomy_top_gap_rows + max_visible_items;
 const minimum_title_column_width: usize = 12;
-// Each session is a single line now: the workspace, age, and turn count live
-// in the title row's right cluster, so there is no separate path row or gap.
 const path_rows: u16 = 0;
 const item_gap_rows: u16 = 0;
 
@@ -238,7 +236,6 @@ pub fn composeSessionMenuRow(
     const display_index = window_start + visible_offset;
     const summary = projection.itemAt(display_index) orelse return row;
 
-    // item_stride is 1: every session is a single row.
     const columns = matchingColumns(projection);
     if (layout.feedback_inline) {
         return composeCompactFailureTitleRow(
@@ -306,14 +303,13 @@ fn appendScopeTab(alloc: Allocator, row: *std.ArrayList(u8), scope: session_cata
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
-// Measure every matching row so navigation never shifts a column.
 const MetadataColumns = struct {
     title: usize = 0,
     workspace: usize = 0,
     age: usize = 0,
     turns: usize = 0,
 
-    const separator_width: usize = 3; // " · "
+    const separator_width: usize = 3;
 };
 
 fn sessionWorkspaceLabel(summary: session_store.SessionSummary) []const u8 {
@@ -359,9 +355,6 @@ fn composeTitleRow(
     const indent_width: usize = if (width <= 4) 0 else 2;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
 
-    // Right cluster: "<workspace> · <age> · N turns", all dim, laid out in
-    // fixed columns. @max with the row's own widths keeps it self-sizing when
-    // no shared columns are supplied.
     var age_buf: [32]u8 = undefined;
     const age = session_catalog.relativeActivityAgeCompact(&age_buf, summary.updated_at_ms, now_ms);
     const workspace = sessionWorkspaceLabel(summary);
@@ -388,20 +381,13 @@ fn composeTitleRow(
     else
         @as(usize, width) -| prefix_width;
 
-    // Selection is signaled by brightness: bold bright white when selected,
-    // dim gray otherwise, so the two are clearly distinct. No marker glyph.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
     try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_metadata) {
         try row_text.appendSpacesToColumn(alloc, &row, metadata_start);
-        // The metadata cluster tracks the row's selection: bold bright with the
-        // selected title, dim gray otherwise, so the whole selected row stands out.
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-        // Workspace and turn count left-aligned, age right-aligned: each column
-        // keeps its own digits in line. The turn count closes the row, so it
-        // needs no trailing padding.
         try row.appendSlice(alloc, workspace);
         try row.appendNTimes(alloc, ' ', workspace_col - display_width.visibleWidth(workspace));
         try row.appendSlice(alloc, " · ");
@@ -578,8 +564,6 @@ test "resume menu renders each session on one line with a right metadata cluster
 
     var title = try composeSessionMenuRow(alloc, projection, 2, 120, 4);
     defer title.deinit(alloc);
-    // Single line, no selection marker: title plus the dim right cluster
-    // "<workspace> · <age> · N turns" using the workspace basename.
     try std.testing.expect(std.mem.find(u8, title.items, "Redesign resume menu") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "resume-catalog · 8m · 24 turns") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);

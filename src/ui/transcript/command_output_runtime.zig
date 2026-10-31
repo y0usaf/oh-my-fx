@@ -1,17 +1,3 @@
-// Host contract:
-// - fields: command_output_blocks, folded_command_blocks,
-//   command_output_display, command_output_render,
-//   entries, transcript, transcript_band_dirty, replaceable_last_line,
-//   replaceable_start, footer_viewport, viewport_top_row, cursor_row,
-//   cursor_col, layout
-// - methods: assertCanMutateTranscript, appendRawBytesEntryClassified,
-//   attachCommandOutputEntryForLifecycle,
-//   writeRecordedCommandOutputChunkAtomic,
-//   flushRecordedCommandOutputSummaryAtomic,
-//   rebuildTranscriptCacheFromEntries,
-//   rebuildTranscriptCacheAfterStructuredRewrite,
-//   recomputeCursorFromTranscript, enforceStructuredRetention,
-//   enforceStructuredRetentionAndReport
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -866,8 +852,6 @@ pub fn flushCommandOutputSummaryUncommitted(
     );
     var retention_changed = false;
     if (record) {
-        // Completion makes the block pruneable; retention must not treat
-        // a terminal count-only block as still active.
         if (was_displayed) {
             shell.command_output_display.open_command_block = null;
         }
@@ -1182,10 +1166,6 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
             const stream_index = commandStreamIndex(self.stream);
             var block = &self.shell.command_output_blocks.items[self.block_index];
             const line_index = block.open_line_indices[stream_index] orelse {
-                // A descriptor-capped record has no retained line to clear,
-                // but it is still the same logical record after a bare CR.
-                // Keep the open marker so the replacement bytes do not count
-                // a second record.
                 block.overflow_record_visible[stream_index] = false;
                 return;
             };

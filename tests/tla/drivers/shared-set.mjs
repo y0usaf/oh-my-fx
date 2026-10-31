@@ -1,7 +1,3 @@
-// A set of short strings in shared memory, so the worker threads of one
-// driver see one set, as the agents of one process see one Set. Each slot
-// holds a length byte and up to 63 bytes of UTF-8; a spin lock guards every
-// read and write, which take microseconds.
 const slotBytes = 64;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -24,7 +20,6 @@ export function sharedSet(buffer) {
       Atomics.store(lock, 0, 0);
     }
   };
-  // TextDecoder takes no shared memory, so a slot is copied out first.
   const read = (slot) => decoder.decode(bytes.slice(slot * slotBytes + 1, slot * slotBytes + 1 + bytes[slot * slotBytes]));
   const find = (value) => {
     for (let slot = 0; slot < slots; slot += 1) if (bytes[slot * slotBytes] !== 0 && read(slot) === value) return slot;
@@ -53,8 +48,6 @@ export function sharedSet(buffer) {
       locked(() => insert(String(value)));
       return set;
     },
-    // Adds `value` and says whether it was new, in one step, so two threads
-    // never both take it.
     claim: (value) => locked(() => insert(String(value))),
     delete: (value) => locked(() => {
       const slot = find(String(value));

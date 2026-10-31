@@ -498,7 +498,6 @@ fn storeLargeResultAtHandleManaged(
 ) !void {
     if (capability.holdsBlobs()) {
         const hash = try capability.putBlob(text);
-        // `handleFor` names the handle after this very blob.
         std.debug.assert(std.mem.eql(u8, artifact_digest.blobHash(handle).?, &hash));
         return;
     }
@@ -565,7 +564,6 @@ pub fn readForReplayManaged(
     expected_bytes: usize,
 ) ![]u8 {
     if (expected_bytes > stored_text_max_bytes) return error.ResultSizeUnsupported;
-    // A blob is read once; a file's size is checked before it is read.
     if (!capability.holdsBlobs()) {
         const stat = try statManaged(capability, handle);
         if (stat.size != expected_bytes) return error.ResultSizeMismatch;
@@ -787,10 +785,6 @@ fn readStoredTextManaged(
     handle: []const u8,
 ) ![]u8 {
     if (capability.holdsBlobs()) {
-        // Every store's blobs share the session, found by hash alone, so
-        // only this store's own handles are its results, its compactor
-        // records among them: a command replay's is read by its own store
-        // (D44, D50).
         if (!isStoredTextHandle(handle) and !isImageHandle(handle) and !isRecordHandle(handle)) return error.ResultHandleNotFound;
         return capability.readBlob(alloc, .tool_results, handle, stored_text_max_bytes) catch |err| switch (err) {
             error.BlobNotFound => error.ResultHandleNotFound,
@@ -928,7 +922,6 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     try std.testing.expect(std.mem.find(u8, prepared.model_output, handle) != null);
     try std.testing.expectEqual(@as(usize, 1), memory.count());
 
-    // The same bytes from another call are the same blob.
     const again = try storeLargeResultManaged(alloc, &capability, "call/2", "read_file", &bytes);
     defer alloc.free(again);
     try std.testing.expectEqualStrings(handle, again);
@@ -951,14 +944,11 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     defer alloc.free(tail);
     try std.testing.expectEqualStrings("xx", tail);
 
-    // Every store's blobs share the session: the same blob under a command
-    // replay's handle is not a result, so the caller asks that store.
     const foreign = try std.mem.concat(alloc, u8, &.{ "fx-command-replay-", artifact_digest.blobHash(handle).?, ".bin" });
     defer alloc.free(foreign);
     try std.testing.expectError(error.ResultHandleNotFound, readByRangeManaged(alloc, &capability, foreign, 1, 4));
     try std.testing.expectError(error.ResultHandleNotFound, searchByQueryManaged(alloc, &capability, foreign, "xxx"));
 
-    // A blob stays with the session; an unknown hash is not found.
     try deleteManaged(&capability, handle);
     const kept = try readByRangeManaged(alloc, &capability, handle, 1, 1);
     alloc.free(kept);
@@ -966,7 +956,6 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     defer alloc.free(missing);
     try std.testing.expectError(error.ResultHandleNotFound, readByRangeManaged(alloc, &capability, missing, 1, 1));
 
-    // Image packs are blobs too, and their handle still routes as an image.
     const png = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0 };
     const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
     defer alloc.free(encoded);
@@ -980,7 +969,6 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     defer types.freeToolImages(alloc, loaded);
     try std.testing.expectEqualStrings(encoded, loaded[0].data);
 
-    // A read-only copy reads, but cannot store.
     var read_only = try capability.cloneReadOnly(alloc);
     defer read_only.deinit();
     const through_copy = try readByRangeManaged(alloc, &read_only, handle, 1, 3);
@@ -1037,12 +1025,10 @@ test "a v2 session's compactor records are blobs, replaced and listed by name (D
     try std.testing.expectError(error.FileNotFound, store.read(arena, "compacted-T2.txt", 1024));
     try std.testing.expectError(error.StoreFailed, store.write(alloc, "../escape.txt", "no"));
 
-    // read_tool_result opens a record by its ID through the ordinary reader.
     const page = try readByRangeManaged(alloc, &capability, "compacted-T1.txt", 1, 64);
     defer alloc.free(page);
     try std.testing.expect(std.mem.find(u8, page, "replaced") != null);
 
-    // A read-only copy reads records but cannot keep one.
     var read_only = try capability.cloneReadOnly(alloc);
     defer read_only.deinit();
     try std.testing.expectEqualStrings("T1 shell", try compactorStore(&read_only).read(arena, "compacted-T1.txt", 8));
@@ -1082,7 +1068,6 @@ test "diff content packs round trip, bound, and reject tampering" {
         loadDiffContentManaged(alloc, &capability, "call-edit-2", handle),
     );
 
-    // Null snapshots survive the round trip.
     const partial = try storeDiffContent(alloc, dir, "call-edit-2", null, "created\n");
     defer alloc.free(partial);
     var partial_pack = try loadDiffContentManaged(
@@ -1095,7 +1080,6 @@ test "diff content packs round trip, bound, and reject tampering" {
     try std.testing.expect(partial_pack.previous_content == null);
     try std.testing.expectEqualStrings("created\n", partial_pack.after_content.?);
 
-    // A tampered artifact fails the content digest check.
     var rewritten = try capability.atomicReplace(alloc, .tool_results, handle, "{\"previous_content\":\"forged\",\"after_content\":null}");
     rewritten.deinit(alloc);
     try std.testing.expectError(
@@ -1103,7 +1087,6 @@ test "diff content packs round trip, bound, and reject tampering" {
         loadDiffContentManaged(alloc, &capability, "call-edit-1", handle),
     );
 
-    // Handles from other artifact families are rejected before any read.
     try std.testing.expectError(
         error.InvalidResultHandle,
         loadDiffContentManaged(

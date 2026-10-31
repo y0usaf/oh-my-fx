@@ -1,8 +1,3 @@
-// U02 request lifecycle over a real transport: requests are encoded by U01,
-// tracked by the U02 request table, and carried by the U03 stdio connection
-// to the scripted fake server. Each run must produce request traces that TLC
-// accepts as behaviors of spec/Request.tla, and stdio traces it accepts as
-// behaviors of spec/StdioConn.tla.
 
 import { expectFinal, labScenario, type LabCase, outcomes } from "../lab";
 import type { Scenario } from "../scenario";
@@ -27,7 +22,6 @@ export const scenarios: Scenario[] = [
     check: (lines, final, log) => {
       const problem = want(outcomes(lines), { 1: "result", 2: "result", 3: "peer_error" });
       if (problem) return problem;
-      // Every request carried its id as the progress token (WIRE-06).
       if (!received(log, "tools/list").some((l) => l.line.includes('"progressToken":1'))) return "tools/list was sent without its progress token";
       return expectFinal(final, { state: "stopped", in_flight: 0 });
     },

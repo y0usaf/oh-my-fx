@@ -153,8 +153,6 @@ pub const State = struct {
             containing = item;
         }
         const item = containing orelse return self;
-        // Synthetic full-detail records share the never-issued id 0 and cannot
-        // be found again; only those records precede them, so the offset holds.
         if (item.entry_id == 0) return self;
         var next = self;
         next.bookmark_entry_id = item.entry_id;
@@ -232,8 +230,6 @@ pub const State = struct {
     fn open_full(self: State) State {
         var next = if (self.bookmark_pending) self else self.reset_viewport();
         next.depth = .full;
-        // The identity remains available for retention retargeting, but a
-        // normal open starts at the tail instead of consuming the old anchor.
         next.anchor_pending = false;
         return next;
     }
@@ -259,8 +255,6 @@ pub const State = struct {
         var selected: ?ItemRow = null;
         for (item_rows) |item| {
             if (item.row > offset) break;
-            // Synthetic full-detail records share the never-issued id 0 and
-            // are not addressable restore anchors.
             if (item.entry_id == 0) continue;
             selected = item;
         }
@@ -400,13 +394,11 @@ test "transcript presentation pins the reading position to its entry for a rebui
         .{ .entry_id = 2, .row = 2 },
         .{ .entry_id = 3, .row = 5 },
     };
-    // Entry 2 grew by four rows on the rebuilt page.
     const rebuilt = [_]ItemRow{
         .{ .entry_id = 1, .row = 0 },
         .{ .entry_id = 2, .row = 2 },
         .{ .entry_id = 3, .row = 9 },
     };
-    // Row 6 is one row into entry 3 on the outgoing page.
     const reading = State{ .depth = .full, .scroll_rows = 6, .follow_tail = false };
     try std.testing.expectEqual(@as(u32, 6), reading.select_visual_offset(20, 4, &rebuilt).offset);
     try std.testing.expectEqual(
@@ -432,8 +424,6 @@ test "transcript presentation pins the reading position to its entry for a rebui
     try std.testing.expectEqualDeep(anchored, anchored.pin_reading_position(&outgoing));
     try std.testing.expectEqualDeep(reading, reading.pin_reading_position(&.{}));
 
-    // A position inside the synthetic full-detail records after the welcome
-    // banner keeps its offset instead of snapping back to the banner.
     const with_records = [_]ItemRow{
         .{ .entry_id = 1, .row = 0 },
         .{ .entry_id = 0, .row = 2 },

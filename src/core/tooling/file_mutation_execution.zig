@@ -292,11 +292,7 @@ fn fileMutationRejectionResult(
             else => "rejected",
         },
         .failure_kind = switch (rejection.reason) {
-            // The approved binding was invalidated or the commit was
-            // cancelled before its effect landed.
             .binding_mismatch, .traversal_changed, .staged_source_changed, .cancelled => .denied,
-            // Authorized work failed at the effect boundary; retry with a
-            // fresh preview.
             .stale_preimage, .io_failure => .apply,
         },
         .model_output = try out.toOwnedSlice(),
@@ -540,7 +536,6 @@ test "file executor kinds semantic failures preflight and missing authority deni
     const call_alloc = call_arena_state.allocator();
     const result_alloc = result_arena_state.allocator();
 
-    // The requested edit was already applied, so the content match fails.
     const call: ToolCall = .{
         .id = "kinds",
         .name = "edit_file",
@@ -583,14 +578,12 @@ test "file executor kinds semantic failures preflight and missing authority deni
     try std.testing.expectEqual(tool_contracts.ToolFailureKind.preflight, result.failure_kind);
     try std.testing.expect(std.mem.find(u8, result.model_output, "old_string not found in file") != null);
 
-    // The executed failure must not modify the file.
     var file = try tmp.dir.openFile(io_mod.getIo(), "workspace/strategy.ts", .{});
     defer file.close(io_mod.getIo());
     const unchanged = try io_mod.readFileToEnd(alloc, &file, 4096);
     defer alloc.free(unchanged);
     try std.testing.expectEqualStrings("export interface RacePlan {\n  laps: number;\n}\n", unchanged);
 
-    // A call without execution authority is denial-class.
     const no_authority = try execute(.{
         .call_allocator = call_alloc,
         .result_allocator = result_alloc,

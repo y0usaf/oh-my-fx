@@ -1,5 +1,3 @@
-// `libfx/skills` (skills.js): instructions and tools from already-loaded
-// skill records.
 import type { FxAgentTool } from "./libfx.cjs";
 
 /** A resource whose text joins its skill's instructions. */

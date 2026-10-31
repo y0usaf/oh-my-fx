@@ -174,8 +174,6 @@ def read_regular(path):
 def verify(request, report):
     ids = request.get('sessionIds', [])
     required = request.get('requiredModels', ['turns', 'wiring'])
-    # A run that saved no session, such as a refused /fork, is judged by its
-    # wiring alone.
     if request.get('version') != 1 or (not ids and required != ['wiring']) or len(ids) != len(set(ids)) or not all(isinstance(s, str) and VALID_ID.fullmatch(s) for s in ids):
         raise ValueError('version 1 and unique safe sessionIds required, nonempty unless only wiring is')
     if not required or not set(required) <= {'turns', 'children', 'fork', 'wiring'} or len(required) != len(set(required)):
@@ -210,8 +208,6 @@ def verify(request, report):
     if not jar.is_file():
         raise RuntimeError(f'missing {jar} (set TLA2TOOLS_JAR)')
     executor = RetainedTLC(report, java, jar)
-    # The archives expose generator functions with a module-local executor.
-    # Bind that callback only in this new, single-threaded CLI process.
     saved.run_tlc = executor.run
     wiring.run_tlc = executor.run
     children_checked = forks_checked = 0

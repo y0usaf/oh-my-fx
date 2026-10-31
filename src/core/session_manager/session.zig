@@ -225,7 +225,6 @@ pub const Session = struct {
     /// first write (D20). Under `mutex`.
     updated_ms: u64 = 0,
 
-    // Scratch and held lines, under `mutex`.
     held: std.ArrayList(u8) = .empty,
     held_lines: u64 = 0,
     batch: std.ArrayList(u8) = .empty,
@@ -234,7 +233,6 @@ pub const Session = struct {
     /// Log offset just past the newest snapshot, or 0.
     snapshot_base: u64 = 0,
 
-    // Durability, under `sync_mutex`.
     sync_file: ?storage.File = null,
     synced_seq: u64 = 0,
     /// Written under `mutex`, read under `sync_mutex`.
@@ -282,7 +280,6 @@ pub const Session = struct {
         const log: *const Log = switch (session.phase) {
             .held => return .{ .arena = .init(gpa), .entries = &.{}, .next = null, .damaged = false },
             .live => |*live| &live.log,
-            // After a failed write, the lines up to the tracked end are whole.
             .failed => |*maybe| if (maybe.*) |*live| &live.log else return error.SessionClosed,
             .closed => return error.SessionClosed,
         };
@@ -331,15 +328,12 @@ pub const Session = struct {
             defer session.mutex.unlock(io);
             session.observe(.mutex_acquired);
             const was_held = session.phase == .held;
-            // An import's batches keep their own times; a host's append
-            // after the publish, and the lines after it, take the clock.
             session.import_ts = ts_ms;
             const last = try session.appendLocked(events, &sync_through);
             session.observe(.mutex_releasing);
             break :blk Appended{
                 .last_seq = last,
                 .published = was_held and session.phase == .live,
-                // Only a published session is in the index.
                 .listing_changed = session.phase == .live and changesListing(events),
             };
         };
@@ -367,12 +361,10 @@ pub const Session = struct {
         const ts = session.timestamp();
         switch (session.phase) {
             .held => if (session.import) try session.holdImport(bodies, ts) else {
-                // Nothing exists on disk yet, so no blob can be referenced.
                 if (hasBlobRefs(bodies)) return error.InvalidTransition;
                 if (!hasTurnStart(bodies)) {
                     try session.hold(bodies, ts);
                 } else {
-                    // The publish syncs every line it writes.
                     try session.publish(bodies, ts);
                     try session.maybeSnapshot(&session.phase.live, bodies, ts);
                 }
@@ -452,7 +444,6 @@ pub const Session = struct {
         session.mutex.lockUncancelable(io);
         defer session.mutex.unlock(io);
         if (!session.import or session.phase != .held or session.bounds.items.len < 2) return error.InvalidTransition;
-        // Nothing is visible; later calls name the cause (D40).
         const live = session.stage(null) catch |err| {
             session.phase = .{ .failed = null };
             if (session.fault == null) session.fault = asIoFault(err);
@@ -477,7 +468,6 @@ pub const Session = struct {
     /// session always has a durable first line (`tests/tla/session_manager/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         session.writeFirstTurn(bodies, ts) catch |err| {
-            // Nothing is visible; later calls name the cause (D40).
             session.phase = .{ .failed = null };
             if (session.fault == null) session.fault = asIoFault(err);
             return err;
@@ -487,7 +477,6 @@ pub const Session = struct {
     fn writeFirstTurn(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         const gpa = session.env.gpa;
 
-        // Frame everything first: line 1, the held lines, then the batch.
         session.batch.clearRetainingCapacity();
         session.bounds.clearRetainingCapacity();
         const created = session.created_ms orelse ts;
@@ -505,7 +494,6 @@ pub const Session = struct {
 
         const live = try session.stage(null);
 
-        // Fold the batch; line 1 has no state and the held lines are folded.
         for (bodies, 0..) |body, i| {
             const line_index: usize = @intCast(1 + session.held_lines + i);
             try fold.apply(gpa, &session.state, 0, .{
@@ -532,7 +520,6 @@ pub const Session = struct {
         const s = env.s;
         const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(tmp);
-        // An import that staged blobs already has its folder.
         const dir = if (session.staged) |staged| staged else try session.makeStaging(tmp);
         session.staged = null;
         errdefer s.closeDir(dir);
@@ -567,7 +554,6 @@ pub const Session = struct {
         const s = session.env.s;
         const id_ = session.identity.id;
         s.makeDir(tmp, id_) catch |err| switch (err) {
-            // A leftover from a crashed attempt with the same id (an import).
             error.AlreadyExists => {
                 s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
                 s.makeDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
@@ -641,21 +627,17 @@ pub const Session = struct {
         const env = session.env;
         const s = env.s;
         const io = s.io;
-        // Hold the mutex only to check the phase and borrow the folder.
         const dir = blk: {
             session.mutex.lockUncancelable(io);
             defer session.mutex.unlock(io);
             switch (session.phase) {
                 .live => |live| break :blk s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err),
-                // An import stages its blobs before its one publish (D59).
                 .held => if (session.import) break :blk try session.stagedBlobs() else return error.InvalidTransition,
                 .failed => return session.fault orelse error.Io,
                 .closed => return error.SessionClosed,
             }
         };
         defer s.closeDir(dir);
-        // Bytes in hand name themselves before any write; a file is named
-        // once copied.
         const known: ?[schema.blob_hash_len]u8 = switch (source) {
             .bytes => |bytes| schema.blobHash(bytes),
             .file => null,
@@ -744,8 +726,6 @@ pub const Session = struct {
         for (session.bounds.items, 0..) |end, i| {
             const line = session.batch.items[start..end];
             const header = log_mod.checkLine(line) catch return error.Io;
-            // In a publish only line 1 is the header; the held and batch
-            // lines after it come from the host.
             const line_cause: Cause = if (cause != .header) cause else if (i == 0) .header else .host;
             session.observe(.{ .wrote_line = .{ .seq = first_seq + i, .kind = header.kind.?, .cause = line_cause } });
             start = end;
@@ -827,7 +807,6 @@ pub const Session = struct {
         std.debug.assert(target >= seq);
         session.env.s.sync(file) catch |err| {
             const fault = storage.ioFault(err);
-            // Only the first cause is kept; a later failure changes nothing.
             _ = session.sync_fault.cmpxchgStrong(@backingInt(FaultCode.none), @backingInt(faultCode(fault)), .release, .monotonic);
             return fault;
         };
@@ -895,8 +874,6 @@ pub const Session = struct {
                 });
                 session.held.clearAndFree(session.env.gpa);
                 session.held_lines = 0;
-                // An unpublished import's staging stays for the next
-                // attempt's publish to clear.
                 if (session.staged) |staged| session.env.s.closeDir(staged);
                 session.staged = null;
                 session.phase = .closed;
@@ -1081,11 +1058,6 @@ fn hasTurnStart(bodies: []const schema.Body) bool {
 fn needsSync(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
-        // Usage is durable before fx clears its usage-recovery marker
-        // (`tests/tla/session_manager/Wiring.tla` UsageNeverSilent).
-        // fx removes the side folder only once the move is durable (D47).
-        // Compactor records need no sync of their own: the compaction line
-        // that cites them comes later in the log, which keeps a prefix (D50).
         .set => |s| switch (s.key) {
             .permissions, .usage, .moved_files => return true,
             .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records, .v1_source => {},
@@ -1094,9 +1066,6 @@ fn needsSync(bodies: []const schema.Body) bool {
     };
     return false;
 }
-
-// ---------------------------------------------------------------------------
-// Opening
 
 pub const NewOptions = struct {
     workspace: []const u8,
@@ -1156,7 +1125,6 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
         parts.deinit(env);
         return error.OutOfMemory;
     };
-    // Ownership of every part moves into the Session here.
     session.* = .{
         .env = env,
         .identity = parts.loaded.identity,
@@ -1239,7 +1207,6 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     defer arena_state.deinit();
     var damaged_at: u64 = 0;
     var loaded = loadFolded(env, &arena_state, opened.log.file, opened.log.end, &damaged_at) catch |err| {
-        // Damage behind the tail, found while folding: reported once here.
         if (err == error.Corrupt) diag.report(env.diagnostics, .{
             .kind = .opened_read_only,
             .session_id = options.id,
@@ -1301,7 +1268,6 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
     errdefer identity.deinit(gpa);
     const line1_end = line1.offset + line1.bytes.len;
 
-    // The newest snapshot, scanning back from the end.
     var snapshot: ?struct { seq: u64, end: u64, state: []const u8, ts_ms: u64 } = null;
     {
         var back = log_mod.BackwardReader.init(gpa, env.s, file, end);
@@ -1329,7 +1295,6 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
             error.OutOfMemory => error.OutOfMemory,
             error.BadBody => error.Corrupt,
         };
-        // A snapshot copied from a fork's source carries the source's children.
         if (snap.seq <= fork_seq) state.clearChildren(gpa);
         state.last_seq = snap.seq;
         from = snap.end;
@@ -1348,7 +1313,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         _ = line_arena.reset(.retain_capacity);
         updated_ms = line.header.ts_ms;
         const kind = line.header.kind orelse {
-            state.last_seq = line.header.seq; // unknown kinds are skipped
+            state.last_seq = line.header.seq;
             state.clean_exit = false;
             continue;
         };
@@ -1360,7 +1325,6 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         .state = state,
         .snapshot_end = if (snapshot) |snap| snap.end else 0,
         .created_ms = created_ms,
-        // A fork's copied lines keep the source's older times (D20).
         .updated_ms = @max(updated_ms, created_ms),
     };
 }
@@ -1378,12 +1342,10 @@ fn repair(session: *Session, workspace: []const u8) AppendError!void {
     const gpa = session.env.gpa;
     const live = &session.phase.live;
     const ts = session.timestamp();
-    // An open turn from the previous owner is interrupted (D1).
     if (session.state.open_turn) |turn| {
         try session.writeBodies(live, &.{.{ .turn_interrupted = .{ .turn = turn, .reason = .crash } }}, ts, .interrupt_repair);
     }
     session.observe(.reopened);
-    // Every unfinished work item gets a known outcome (tests/tla/session_manager/Subagents.tla).
     var finished: std.ArrayList(schema.Body) = .empty;
     defer finished.deinit(gpa);
     for (session.state.children.items) |child| {
@@ -1396,8 +1358,6 @@ fn repair(session: *Session, workspace: []const u8) AppendError!void {
         } });
     }
     if (finished.items.len > 0) {
-        // `writeBodies` folds the lines, which updates the children the
-        // bodies borrow from; frame from copies.
         var copies = std.heap.ArenaAllocator.init(gpa);
         defer copies.deinit();
         for (finished.items) |*body| {
@@ -1405,13 +1365,11 @@ fn repair(session: *Session, workspace: []const u8) AppendError!void {
             body.child_finished.work_id = try copies.allocator().dupe(u8, body.child_finished.work_id);
         }
         if (session.env.isPlanted(.repair_marks_child_twice)) {
-            // Copied first: appending may move the list it came from.
             const twice = finished.items[0];
             try finished.append(gpa, twice);
         }
         try session.writeBodies(live, finished.items, ts, .child_repair);
     }
-    // Resumed from another workspace: record it.
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     if (!std.mem.eql(u8, try currentWorkspace(session, scratch.allocator()), workspace)) {
@@ -1429,7 +1387,6 @@ pub fn currentWorkspace(session: *const Session, arena: std.mem.Allocator) error
     const raw = session.state.workspace orelse return session.identity.workspace;
     return std.json.parseFromSliceLeaky([]const u8, arena, raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // Not a JSON string: compare the raw bytes, which never match a path.
         else => raw,
     };
 }
@@ -1441,9 +1398,6 @@ fn childHasLog(env: *const Env, child: []const u8) bool {
     _ = env.s.stat(dir, "log.jsonl") catch return false;
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// Reading (lock-free)
 
 /// A position between two lines.
 pub const Cursor = struct {
@@ -1532,8 +1486,6 @@ fn readLines(
     var page: Page = .{ .arena = .init(gpa), .entries = &.{}, .next = null, .damaged = false };
     errdefer page.arena.deinit();
     const arena = page.arena.allocator();
-    // Raw, as `log.ReadBuffer` explains: every entry is written in full
-    // before it is read. A longer page grows the list as usual.
     const first_capacity: usize = @min(limit, max_raw_page_entries);
     const first_memory = arena.rawAlloc(first_capacity * @sizeOf(Entry), .of(Entry), @returnAddress()) orelse return error.OutOfMemory;
     const first_entries: [*]Entry = @ptrCast(@alignCast(first_memory));
@@ -1602,11 +1554,8 @@ fn readLines(
 }
 
 fn copyEntry(arena: std.mem.Allocator, line: log_mod.Line) error{OutOfMemory}!Entry {
-    // The reader's buffer is reused on the next line: copy before parsing.
-    // Raw, as `log.ReadBuffer` explains: the copy writes every byte.
     const bytes = (arena.rawAlloc(line.bytes.len, .@"1", @returnAddress()) orelse return error.OutOfMemory)[0..line.bytes.len];
     @memcpy(bytes, line.bytes);
-    // The reader checked the line; only the header's name moves.
     var header = line.header;
     header.kind_name = bytes[@intFromPtr(header.kind_name.ptr) - @intFromPtr(line.bytes.ptr) ..][0..header.kind_name.len];
     const kind = header.kind;
@@ -1619,9 +1568,6 @@ fn copyEntry(arena: std.mem.Allocator, line: log_mod.Line) error{OutOfMemory}!En
         null;
     return .{ .seq = header.seq, .offset = line.offset, .ts_ms = header.ts_ms, .kind = kind, .kind_name = header.kind_name, .body = body };
 }
-
-// ---------------------------------------------------------------------------
-// Blobs, fork and delete
 
 pub const BlobError = error{ NotFound, Corrupt, OutOfMemory } || storage.IoFault;
 
@@ -1719,7 +1665,6 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
         session.phase = .closed;
         session.destroy();
     }
-    // Line 1 is new; lines 2..S are copied (see `copyFolded`).
     session.batch.clearRetainingCapacity();
     session.bounds.clearRetainingCapacity();
     const created = env.nowMs();
@@ -1745,7 +1690,6 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
 fn forkError(err: AppendError) ForkError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // Copied lines were checked on read; anything else is an I/O failure.
         error.InvalidTransition, error.SessionClosed, error.TooLarge => error.Io,
         else => |io_err| storage.ioFault(io_err),
     };
@@ -1775,7 +1719,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
     defer arena.deinit();
     while (true) {
         const line = (reader.next() catch |err| switch (err) {
-            error.Corrupt => break, // the good part ends here (D15)
+            error.Corrupt => break,
             error.OutOfMemory => return error.OutOfMemory,
             else => |io_err| return storage.ioFault(io_err),
         }) orelse break;
@@ -1847,7 +1791,6 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
             session.state.last_seq = header.seq;
         }
     }
-    // The fork owns no children spawned before its fork point.
     std.debug.assert(session.state.children.items.len == 0);
 }
 
@@ -1951,7 +1894,7 @@ fn collectChildren(env: *const Env, dir: storage.Dir, out: *std.ArrayList([]u8))
     while (true) {
         const line = (reader.next() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => break, // a damaged log still deletes; its later children are not found
+            else => break,
         }) orelse break;
         if (line.header.kind != .child_spawned) continue;
         _ = arena.reset(.retain_capacity);
@@ -1962,9 +1905,6 @@ fn collectChildren(env: *const Env, dir: storage.Dir, out: *std.ArrayList([]u8))
         } else try out.append(gpa, try gpa.dupe(u8, child));
     }
 }
-
-// ---------------------------------------------------------------------------
-// Doctor
 
 pub const Verified = struct {
     lines: u64,
@@ -2026,7 +1966,6 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
                 defer decoded.deinit(gpa);
                 decoded.last_seq = state.last_seq;
                 decoded.clean_exit = state.clean_exit;
-                // A snapshot copied from a fork's source carries its children.
                 if (line.header.seq <= fork_seq) decoded.clearChildren(gpa);
                 if (!decoded.eql(&state)) result.bad_snapshots += 1;
             },
@@ -2104,7 +2043,6 @@ const session_tests = struct {
 
         pub fn deinit(t: *TestEnv) void {
             if (hooks) {
-                // Every written file was closed only after a sync.
                 if (!t.crashed) testing.expectEqual(@as(usize, 0), t.fault.closed_unsynced) catch @panic("a written file was closed unsynced");
                 t.fault.deinit();
             }
@@ -2191,7 +2129,6 @@ const session_tests = struct {
         defer t.env.s.closeDir(dir);
         try testing.expectEqual(storage.Kind.file, (try t.env.s.stat(dir, "lock")).kind);
         try testing.expectEqual(storage.Kind.directory, (try t.env.s.stat(dir, "blobs")).kind);
-        // The staging folder is empty again.
         const tmp = try t.env.s.openDir(t.env.root, ".tmp");
         defer t.env.s.closeDir(tmp);
         var listing = t.env.s.list(tmp);
@@ -2237,7 +2174,6 @@ const session_tests = struct {
         try testing.expectEqual(@as(?u64, null), state.open_turn);
         try testing.expectEqual(schema.Reason.crash, state.last_interrupted.?.reason);
         try testing.expect(!state.clean_exit);
-        // The next turn is turn 2.
         _ = try r.append(&.{ .turn_started, item, .turn_committed });
         var after = try r.stateCopy(gpa);
         defer after.deinit(gpa);
@@ -2356,11 +2292,8 @@ const session_tests = struct {
         var resumed = try r.stateCopy(gpa);
         defer resumed.deinit(gpa);
         try closeAndDestroy(r);
-        // Compare against a full fold of the log as it stood before the close.
         var reference = try fullFold(&t, id);
         defer reference.deinit(gpa);
-        // The close added turn_interrupted? No: resume already interrupted the
-        // open turn, then close appended `closed`. Undo only the close line.
         try testing.expect(reference.clean_exit);
         reference.clean_exit = false;
         reference.last_seq -= 1;
@@ -2402,7 +2335,6 @@ const session_tests = struct {
                         w.failed = true;
                         return;
                     };
-                    // A durable-class call returns only after its own sync.
                     w.session.sync_mutex.lockUncancelable(io);
                     const synced = w.session.synced_seq;
                     w.session.sync_mutex.unlock(io);
@@ -2451,7 +2383,6 @@ const session_tests = struct {
         const id = try gpa.dupe(u8, s.id());
         defer gpa.free(id);
         try closeAndDestroy(s);
-        // readPage checks crc and that seq is contiguous from 1.
         const all = try t.kinds(id);
         defer gpa.free(all);
         var items: usize = 0;
@@ -2473,7 +2404,6 @@ const session_tests = struct {
         defer closeAndDestroy(s) catch {};
         _ = try s.append(&.{.turn_started});
         for (0..20) |_| _ = try s.append(&.{item});
-        // 22 lines. Page backward by 5 from the end.
         var seen: std.ArrayList(u64) = .empty;
         defer seen.deinit(gpa);
         var from: session_mod.From = .end;
@@ -2483,7 +2413,6 @@ const session_tests = struct {
             defer page.deinit();
             for (page.entries) |e| try seen.append(gpa, e.seq);
             if (first) {
-                // Appends after the first page do not disturb older pages.
                 _ = try s.append(&.{ item, item });
                 first = false;
             }
@@ -2514,7 +2443,6 @@ const session_tests = struct {
         _ = try s.append(&.{ .turn_started, item, .turn_committed });
         const id = try gpa.dupe(u8, s.id());
         defer gpa.free(id);
-        // Die in the middle of the next line.
         _ = try s.append(&.{.turn_started});
         t.fault.next_write = .{ .keep = 20, .then = .die };
         try testing.expectError(error.Io, s.append(&.{item}));
@@ -2524,7 +2452,6 @@ const session_tests = struct {
         try closeAndDestroy(r);
         try testing.expectEqual(@as(usize, 1), t.recorder.count(.torn_tail_cut));
 
-        // Now damage line 2 of the log.
         const dir = try t.env.s.openDir(t.env.root, id);
         defer t.env.s.closeDir(dir);
         var path_buffer: [300]u8 = undefined;
@@ -2535,7 +2462,6 @@ const session_tests = struct {
         try @import("storage_fault.zig").flipBit(io, dir, "log.jsonl", line2 + 4, 1);
         try testing.expectError(error.Corrupt, resumeRoot(&t, id));
         try testing.expectEqual(@as(usize, 1), t.recorder.count(.opened_read_only));
-        // Reading still works up to the damage.
         var page = try session_mod.readPage(&t.env, gpa, id, .start, .forward, 100);
         defer page.deinit();
         try testing.expect(page.damaged);
@@ -2548,7 +2474,6 @@ const session_tests = struct {
         t.init(.{});
         defer t.deinit();
 
-        // A full disk on a log write (D29).
         const s = try newRoot(&t);
         _ = try s.append(&.{ .turn_started, item, .turn_committed });
         const id = try gpa.dupe(u8, s.id());
@@ -2556,14 +2481,11 @@ const session_tests = struct {
         t.fault.fail_error = error.NoSpace;
         t.fault.next_write = .{ .keep = 0, .then = .fail };
         try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
-        // Durability is unknown after a failed write, so nothing more is
-        // written; later calls still name the cause (D40).
         try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
         try testing.expectError(error.NoSpaceLeft, s.putBlob("after the full disk"));
         try closeAndDestroy(s);
         try expectKinds(&t, id, &.{ .session_created, .turn_started, .item, .turn_committed });
 
-        // A read-only file system on the sync that ends a turn.
         const r = try resumeRoot(&t, id);
         _ = try r.append(&.{ .turn_started, item });
         t.fault.fail_error = error.ReadOnly;
@@ -2571,11 +2493,9 @@ const session_tests = struct {
         try testing.expectError(error.ReadOnlyFileSystem, r.append(&.{.turn_committed}));
         try testing.expectError(error.ReadOnlyFileSystem, r.append(&.{.turn_started}));
         try closeAndDestroy(r);
-        // The close does not sync again: the failed sync's bytes stay unknown.
         try testing.expectEqual(@as(usize, 1), t.fault.closed_unsynced);
         t.fault.closed_unsynced = 0;
 
-        // A permission denial on the first turn, before the session exists.
         const n = try newRoot(&t);
         t.fault.fail_error = error.Refused;
         t.fault.next_write = .{ .keep = 0, .then = .fail };
@@ -2583,9 +2503,6 @@ const session_tests = struct {
         try testing.expectError(error.AccessDenied, n.append(&.{.turn_started}));
         try closeAndDestroy(n);
     }
-
-    // ---------------------------------------------------------------------------
-    // Blobs, fork, children, delete (plan checkpoint 4)
 
     /// `refs` must outlive the event: the caller owns the array.
     fn itemWith(refs: []const []const u8) fold.Event {
@@ -2656,13 +2573,11 @@ const session_tests = struct {
         try testing.expectEqual(@as(u64, 2), state.committed);
         try testing.expectEqual(@as(?u64, null), state.open_turn);
         try testing.expectEqualStrings(source.id, f.identity.forked_from.?.id);
-        // The fork continues with turn 3 of its own.
         _ = try f.append(&.{ .turn_started, item, .turn_committed });
         const fork_id = try gpa.dupe(u8, f.id());
         defer gpa.free(fork_id);
         try closeAndDestroy(f);
 
-        // Lines 2..S match the source's, and the source is unchanged.
         const fork_kinds = try t.kinds(fork_id);
         defer gpa.free(fork_kinds);
         try testing.expectEqualSlices(schema.Kind, before[1..7], fork_kinds[1..7]);
@@ -2670,7 +2585,6 @@ const session_tests = struct {
         defer gpa.free(after);
         try testing.expectEqualSlices(schema.Kind, before, after);
 
-        // Delete the source: the fork still reads fully, blob included.
         try deleteWithoutIndex(&t.env, source.id);
         try testing.expectError(error.NotFound, session_mod.readPage(&t.env, gpa, source.id, .start, .forward, 10));
         const bytes = try session_mod.readBlob(&t.env, gpa, fork_id, &source.hash);
@@ -2693,8 +2607,6 @@ const session_tests = struct {
         defer gpa.free(id);
         try closeAndDestroy(s);
 
-        // The fork's line 1 is longer than the source's, so every copied line
-        // moves; the copied snapshots must be encoded again with its offsets.
         const f = try session_mod.openFork(&t.env, .{ .source = id, .at = .{ .turn = 3 }, .workspace = "/w", .host = .app });
         const fork_id = try gpa.dupe(u8, f.id());
         defer gpa.free(fork_id);
@@ -2712,8 +2624,6 @@ const session_tests = struct {
             if (entry.kind == .snapshot) snapshots += 1;
         }
         try testing.expect(snapshots >= 2);
-        // Resume starts from the newest snapshot; the model's context must
-        // start at the fork's own compacted line.
         const r = try resumeRoot(&t, fork_id);
         var state = try r.stateCopy(gpa);
         defer state.deinit(gpa);
@@ -2728,7 +2638,6 @@ const session_tests = struct {
         const source = try forkSource(&t);
         defer gpa.free(source.id);
         try testing.expectError(error.InvalidForkPoint, session_mod.openFork(&t.env, .{ .source = source.id, .at = .{ .turn = 5 }, .workspace = "/w", .host = .app }));
-        // Turn 4 was left open by the close: its end line is an interrupt, a boundary.
         const four = try session_mod.openFork(&t.env, .{ .source = source.id, .at = .{ .turn = 4 }, .workspace = "/w", .host = .app });
         try closeAndDestroy(four);
         const zero = try session_mod.openFork(&t.env, .{ .source = source.id, .at = .{ .turn = 0 }, .workspace = "/w", .host = .app });
@@ -2746,7 +2655,6 @@ const session_tests = struct {
         defer t.deinit();
         const source = try forkSource(&t);
         defer gpa.free(source.id);
-        // Damage the item of turn 3 (line 9).
         var path_buffer: [300]u8 = undefined;
         const path = try std.mem.print(&path_buffer, "{s}/log.jsonl", .{source.id});
         const bytes = try t.tmp.dir.readFileAlloc(io, path, gpa, .limited(1 << 20));
@@ -2783,13 +2691,11 @@ const session_tests = struct {
         const parent_id = try gpa.dupe(u8, p.id());
         defer gpa.free(parent_id);
 
-        // c1 runs to completion.
         const c1 = try childOf(&t, parent_id);
         _ = try p.append(&.{.{ .child_spawned = .{ .child = c1.id(), .work_id = "w1" } }});
         _ = try c1.append(&.{ .turn_started, item, .turn_committed });
         _ = try p.append(&.{.{ .child_finished = .{ .child = c1.id(), .work_id = "w1", .outcome = .ok } }});
         try closeAndDestroy(c1);
-        // c2 publishes a log, c3 dies before its first turn; then the parent crashes.
         const c2 = try childOf(&t, parent_id);
         const c3 = try childOf(&t, parent_id);
         _ = try p.append(&.{ .{ .child_spawned = .{ .child = c2.id(), .work_id = "w1" } }, .{ .child_spawned = .{ .child = c3.id(), .work_id = "w1" } } });
@@ -2804,7 +2710,6 @@ const session_tests = struct {
         const r = try resumeRoot(&t, parent_id);
         var state = try r.stateCopy(gpa);
         defer state.deinit(gpa);
-        // Every child stays listed with how its work ended; none is open.
         try testing.expectEqual(@as(usize, 3), state.children.items.len);
         const want = [_]schema.Outcome{ .ok, .interrupted, .lost };
         for (state.children.items, want) |child, outcome| {
@@ -2822,7 +2727,6 @@ const session_tests = struct {
         };
         try testing.expectEqualSlices(schema.Outcome, &.{ .ok, .interrupted, .lost }, outcomes.items);
 
-        // A child resumes only through its parent; deleting the parent removes it.
         const again = try session_mod.openResume(&t.env, .{ .id = c2_id, .workspace = "/w", .host = .child, .parent = parent_id });
         try testing.expectError(error.Busy, deleteWithoutIndex(&t.env, parent_id));
         try closeAndDestroy(again);
@@ -2848,7 +2752,6 @@ const session_tests = struct {
         const fork_id = try gpa.dupe(u8, f.id());
         defer gpa.free(fork_id);
         crash(&t, f);
-        // Its reopen repairs nothing that belongs to the source.
         const r = try resumeRoot(&t, fork_id);
         var state = try r.stateCopy(gpa);
         defer state.deinit(gpa);
@@ -2880,9 +2783,6 @@ const session_model_tests = struct {
     const gpa = testing.allocator;
     const io = testing.io;
     const Io = std.Io;
-
-    // ---------------------------------------------------------------------------
-    // Disk helpers (direct reads, no fault layer, no session)
 
     fn readLog(root: Io.Dir, id: []const u8) !?[]u8 {
         var path: [300]u8 = undefined;
@@ -2928,9 +2828,6 @@ const session_model_tests = struct {
         };
     }
 
-    // ---------------------------------------------------------------------------
-    // TurnLifecycle
-
     fn runTurnTrace(case: []const u8, planted: trace.Planted) !void {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -2975,9 +2872,6 @@ const session_model_tests = struct {
     test "TurnLifecycle trace: planted bug, an item outside a turn" {
         try runTurnTrace("planted-accept_item_outside_turn", .accept_item_outside_turn);
     }
-
-    // ---------------------------------------------------------------------------
-    // Lifecycle
 
     const LifecycleTracer = struct {
         trace: trace.Trace,
@@ -3111,7 +3005,6 @@ const session_model_tests = struct {
         env.observer = killer.observer();
         env.planted = planted;
 
-        // s1: dies right after its rename, before the root folder is synced.
         const s1 = try session_mod.openNew(&env, .{ .workspace = "/w", .host = .app });
         _ = try s1.append(&.{.{ .set = .{ .key = .title, .value = "\"one\"" } }});
         try testing.expectError(error.Io, s1.append(&.{.turn_started}));
@@ -3126,7 +3019,6 @@ const session_model_tests = struct {
         }
         if (std.mem.eql(u8, tracer.where(0), "tmp")) try tracer.sweep(env.s, 0);
 
-        // s2: a complete first turn after the restart.
         killer.fired = true;
         const s2 = try session_mod.openNew(&env, .{ .workspace = "/w", .host = .app });
         _ = try s2.append(&.{ .turn_started, .turn_committed });
@@ -3146,9 +3038,6 @@ const session_model_tests = struct {
     test "Lifecycle trace: planted bug, rename before the log sync" {
         try runLifecycleTrace("planted-rename_before_fsync", .rename_before_fsync, false);
     }
-
-    // ---------------------------------------------------------------------------
-    // ResumeSnapshot
 
     const SnapTracer = struct {
         trace: trace.Trace,
@@ -3223,7 +3112,6 @@ const session_model_tests = struct {
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();
         var tracer: SnapTracer = .{ .trace = try trace.Trace.create(gpa, io, "ResumeSnapshot", case), .root = tmp.dir };
-        // A snapshot after every batch.
         var env = testEnv(&tmp, &fault, .{ .snapshot_every_bytes = 1 });
         env.observer = tracer.observer();
         env.planted = planted;
@@ -3239,7 +3127,6 @@ const session_model_tests = struct {
         const id = try gpa.dupe(u8, s.id());
         defer gpa.free(id);
         s.abandon();
-        // Resume must see exactly the state the log implies.
         env.observer = null;
         const r = try session_mod.openResume(&env, .{ .id = id, .workspace = "/w", .host = .app });
         var state = try r.stateCopy(gpa);
@@ -3260,9 +3147,6 @@ const session_model_tests = struct {
     test "ResumeSnapshot trace: planted bug, snapshots drop prefs" {
         try runSnapshotTrace("planted-snapshot_drops_field", .snapshot_drops_field);
     }
-
-    // ---------------------------------------------------------------------------
-    // WriterLock
 
     threadlocal var thread_label: []const u8 = "t1";
 
@@ -3427,12 +3311,10 @@ const session_model_tests = struct {
         defer fault1.deinit();
         var fault2 = Fault.init(gpa, io, 2);
         defer fault2.deinit();
-        // Two processes: two managers over the same root, each with its own flock.
         var env1 = testEnv(&tmp, &fault1, .{ .lock_wait_ms = 20 });
         var env2 = testEnv(&tmp, &fault2, .{ .lock_wait_ms = 20 });
         env2.planted = planted;
 
-        // The session exists before the trace begins.
         const setup = try session_mod.openNew(&env1, .{ .workspace = "/w", .host = .app });
         _ = try setup.append(&.{ .turn_started, .turn_committed });
         const id = try gpa.dupe(u8, setup.id());
@@ -3448,7 +3330,6 @@ const session_model_tests = struct {
         env2.observer = proc2.observer();
         const options: session_mod.ResumeOptions = .{ .id = id, .workspace = "/w", .host = .app };
 
-        // p1 opens and writes from two threads; p2 is refused meanwhile.
         const a = try session_mod.openResume(&env1, options);
         tracer.event("Open", 0, a);
         if (planted == .skip_flock) {
@@ -3459,11 +3340,9 @@ const session_model_tests = struct {
             try testing.expectError(error.Busy, session_mod.openResume(&env2, options));
         }
         try writeFromTwoThreads(a, "{\"by\":\"p1\"}");
-        // p1 crashes; the kernel frees the flock.
         a.abandon();
         tracer.event("Crash", 0, null);
 
-        // p2 takes over, writes, and closes cleanly.
         const b = try session_mod.openResume(&env2, options);
         tracer.event("Open", 1, b);
         try writeFromTwoThreads(b, "{\"by\":\"p2\"}");
@@ -3471,7 +3350,6 @@ const session_model_tests = struct {
         tracer.event("Close", 1, null);
         b.destroy();
 
-        // p1 restarts and continues where the log ends.
         tracer.event("Restart", 0, null);
         const c = try session_mod.openResume(&env1, options);
         tracer.event("Open", 0, c);
@@ -3489,9 +3367,6 @@ const session_model_tests = struct {
     test "WriterLock trace: planted bug, resume skips the flock" {
         try runLockTrace("planted-skip_flock", .skip_flock);
     }
-
-    // ---------------------------------------------------------------------------
-    // Fork
 
     const ForkTracer = struct {
         trace: trace.Trace,
@@ -3547,7 +3422,6 @@ const session_model_tests = struct {
             const i = t.slot(session.id());
             if (session.identity.forked_from != null and !t.published[i]) {
                 const origin = session.identity.forked_from.?;
-                // A fork is one action: its staging writes are not host writes.
                 if (what != .published) return;
                 t.published[i] = true;
                 const src = t.slot(origin.id);
@@ -3708,10 +3582,8 @@ const session_model_tests = struct {
         const r2 = [_][]const u8{&b2};
         _ = try s1.append(&.{ .{ .item = .{ .type = "tool_result", .data = "{}", .blobs = &r2 } }, .turn_committed });
 
-        // Fork s1 at the end of turn 1, while s1 is still open elsewhere.
         const s2 = try session_mod.openFork(&env, .{ .source = s1.id(), .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
         if (planted == .fork_skips_blob_link) {
-            // The code notices too: one source blob is missing from the fork.
             var missing: usize = 0;
             for ([_][]const u8{ &b1, &b2 }) |hash| {
                 if (session_mod.readBlob(&env, gpa, s2.id(), hash)) |bytes| gpa.free(bytes) else |err| {
@@ -3727,7 +3599,6 @@ const session_model_tests = struct {
         _ = try s2.append(&.{.turn_started});
         _ = try s2.append(&.{ .{ .item = .{ .type = "tool_result", .data = "{}", .blobs = &r2 } }, .turn_committed });
 
-        // The source goes away; the fork keeps its prefix and its blobs.
         const s1_id = try gpa.dupe(u8, s1.id());
         defer gpa.free(s1_id);
         s1.abandon();
@@ -3735,7 +3606,6 @@ const session_model_tests = struct {
         tracer.deleted(s1_id);
         _ = try s2.append(&.{ .turn_started, .{ .item = .{ .type = "tool_result", .data = "{}", .blobs = &r1 } }, .turn_committed });
 
-        // A fork of the fork.
         const s3 = try session_mod.openFork(&env, .{ .source = s2.id(), .at = .{ .turn = 2 }, .workspace = "/w", .host = .app });
         _ = try s3.append(&.{ .turn_started, .turn_committed });
         s2.abandon();
@@ -3750,9 +3620,6 @@ const session_model_tests = struct {
     test "Fork trace: planted bug, a fork skips a blob link" {
         try runForkTrace("planted-fork_skips_blob_link", .fork_skips_blob_link);
     }
-
-    // ---------------------------------------------------------------------------
-    // Subagents
 
     const SubTracer = struct {
         trace: trace.Trace,
@@ -3795,13 +3662,11 @@ const session_model_tests = struct {
             if (session.identity.role == .child) {
                 const i = t.slot(session.id());
                 switch (what) {
-                    // The first work's turn publishes the child's log.
                     .published => {
                         t.published[i] = true;
                         t.thread[i] = "running";
                         t.emit("ChildStart", labels[i]);
                     },
-                    // Later work runs in the published log.
                     .wrote_line => |w| if (w.kind == .turn_started and t.published[i] and
                         std.mem.eql(u8, t.thread[i], "starting"))
                     {
@@ -3870,8 +3735,6 @@ const session_model_tests = struct {
             const parent = t.parent orelse return out.items;
             const bytes = (try readLog(t.root, parent)) orelse return out.items;
             defer gpa.free(bytes);
-            // A child's work number counts its spawn lines
-            // (`tests/tla/session_manager/Subagents.tla`).
             var works: [2]u64 = .{ 0, 0 };
             for (try diskLines(arena, bytes)) |line| {
                 if (t.horizon) |h| if (line.seq > h) break;
@@ -3940,7 +3803,6 @@ const session_model_tests = struct {
         tracer.spawnable(c2.id());
         _ = try p.append(&.{.{ .child_spawned = .{ .child = c2.id(), .work_id = "w1" } }});
 
-        // The process dies with c2 never started (and c1 still running unless finished).
         c1.abandon();
         c2.abandon();
         p.abandon();
@@ -3979,7 +3841,6 @@ const session_model_tests = struct {
         const parent_id = try gpa.dupe(u8, p.id());
         defer gpa.free(parent_id);
 
-        // c1's first work fails; its second runs in the same log and is cancelled.
         const c1 = try session_mod.openNew(&env, .{ .workspace = "/w", .host = .child, .role = .child, .parent = parent_id });
         tracer.spawnable(c1.id());
         _ = try p.append(&.{.{ .child_spawned = .{ .child = c1.id(), .work_id = "w1", .data = "{\"name\":\"reviewer\"}" } }});
@@ -3990,7 +3851,6 @@ const session_model_tests = struct {
         _ = try p.append(&.{.{ .child_finished = .{ .child = c1.id(), .work_id = "w2", .outcome = .cancelled } }});
         _ = try c1.append(&.{.{ .turn_interrupted = .cancel }});
 
-        // c2 is running when the process dies.
         const c2 = try session_mod.openNew(&env, .{ .workspace = "/w", .host = .child, .role = .child, .parent = parent_id });
         tracer.spawnable(c2.id());
         _ = try p.append(&.{.{ .child_spawned = .{ .child = c2.id(), .work_id = "w1" } }});

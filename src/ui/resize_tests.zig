@@ -1401,7 +1401,6 @@ fn expectActiveInputSurvivesResize(
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 15);
-    // Tiny targets require the committed frame to own the full terminal.
     h.shell.owned_top_row = 1;
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -3748,8 +3747,6 @@ test "structured command-output rewrite materializes committed transcript scroll
         const text = try std.mem.print(&line, "assistant table row {d}\n", .{index + 1});
         try first_assistant.text.appendSlice(h.alloc, text);
     }
-    // Assistant content is complete before each frame; report producer
-    // closure so the finality floor does not hold the tail.
     h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
 
     try h.renderTranscriptFrame();
@@ -3801,7 +3798,6 @@ test "structured command-output rewrite materializes committed transcript scroll
         "SYSTEM OUTPUT 02",
     ) == null);
 
-    // Retention removed the recorded entry, not its unexported publication.
     try std.testing.expect(h.shell.lookupAssistantSegments(first_assistant_id) == null);
     const rebased = h.shell.transcript_commit_state.stable;
     try std.testing.expect(std.mem.findScalar(u32, rebased.retention_identity.publication_entries, first_assistant_id) != null);
@@ -3816,7 +3812,6 @@ test "structured command-output rewrite materializes committed transcript scroll
     var seen_follow_up: [60]bool = @splat(false);
     var accepted_rows: usize = 0;
     for (0..8) |_| {
-        // Settlement may translate coordinates only for rows already exported.
         var source = try h.shell.prepareTranscriptSource(h.alloc, null);
         source.deinit(h.alloc);
         const before_history = h.shell.transcriptCommitDiagnostic().history_visual_offset;
@@ -6571,7 +6566,6 @@ test "approval footer growth preserves raw status row over stale footer frame" {
     _ = try h.shell.appendRawTranscriptEntry(alloc, status_line ++ "\n");
     _ = try approval.syncRequest(alloc, .{ .label = "skill next-best-practices" });
 
-    // Footer growth follows transcript paint; its stale clear must preserve the status row.
     try renderTestFooter(&h, &input, &approval, &frame_redraw);
     try h.flush();
 
@@ -6884,8 +6878,6 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // Complete streamed rows are final even while the producer remains open,
-    // so they enter history instead of sliding the viewport by repaint.
     try std.testing.expectEqual(@as(u16, 2), h.last_frame.planned_scroll_rows);
     try std.testing.expectEqual(@as(u16, 2), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
@@ -6901,7 +6893,6 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 
-    // Closing the producer has no completed-row debt left to settle.
     h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -7807,7 +7798,6 @@ pub fn testReconstructiveFullTranscriptReplay() !void {
     const middle_idx = std.mem.find(u8, emitted, middle_marker) orelse return error.TestMissingMiddleEntry;
     const final_idx = std.mem.find(u8, emitted, final_marker) orelse return error.TestMissingFinalEntry;
 
-    // Limit uniqueness checks to the reconstructive replay, before the final-tail paint.
     const replay = emitted[first_idx .. final_idx + final_marker.len];
     try std.testing.expect(reset_idx < first_idx);
     try std.testing.expect(reset_idx < replay_origin_idx);
@@ -8743,7 +8733,6 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     const append = "\nzeta\n";
     h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + append.len - 1;
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, append);
-    // Retention must not label an unpainted reflow as the physical endpoint.
     const anchor = h.shell.transcript_commit_state.stable;
     try std.testing.expect(std.mem.endsWith(u8, committed, anchor.flow));
     try h.renderTranscriptFrame();
@@ -8760,7 +8749,6 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     defer alloc.free(full);
     var last: usize = 0;
     for ([_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu" }) |word| {
-        // eta also occurs inside zeta/theta; use token boundaries below.
         var tokens = std.mem.tokenizeAny(u8, full, " \n\r");
         var count: usize = 0;
         while (tokens.next()) |token| if (std.mem.eql(u8, token, word)) {
@@ -8999,7 +8987,6 @@ test "assistant retention preserves physical rows inside a protected wrapped ent
         try paintRetentionFrame(&h, &probe, &input, &approval);
         try expectRetentionRows(&probe, &h, 121);
         try expectGridContains(&h, "ROW_0120");
-        // Two retention mutations may arrive before the next frame commits.
         for (121..123) |id| {
             const later = try wrappedRetentionRow(alloc, id);
             defer alloc.free(later);
@@ -9021,8 +9008,6 @@ test "command tool rows reclip to live width across lifecycle states" {
     defer approval.deinit(alloc);
     try h.shell.initViewport(&h.metrics, 1);
 
-    // A 152-byte command: past the 120-byte compact activity bound, so its
-    // status phrases carry the frozen "..." marker at generation time.
     const command = "printf '" ++ text_utils.repeat("x", 60) ++ "' && sleep 1 && printf '" ++ text_utils.repeat("y", 60) ++ "'";
     const frozen_command = command[0..117] ++ "...";
     const full_tail = text_utils.repeat("y", 60);
@@ -9037,10 +9022,7 @@ test "command tool rows reclip to live width across lifecycle states" {
         .activity_kind = .command,
         .arguments_json = args_json,
     } });
-    // Start-time metadata store, mirroring the worker callback: the full
-    // reflow-bound command plus the predicted completed label.
     try h.shell.setToolCommandMetadata(alloc, id, command, "Ran");
-    // The active status phrase is generated at the compact bound.
     _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{
         .id = id,
         .text = "● Running " ++ frozen_command,
@@ -9049,11 +9031,9 @@ test "command tool rows reclip to live width across lifecycle states" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The active row reclips to the live width and keeps its own label.
     try expectGridContains(&h, "Running " ++ command);
     try expectGridNotContains(&h, frozen_command);
 
-    // Settled success: the frozen "Ran" phrase reclips the same way.
     _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
         .outcome = .{ .kind = .completed, .summary = "Ran " ++ frozen_command },
@@ -9064,8 +9044,6 @@ test "command tool rows reclip to live width across lifecycle states" {
     try expectGridContains(&h, "Ran " ++ command);
     try expectGridNotContains(&h, frozen_command);
 
-    // Settled with a nonzero exit: the settled label carries the exit code,
-    // which the start-time predicted label ("Ran") cannot know.
     const failed_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-failed" };
     _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = failed_id,
@@ -9085,9 +9063,6 @@ test "command tool rows reclip to live width across lifecycle states" {
     try expectGridContains(&h, "Exited 1 " ++ command);
     try expectGridNotContains(&h, frozen_command);
 
-    // Reclipped rows still respect the live width: narrow them and the row
-    // folds to the width with the single-cell clip marker, not the frozen
-    // generation marker.
     try h.driveResize(90, 30, 4, true);
     try expectGridNotContains(&h, full_tail);
     try h.driveResize(200, 30, 4, true);
@@ -9105,9 +9080,6 @@ test "full transcript shows terminal session launch commands in full across widt
     defer approval.deinit(alloc);
     try h.shell.initViewport(&h.metrics, 1);
 
-    // `interact` has no command argument: the session's launch command is
-    // known only through the stored command display, and the status phrase
-    // was frozen at the compact activity bound.
     const launch = "cd . && python3 - <<'PYEOF' import pathlib led = pathlib.Path(\"docs/workflows/ledger.md\"); " ++
         "s = led.read_text() old = \"Fixed in draft (b226cd28e,\" assert old in s LAUNCH_COMMAND_TAIL";
     const frozen = launch[0..100] ++ "...";
@@ -9128,11 +9100,9 @@ test "full transcript shows terminal session launch commands in full across widt
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The main view still trails a row that does not fit.
     try expectGridContains(&h, "Observed cd . && python3");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
 
-    // Ctrl+O shows the whole launch command at every width.
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -9147,7 +9117,6 @@ test "full transcript shows terminal session launch commands in full across widt
     try h.driveResize(140, 30, 4, true);
     try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
 
-    // Leaving Ctrl+O restores the trailing main view.
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
     try h.driveResize(100, 30, 4, true);
     try expectGridContains(&h, "Observed cd . && python3");

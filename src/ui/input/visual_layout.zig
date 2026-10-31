@@ -923,7 +923,6 @@ test "visual layout treats only registered image placeholders as atomic badges" 
         .unit => |unit| switch (unit.kind) {
             .image_badge => |badge| {
                 badges += 1;
-                // Both placeholders name the same attachment, so both badges are identical.
                 try std.testing.expectEqual(@as(usize, 0), badge.attachment_index);
                 try std.testing.expectEqual(image_attachments.imageBadgeVisibleWidth(5), unit.cell_width);
             },
@@ -1247,10 +1246,6 @@ test "visual layout visibleWindow is defensive and cursor-containing" {
 }
 
 test "visual layout wraps whole words at the soft margin" {
-    // cols = 12, prefix = 2, so 10 content cells per row.
-    // "hello brave world" splits per word: "hello " (6) + "brave" would end
-    // past column 10, so "brave" moves whole to the next row, and "world"
-    // (5 cells after "brave " = 6) wraps whole again.
     const input = "hello brave world";
     const source = testSource(input, input.len, 12);
     try std.testing.expectEqual(@as(usize, 3), summarize(source, null).total_rows);
@@ -1265,16 +1260,12 @@ test "visual layout wraps whole words at the soft margin" {
     const third = rowAt(source, 2).?;
     try std.testing.expectEqualStrings("world", input[third.raw_start..third.raw_end]);
 
-    // The first character of the wrapped word lands at column 0 of row 1.
     try expectPoint(cursorPointAt(source, "hello ".len), "hello ".len, 1, 0);
 }
 
 test "visual layout still splits words wider than a full row per character" {
     const input = "ab cdefghijklm";
     const source = testSource(input, input.len, 12);
-    // "cdefghijklm" is 11 cells wide, wider than the 10 available content
-    // cells, so it must fall back to character splitting instead of leaving
-    // the first row almost empty.
     try std.testing.expectEqual(@as(usize, 2), summarize(source, null).total_rows);
     const first = rowAt(source, 0).?;
     try std.testing.expectEqual(BreakKind.soft_wrap, first.break_kind);
@@ -1282,9 +1273,6 @@ test "visual layout still splits words wider than a full row per character" {
 }
 
 test "visual layout hangs margin spaces so continuation rows never start with a space" {
-    // cols = 12, prefix = 2, so 10 content cells. "abcdefghij" fills row 0
-    // exactly; the following space hangs past the margin instead of wrapping,
-    // so row 1 starts at "kl" with no leading space.
     const input = "abcdefghij kl";
     const source = testSource(input, input.len, 12);
     try std.testing.expectEqual(@as(usize, 2), summarize(source, null).total_rows);
@@ -1296,7 +1284,6 @@ test "visual layout hangs margin spaces so continuation rows never start with a 
     const second = rowAt(source, 1).?;
     try std.testing.expectEqualStrings("kl", input[second.raw_start..second.raw_end]);
 
-    // Multiple margin spaces all hang on the previous row.
     const multi = "abcdefghij   kl";
     const multi_source = testSource(multi, multi.len, 12);
     try std.testing.expectEqual(@as(usize, 2), summarize(multi_source, null).total_rows);
@@ -1305,8 +1292,6 @@ test "visual layout hangs margin spaces so continuation rows never start with a 
 }
 
 test "visual layout word wrap keeps trailing space on the previous row" {
-    // Typing "aaaa bbbb " at cols 12: after the wrap, continuing to type
-    // starts words on the second row rather than mid-split.
     const input = "aaaa bbbbbb cc";
     const source = testSource(input, input.len, 12);
     try std.testing.expectEqual(@as(usize, 2), summarize(source, null).total_rows);

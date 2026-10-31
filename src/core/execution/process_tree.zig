@@ -485,8 +485,6 @@ pub const Tracker = struct {
     ) CompletionStanding {
         const actual = Effects.capture(self.alloc, process.pid) catch |err| switch (err) {
             error.ProcessNotFound => return .gone,
-            // An unreadable process stays attached, so cleanup still tries
-            // to stop it and reports the failed attempt.
             else => return .attached,
         };
         if (!process.identity.eql(actual.identity) or !snapshotIsAlive(actual)) {
@@ -519,9 +517,6 @@ pub const Tracker = struct {
         defer self.alloc.free(task_path);
         var task_dir = (try openLinuxProcDir(task_path)) orelse return;
         defer task_dir.close(io_mod.getIo());
-        // The directory was just opened, so skip the rewind that `iterate`
-        // does first. gVisor fails that lseek with ENOENT once the process
-        // has exited, which would abort the whole scan.
         var tasks = task_dir.iterateAssumeFirstIteration();
         while (try tasks.next(io_mod.getIo())) |entry| {
             const tid = std.fmt.parseInt(
@@ -785,9 +780,6 @@ fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
 
 fn openLinuxProcDir(path: []const u8) !?std.Io.Dir {
     if (comptime builtin.target.os.tag != .linux) return error.ProcessTreeUnsupported;
-    // A process can disappear between identity validation and opening its
-    // procfs entry. The POSIX wrapper maps Linux's ESRCH to FileNotFound;
-    // std.Io currently treats ESRCH from directory opens as unexpected.
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
         .ACCMODE = .RDONLY,
         .NOFOLLOW = true,
@@ -1088,8 +1080,6 @@ test "natural completion keeps an unreadable process attached and reports it" {
 
     FakeEffects.sent_count = 0;
     const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
-    // Without a snapshot the process cannot be signaled safely, but it is
-    // neither kept as a daemon nor treated as gone.
     try std.testing.expectEqual(@as(usize, 0), FakeEffects.sent_count);
     try std.testing.expectEqual(@as(usize, 0), completed.delivery.delivered);
     try std.testing.expectEqual(@as(usize, 0), completed.kept_detached);
@@ -1240,8 +1230,6 @@ fn snapshotIsAlive(snapshot: ProcessSnapshot) bool {
 }
 
 const Darwin = struct {
-    // Stable libproc process-identity flavor; the SDK omits this constant from
-    // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
     const proc_pid_fd_pipe_info: c_int = 6;
     const process_status_zombie: u32 = 5;

@@ -50,7 +50,6 @@ pub const ResizeApprovalInterlock = struct {
     const clear_resize_pending_mask: u8 = ~resize_pending_bit;
     const clear_affirmative_claimed_mask: u8 = ~affirmative_claimed_bit;
 
-    // The signal handler only sets resize_pending_bit; event-loop code owns all clears.
     state: std.atomic.Value(u8) = .init(0),
 
     pub fn noteResizeSignal(self: *ResizeApprovalInterlock) void {
@@ -236,9 +235,6 @@ pub fn collectResizeFacts(
                 );
                 return;
             }
-            // Position replies are indistinguishable from pasted bytes, so
-            // leave live geometry pending until bracketed paste releases input
-            // ownership and the shared parser can begin.
             if (!cursor_probe_allowed or !probe.canBegin()) return;
             try observeDirtyResize(
                 terminal,
@@ -726,16 +722,12 @@ fn applyResizeWithLayoutResolved(
     const needs_owned_band_invalidation = size_changed or recovering_invalid_dimensions;
 
     if (!settled) {
-        // .resize_light is the only unsettled mode, so the size changed here.
         std.debug.assert(size_changed);
         shell.layout = new_layout;
         shell.terminal_dimensions_invalid = false;
         try recordOwnedBandInvalidation(shell, .resize);
         metrics.debounced_resizes += 1;
         shell.render_requests.completeResizeGeometry(true);
-        // Shadow-grid reconciliation is part of the next frame commit.
-        // Resizing the shadow here would make it describe terminal
-        // reflow that has not yet been committed.
         try requestRedraw(shell, metrics, mode);
         return;
     }

@@ -1,5 +1,3 @@
-// `libfx/skills/node` (skills-node.js): loads a `SKILL.md` explicitly in
-// Node.js or Bun.
 import type { FxAgentTool } from "./libfx.cjs";
 import type { SkillRecord, SkillResource } from "./skills.js";
 

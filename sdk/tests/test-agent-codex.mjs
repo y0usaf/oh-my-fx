@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// A Codex (ChatGPT plan) agent: the engine's requests reach Codex through the
-// host fetch with the host's ChatGPT credentials, refreshed when needed, and
-// never touch AI Gateway. No network: every request is answered here.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -88,7 +85,6 @@ const assertNoSecrets = (value, secrets) => {
   for (const secret of secrets) assert.equal(text.includes(secret), false, "libfx diagnostics must not expose ChatGPT credentials");
 };
 
-// 1. A Codex turn on the host's credentials, with no Gateway request.
 {
   const access = jwt("first", tenDays);
   const world = codexWorld({ refreshedToken: jwt("unused", tenDays) });
@@ -125,7 +121,6 @@ const assertNoSecrets = (value, secrets) => {
   assertNoSecrets(events, [access, "rt-1"]);
 }
 
-// 2. A rejected token is refreshed once and the request sent again.
 {
   const first = jwt("rejected", tenDays);
   const second = jwt("refreshed", tenDays);
@@ -155,7 +150,6 @@ const assertNoSecrets = (value, secrets) => {
   assertNoSecrets(events, [first, second, "rt-1", "rt-2"]);
 }
 
-// 3. Credentials about to expire are refreshed before the request.
 {
   const expiring = jwt("expiring", 60);
   const fresh = jwt("fresh", tenDays);
@@ -168,7 +162,6 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 5. A durable session asks for its own session's credentials.
 {
   const access = jwt("durable", tenDays);
   const world = codexWorld({ refreshedToken: jwt("unused", tenDays) });
@@ -196,7 +189,6 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 4. Options are checked before anything starts.
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "codex", model: "gpt-6.1-sol" }), /needs a credentials\(\) function/);
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "custom", apiKey: "key" }), /provider must be "gateway", "codex", "grok" or a custom provider/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", credentials: () => ({}) }), /credentials needs provider "codex"/);

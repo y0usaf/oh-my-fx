@@ -354,8 +354,6 @@ pub const MarkdownProcessor = struct {
             self.active_blockquote = null;
         }
 
-        // An indented list marker continues a list, except that a plus sign in
-        // indented-code position stays code so diff-style lines are preserved.
         const indented_list_item = bp.hasIndentedCodePrefix(line) and
             (bp.parseUnorderedList(line) != null or bp.parseOrderedList(line) != null);
         const plus_in_code_position = indented_list_item and self.previous_line_was_blank and tu.leftTrim(line)[0] == '+';
@@ -1528,9 +1526,6 @@ test "underscore formatted URLs require exact active markers" {
         try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
     }
 
-    // Trailing underscores are outside the URL, as in GFM autolinks, so the
-    // mismatched runs pair on their shared length and the extra underscore
-    // stays literal next to the styled link.
     const mismatched_run_cases = [_]struct {
         input: []const u8,
         url: []const u8,
@@ -1678,7 +1673,6 @@ test "entity lookup is bounded and a long ampersand line renders in bounded time
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    // A semicolon farther than the longest accepted name never forms an entity.
     try processor.push(alloc, "&ampersand; &amp;\n", &out);
     try std.testing.expectEqualStrings("&ampersand; &\n", out.items);
 
@@ -2564,9 +2558,6 @@ test "tab indented fence inside a list item closes on a tab indented fence" {
     );
 }
 
-// Known cost of the plus rule: a loose nested list written as "- a", a blank
-// line, then "    + nested" renders the nested line as indented code, while
-// "-" or "*" at the same indent still become list items.
 test "indented plus line after a blank stays indented code" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
@@ -3376,24 +3367,18 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    // A backtick inside link text is not a code opener and a star inside a
-    // code span is not a closer.
     try processor.push(alloc, "[use `](https://example.com) **bold** `code`\n[use `](https://example.com) *open `code*`\n", &out);
     try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;255mcode\x1b[39m"));
     try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;255mcode*\x1b[39m"));
 
-    // Emphasis around a multi backtick code span still pairs.
     out.clearRetainingCapacity();
     try processor.push(alloc, "See _a ``b`c`` d_ end\n", &out);
     try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;255mb`c\x1b[39m d\x1b[23m end\n", out.items);
 
-    // URL punctuation is never read as markup, and a delimiter that ends a
-    // URL still closes the span around it.
     out.clearRetainingCapacity();
     try processor.push(alloc, "https://example.com/`x*y` **bold** `code`\n", &out);
     try std.testing.expect(std.mem.find(u8, out.items, ";https://example.com/`x*y`\x1b\\") != null);
     try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;255mcode\x1b[39m\n"));
-    // A trailing delimiter is trimmed from the URL and closes the span.
     out.clearRetainingCapacity();
     try processor.push(alloc, "*see https://example.com/a* and `code`\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3msee \x1b]8;id=fx-"));
@@ -3402,9 +3387,6 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
         out.items,
         ";https://example.com/a\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/a\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;255mcode\x1b[39m\n",
     ));
-    // Like a GFM autolink, a URL extends to the next whitespace regardless of
-    // active styles, so interior punctuation belongs to the URL and the rest
-    // of the line is read after it.
     out.clearRetainingCapacity();
     try processor.push(alloc, "*https://example.com/a*`some code` **bold** `x`\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "*\x1b]8;"));
@@ -3422,11 +3404,6 @@ test "emphasis flanking reads neighbouring code points not bytes" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    // An em dash, curly quotes, and a fullwidth comma are punctuation, so the
-    // marker beside them opens or closes; CJK letters are word characters,
-    // so a star still delimits between them while an underscore does not.
-    // Letters outside ASCII such as the micro sign are still letters, so an
-    // underscore between them stays intraword.
     try processor.push(alloc, "a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", &out);
     try std.testing.expectEqualStrings("a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", out.items);
     out.clearRetainingCapacity();
@@ -3471,7 +3448,6 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
         .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "]\n" },
         .{ .prefix = "", .unit = "[^", .repeat = 32 * 1024, .suffix = "]\n" },
     };
-    // Deeply nested successful pairs must not re-walk consumed ranges.
     out.clearRetainingCapacity();
     line.clearRetainingCapacity();
     for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
@@ -3481,8 +3457,6 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
     try processor.push(alloc, line.items, &out);
     try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 500);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3ma \x1b[3ma "));
-    // A closer that matches part of its run and then fails to place the rest
-    // must cache that failed remainder instead of rescanning other openers.
     out.clearRetainingCapacity();
     line.clearRetainingCapacity();
     for (0..32_000) |_| try line.appendSlice(alloc, "*a ");

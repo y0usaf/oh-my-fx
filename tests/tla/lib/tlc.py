@@ -20,8 +20,6 @@ _TLC_SH = Path(__file__).resolve().with_name("tlc.sh")
 def toolchain():
     """Return (java, jar). Exits with status 2 and tlc_find's message when
     either is missing, as the shell checkers do."""
-    # The account's home, not $HOME: drivers run fx under a disposable HOME,
-    # and the default jar lives in the real one.
     env = {**os.environ, "HOME": pwd.getpwuid(os.getuid()).pw_dir}
     found = subprocess.run(
         ["sh", "-c", '. "$1" && tlc_find && printf "%s\\n%s\\n" "$tlc_java" "$tlc_jar"', "sh", str(_TLC_SH)],

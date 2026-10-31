@@ -47,7 +47,6 @@ async function start(cwd, args, name) {
   const port = reservation.address().port;
   await new Promise((resolveClose) => reservation.close(resolveClose));
   const log = createWriteStream(resolve(root, `${name}.log`));
-  // Next 16 dev forwards flags through NODE_OPTIONS, which rejects the JSPI flag.
   const jspiArgs = name === "start" || (name === "dev" && next15) ? ["--experimental-wasm-jspi"] : [];
   const child = spawn(process.execPath, [...jspiArgs, "--no-experimental-require-module", ...args, ...(name === "standalone" ? [] : ["--hostname", "127.0.0.1", "--port", String(port)])], {
     cwd, env: { ...env, HOSTNAME: "127.0.0.1", PORT: String(port) }, detached: true, stdio: ["ignore", "pipe", "pipe"],
@@ -95,7 +94,6 @@ async function exercise(server, stage) {
       console.log(`${stage}/${backend}/${scenario} passed`);
     }
   }
-  // Next's standalone tracer excludes .wasm assets; native selection above must not rely on that fallback.
   if (stage === "start" || (stage === "dev" && next15)) {
     const response = await fetch(`${server.url}/api/fx?backend=wasm&scenario=startup`, {
       headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000),
@@ -119,8 +117,6 @@ async function exercise(server, stage) {
   assert.ok(concurrent.every((result) => result.toolCalls === 1 && result.ok));
   console.log(`${stage}/eight concurrent tool turns passed`);
 
-  // A durable session through the package's default durability: two turns
-  // in one session, then the whole session replayed from its start.
   const authorization = { authorization: `Bearer ${token}` };
   const first = await fetch(`${server.url}/api/durable`, { method: "POST", headers: authorization, body: "hello", signal: AbortSignal.timeout(60_000) });
   assert.equal(first.status, 200, await first.clone().text());
@@ -141,8 +137,6 @@ async function exercise(server, stage) {
   console.log(`${stage}/durable session passed`);
 }
 
-// NDJSON lines from `response` until `done(line)`; a session stream stays
-// open, so the reader stops there.
 async function ndjsonUntil(response, done) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -167,7 +161,6 @@ async function ndjsonUntil(response, done) {
 
 async function assertBundledNativeAssets(buildDir) {
   if (!webpack) return;
-  // A deployment carries the durability modules libfx loads on first use.
   const durableDir = resolve(buildDir, "server/app/api/durable");
   const durableTrace = JSON.parse(await readFile(resolve(durableDir, "route.js.nft.json"), "utf8"));
   for (const name of ["local", "vercel"]) {

@@ -88,8 +88,6 @@ pub const PageData = struct {
     storage_epoch: u64,
     slots: [page_slots]Slot = @splat(.{}),
 
-    // Field-wise init; a partial `.{}` literal materializes a page-sized
-    // (~17KB) const template at every call site.
     pub fn init(number: u64, storage_epoch: u64) PageData {
         var page: PageData = undefined;
         page.number = number;
@@ -200,9 +198,6 @@ pub fn decodePage(
     return page;
 }
 
-// noinline keeps the comptime-known error returns behind a call boundary;
-// inlined into an `Error!PageData` result location they each materialize a
-// page-sized error-union constant.
 pub noinline fn decodePageInto(
     page: *PageData,
     bytes: []const u8,

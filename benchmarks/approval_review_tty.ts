@@ -18,9 +18,6 @@ import {
 import { readTapeFrames, type TapeFrame } from "../tests/e2e/render-lab/tape";
 
 const SEED = "0xf17ed1ff20260805";
-// Transcript scaling is covered by approval_review.zig. Keep the assembled
-// real-TTY run focused on the 50k-line file review instead of measuring the
-// inline transcript stream used to prepare the session.
 const HISTORY_LINES = 200;
 const DIFF_LINES = (() => {
   const value = Number(process.env.FX_APPROVAL_PROFILE_DIFF_LINES ?? "50000");
@@ -717,8 +714,6 @@ try {
     assert(decisions.length === 1, `${callId} decision count was ${decisions.length}, expected 1`);
   }
   assert(readFileSync(stderrPath, "utf8") === "", "fx wrote to stderr");
-  // Escape cancels without a tool-result request. Ctrl-C reports the
-  // interrupted tool result once before returning to the composer.
   assert(gateway.requests.length === 1 + cycles * 2 + 3, `unexpected gateway request count ${gateway.requests.length}`);
 
   await session.sendText("/quit");

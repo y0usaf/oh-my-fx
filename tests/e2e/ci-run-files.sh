@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Run E2E files one at a time, each in its own Bun process with its own tmux
-# server, so terminal fixtures and process state cannot leak between files.
-# A failing file gets one retry after its tmux server is reset. A file that
-# passes only on retry is reported as a warning so flaky files stay visible.
 set -uo pipefail
 
 if [ "$#" -eq 0 ]; then

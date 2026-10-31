@@ -506,14 +506,10 @@ test "safe git blocks repository clean, process and smudge filters" {
     try repo.plain(repo.repo, &.{ "config", "--unset", "filter.evil.clean" });
 
     try repo.plain(repo.repo, &.{ "config", "filter.evil.process", repo.sentinel });
-    // Same size as the committed "one\n": with a different size, git status
-    // can report the change from the index stat alone and skip the filter.
     try repo.write("repo/a.txt", "ten\n");
     try repo.expectBlocked(repo.repo, .status, &.{"--short"}, &.{ "status", "--short" });
     try repo.plain(repo.repo, &.{ "config", "--unset", "filter.evil.process" });
 
-    // No read-only command checks files out, so smudge is shown through the
-    // shared prelude on `checkout`, where git would run it.
     try repo.plain(repo.repo, &.{ "config", "filter.evil.smudge", repo.sentinel });
     const file = try repo.path("repo/a.txt");
     var argv: std.ArrayList([]const u8) = .empty;
@@ -599,8 +595,6 @@ test "safe git follows git's repository choice and refuses what it cannot blank"
     defer tmp.cleanup();
     const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
 
-    // git skips an inner `.git` without `refs` and uses the outer repository.
-    // fx makes the same choice, so the outer repository's filter is blanked.
     try repo.write("repo/.git/info/attributes", "a.txt filter=evil\n");
     try repo.plain(repo.repo, &.{ "config", "filter.evil.clean", repo.sentinel });
     try repo.write("repo/inner/.git/HEAD", "ref: refs/heads/main\n");
@@ -609,17 +603,12 @@ test "safe git follows git's repository choice and refuses what it cannot blank"
     try repo.write("repo/a.txt", "two\n");
     try repo.expectBlocked(inner, .status, &.{"--short"}, &.{ "status", "--short" });
 
-    // A git directory used as the workspace, with a separate work tree. git
-    // uses it; fx's discovery does not, so safe git refuses.
     const gitdir = try repo.path("gitdir");
     try repo.plain(repo.root, &.{ "init", "-q", "--bare", "--template=", gitdir });
     try repo.plain(gitdir, &.{ "config", "core.bare", "false" });
     try repo.plain(gitdir, &.{ "config", "core.worktree", repo.repo });
     try std.testing.expectEqual(Refusal.repository_mismatch, (try prepare(repo.arena, gitdir)).refused);
 
-    // An inner repository whose `HEAD` is a symlink into `refs/`. git uses
-    // it; fx's discovery rejects it and reads the outer repository, so the two
-    // disagree and safe git refuses instead of running with the wrong config.
     const linked = try repo.path("repo/linked");
     try repo.plain(repo.repo, &.{ "init", "-q", "--template=", linked });
     const linked_head = try repo.path("repo/linked/.git/HEAD");

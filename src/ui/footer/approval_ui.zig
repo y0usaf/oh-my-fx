@@ -23,12 +23,8 @@ const file_approval_screen_hint = "1–3 choose now    ↑↓ options    tab ame
 const file_approval_navigation_screen_hint = "1–3 choose now    ↑↓ or tab options    wheel scroll    enter confirm    esc cancel";
 const file_approval_hint_compact = "1–3 choose now    enter confirm    esc cancel";
 const file_approval_hint_minimal = "enter confirm    esc cancel";
-// Ordered widest-first; every variant keeps the Enter/Esc controls so narrow
-// terminals never lose the submit and cancel instructions.
 const file_approval_hint_variants = [_][]const u8{ file_approval_hint, file_approval_hint_compact, file_approval_hint_minimal };
 const file_approval_navigation_hint_variants = [_][]const u8{ file_approval_navigation_hint, file_approval_hint_compact, file_approval_hint_minimal };
-// The scrollable ladder keeps the wheel-scroll notice as long as it fits; it
-// is the only cue that the review document scrolls.
 const file_approval_screen_hint_variants = [_][]const u8{
     file_approval_screen_hint,
     "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",

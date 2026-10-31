@@ -1,6 +1,5 @@
 export const maxCoreMessageBytes = 64 * 1024 * 1024;
 
-// One ordered writer per core; a pending handler holds admission of the next message.
 export class CoreOutput {
   constructor(handler) {
     this.handler = handler;

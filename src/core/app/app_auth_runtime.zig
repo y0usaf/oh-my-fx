@@ -150,7 +150,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn restoreSessionCredential(app: *App, previous_provider: model_provider.ProviderId) !void {
-            // Hydration can run before App.init returns, so it must not start background tasks.
             const provider = provider_runtime.provider(app);
             const provider_changed = !previous_provider.same_authority(provider);
             if (provider_changed) {
@@ -519,8 +518,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(@TypeOf(app.auth), "takeStartupCredentialLoad")) return;
             var outcome = app.auth.takeStartupCredentialLoad() orelse return;
             defer outcome.deinit();
-            // The blocking path aborts launch on these errors; only allocation
-            // failure can reach here for a Keychain-backed Gateway lookup.
             const resolution = switch (outcome) {
                 .failed => |err| return err,
                 .resolved => |*resolution| resolution,
@@ -552,13 +549,11 @@ pub fn Runtime(comptime App: type) type {
             const provider = if (comptime provider_runtime.supported(App)) provider_runtime.provider(app) else .gateway;
             try writeStartupCredentialFailure(app, provider, resolution.failure);
 
-            // Model cache warmup waited for this credential (see startModelCacheWarmup).
             if (adopted) {
                 applyCredentialChange(app, true);
             } else if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
             }
-            // Before the first frame commits, its own hook starts the prewarm.
             if (adopted and !app.shell.render_requests.hasReason(.first_frame)) {
                 startPromptCredentialPrewarm(app);
             }
@@ -612,11 +607,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
-            // Logging out is an explicit rejection of that credential, so a
-            // remembered pointer to it would silently reactivate on next login.
-            // A remembered source always wins resolution, so an active fx login
-            // is the only way one can be remembered; clearing otherwise is a
-            // no-op against a store that holds nothing.
             if (app.auth.credentialSource() == .fx_login) forgetCredentialSource(app);
             applyCredentialChange(app, try app.auth.reconcileAfterFxLoginLogout(app.alloc));
             try writeAuthNotice(app, if (result.local_durability_failed)
@@ -866,8 +856,6 @@ pub fn Runtime(comptime App: type) type {
         /// Polled from the event loop so a save that blocks on a locked key store
         /// or a slow gateway never stalls rendering.
         pub fn collectApiKeySaveFacts(app: *App) !void {
-            // Runs every tick: the key column has to retire whenever its entry
-            // ended, whether it was saved, cancelled, or replaced.
             defer provider_picker_runtime.Runtime(App).closeKeyColumn(app);
             const result = app.auth.takeApiKeySaveResult(app.alloc) orelse return;
             try applyApiKeySaveResult(app, result);
@@ -889,10 +877,6 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = body,
                     }, true);
-                    // Only the inline `/provider vercel api-key` path implies
-                    // "use the gateway now": the user named the provider on the
-                    // way in. The staged hub also reaches this save, and there
-                    // adding a key is not a request to switch.
                     if (comptime provider_runtime.supported(App) and provider_picker_runtime.supported(App)) {
                         if (app.input_runtime.picker.provider_picker_stage == .api_key and
                             provider_runtime.provider(app) != .gateway)
@@ -1002,8 +986,6 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
-            // ChatGPT is selected by model route, not as a global Gateway
-            // credential preference. Its saved session coexists independently.
             if (source == .chatgpt_subscription or source == .grok_subscription) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
@@ -1466,9 +1448,6 @@ pub fn Runtime(comptime App: type) type {
 
             var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
                 debug_trace.logf("auth", "provider picker team load failed err={s}", .{@errorName(err)});
-                // A session file that exists but can no longer be refreshed is
-                // not a listing failure: there is nothing to list until the
-                // user signs in again.
                 if (err == error.NoSession or auth_runtime.classifyCredentialFailure(.fx_login, err).requiresSignIn()) {
                     return .needs_sign_in;
                 }
@@ -1757,9 +1736,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
-                // Open the browser as soon as the device code is ready instead of
-                // waiting for Enter; Enter stays as a manual re-open, and
-                // FX_NO_OPEN_BROWSER opts out for headless/SSH sessions.
                 if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
             }
         }

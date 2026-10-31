@@ -32,7 +32,6 @@ pub fn detectTheme(_: std.mem.Allocator, terminal_state: *const shell_runtime.Te
     if (explicitThemeOverride()) |light| return .{ .light = light, .rgb = null };
     if (comptime builtin.target.os.tag == .wasi) return .{ .light = false, .rgb = null };
 
-    // One probe derives both light/dark and the RGB used for bar shading.
     if (queryTerminalBackground(terminal_state)) |info| {
         return .{ .light = info.light, .rgb = info.rgb };
     }
@@ -53,7 +52,6 @@ fn queryTerminalBackground(terminal_state: *const shell_runtime.TerminalState) ?
     var stdout_file = std.Io.File.stdout();
     stdout_file.writeStreamingAll(io_mod.getIo(), terminal_sequences.theme_background_query_with_fence) catch return null;
 
-    // Room for the longest background reply plus a full device attributes list.
     var buf: [192]u8 = undefined;
     var len: usize = 0;
     const deadline_ms = io_mod.milliTimestamp() + 200;
@@ -95,12 +93,10 @@ test "the device attributes fence ends the background probe" {
     try std.testing.expect(!dark.done.?.light);
     const light = fencedBackgroundReply("\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?1;2c");
     try std.testing.expect(light.done.?.light);
-    // A terminal without OSC 11 answers only the fence.
     try std.testing.expectEqual(@as(?TerminalBackground, null), fencedBackgroundReply("\x1b[?62;22c").done);
 }
 
 test "the background probe keeps reading until the fence completes" {
-    // Hex digits end in "c" without a fence.
     try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cc") == .pending);
     try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cccc\x1b\\") == .pending);
     try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cccc\x1b\\\x1b[?62;2") == .pending);

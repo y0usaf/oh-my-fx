@@ -68,7 +68,6 @@ pub fn search(
     if (!server_configured) return .{ .model_output = try alloc.dupe(u8, server_not_found_output) };
     const candidates = try alloc.alloc(Candidate, candidate_capacity);
     defer alloc.free(candidates);
-    // The catalog is read here, so each candidate's auth generation is too.
     const witnesses = try alloc.alloc(?CatalogAuthWitness, candidate_capacity);
     defer alloc.free(witnesses);
     var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
@@ -536,7 +535,6 @@ test "MCP search names why the server it names is down" {
     defer access.deinit();
     const handles = [_]*McpServer{&servers[0]};
 
-    // Without a recorded reason the ordinary search runs.
     try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtools"));
 
     servers[0].setFailed(alloc, "MCP server exited with code 1 before completing startup: npm error code E401");

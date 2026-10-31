@@ -728,7 +728,6 @@ function expectUserProfileTrace(tracePath: string) {
     "shell.run authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
-  // The user profile runs through the process's captured startup files.
   expect(trace).toContain("command runner snapshot generation=");
   expect(trace).not.toContain("authority=direct_only route=direct_read_only");
 }

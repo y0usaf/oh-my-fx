@@ -690,7 +690,6 @@ pub const Capture = struct {
     ) !OwnedDescriptor {
         const backing = self.backing orelse return error.ReplayStoreUnavailable;
         if (backing == .blobs) {
-            // Already whole in memory: the blob needs no spool.
             const hash = try backing.blobs.putBlob(buffered.items);
             const handle = try blobReplayHandle(alloc, hash);
             const framed_bytes = buffered.items.len;
@@ -728,8 +727,6 @@ pub const Capture = struct {
         const backing = self.backing orelse return error.ReplayStoreUnavailable;
         if (backing == .ephemeral) return;
         if (backing == .blobs) {
-            // The spool's bytes become the blob, copied from the file; the
-            // capture hashed the same bytes as it wrote them.
             const hash = try backing.blobs.putBlobFile(spool.file.ephemeral, spool.framed_bytes);
             const expected = std.fmt.bytesToHex(digest, .lower);
             std.debug.assert(std.mem.eql(u8, &expected, &hash));
@@ -845,8 +842,6 @@ pub const Capture = struct {
                 );
             },
             .ephemeral => |store| store.delete(handle),
-            // A spool is unlinked already and goes when it closes; a kept
-            // blob stays with the session, which a fork may share.
             .blobs => if (artifact_digest.blobHash(handle) != null) {
                 @import("../shared/debug_trace.zig").logf(
                     "session",
@@ -976,8 +971,6 @@ pub const Reader = struct {
     byte_stream: Stream = .stdout,
     frame_remaining: usize = 0,
 
-    // Fallible constructors use noinline out-parameter boundaries so errors do
-    // not materialize Reader's unused 8 KiB payload.
     pub fn open(
         alloc: Allocator,
         capability: *session_child_store.SessionChildCapability,
@@ -1048,8 +1041,6 @@ pub const Reader = struct {
         handle: []const u8,
     ) !void {
         if (!hasContentDigest(handle)) return error.ResultHandleNotFound;
-        // Every store's blobs share the session, found by hash alone, so a
-        // v2 replay is only a replay handle; a web-fetch `.bin` is not (D44).
         if (capability.holdsBlobs() and !isReplayHandle(handle)) return error.ResultHandleNotFound;
         var file = if (capability.holdsBlobs()) ReplayFile{ .blob = capability.openBlobFile(
             alloc,
@@ -1541,7 +1532,6 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
     var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
     defer capability.deinit();
 
-    // Past the inline limit the capture spools outside the session.
     const spilled = try Capture.create(capture_alloc, 20, &capability);
     spilled.appendAccepted(capture_alloc, .stdout, "A");
     spilled.appendAccepted(capture_alloc, .stderr, "B\n");
@@ -1570,14 +1560,12 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
     const page = try readAgentPageManaged(alloc, &capability, replay.handle, 1, 4096);
     defer alloc.free(page);
     try std.testing.expect(std.mem.find(u8, page, "long enough") != null);
-    // Undoing a publication keeps the blob, which the session owns.
     const handle = try alloc.dupe(u8, replay.handle);
     defer alloc.free(handle);
     spilled.discard(capture_alloc);
     var again = try Reader.openHandle(alloc, &capability, handle);
     again.deinit();
 
-    // Within the limit the capture is stored straight from memory.
     const small = try Capture.create(capture_alloc, 4096, &capability);
     small.appendAccepted(capture_alloc, .stdout, "short\n");
     const kept = (try small.retainRequired(capture_alloc)).?;
@@ -1589,10 +1577,7 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
     try std.testing.expectEqualStrings("short\n", only.payload);
     small.releaseRetained(capture_alloc);
 
-    // A name this session never stored is not found.
     try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, "fx-command-replay-" ++ text_utils.repeat("0", 64) ++ ".bin"));
-    // Every store's blobs share the session: the same blob under a
-    // web-fetch download's `.bin` handle is not a replay.
     const foreign = try std.mem.concat(alloc, u8, &.{ "artifact-", handle["fx-command-replay-".len..] });
     defer alloc.free(foreign);
     try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, foreign));

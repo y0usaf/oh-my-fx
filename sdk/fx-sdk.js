@@ -6,7 +6,6 @@ import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.j
 import { loadModule } from "./wasm-module.js";
 import { toolObservation } from "./tool-observation.js";
 
-// Providers that run on a user's plan, authorized by the host's credentials.
 const subscriptionProviders = new Set(["codex", "grok"]);
 
 const encoder = new TextEncoder();
@@ -15,18 +14,14 @@ const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
-// Matches max_instruction_file_bytes and max_instruction_path_bytes in js_host_workspace.zig.
 const workspaceInstructionFileLimit = 1024 * 1024;
 const workspaceInstructionPathLimit = 4 * 1024;
 const workspaceReadTimeoutMs = 10_000;
 const maxInstructionsBytes = 64 * 1024;
 const maxApiKeyBytes = 64 * 1024;
 const maxModelBytes = 1024;
-// Matches the kernel's ReasoningEffort.max_name_bytes.
 const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
-// The answer a resumed turn gives a call its crash left running; matches
-// unfinished_tool_output in session_adapter.zig.
 const unfinishedToolOutput = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
@@ -34,32 +29,20 @@ const streamReadsPerTaskYield = 32;
 const transportActivityIntervalMs = 250;
 const maxUnreadEventBytes = 1024 * 1024;
 const maxUnreadEvents = 256;
-// Prompt images travel as raw bytes beside the ACP frame and are base64
-// encoded only in the model request. An image may use 5 MiB of encoded
-// request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
-// The kernel still validates content and media type.
 const maxPromptImages = 8;
 const maxPromptImageDataBytes = 5 * 1024 * 1024;
 const maxPromptImagesDataBytes = 8 * 1024 * 1024;
 const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
 const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
-// Matches the native attachment table: one prompt's images or one checkpoint.
 const maxPendingAttachments = 8;
 const maxOutboundAttachments = 4;
-// Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
 const maxCheckpointBytes = 4 * 1024 * 1024;
-// Matches the core's journal load limit (journal.max_load_bytes).
 const maxJournalBytes = 4 * 1024 * 1024;
-// The core's ACP reader drops frames over 8 MiB without a request id to answer
-// (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
-// envelope allowance covers the method key and request id.
 const maxPromptFrameBytes = 8 * 1024 * 1024;
 const promptFrameEnvelopeBytes = 128;
 const maxSteeringMessageBytes = 64 * 1024;
 const maxSteeringMessages = 64;
 const maxSteeringQueueBytes = 1024 * 1024;
-// tool_start events carry a bounded preview of the tool input; larger inputs
-// are marked truncated instead of dropped or sent whole.
 const maxToolStartInputBytes = 64 * 1024;
 
 function boundedString(value, name, maxBytes, required) {
@@ -89,8 +72,6 @@ function validateGatewayChatUrl(value) {
   }
 }
 
-// Mirrors the kernel's ReasoningEffort.parse: "auto"/"adaptive"/"default" pick
-// the model default; anything else must be a bounded effort name.
 function normalizeEffort(value) {
   if (value === undefined) return undefined;
   boundedString(value, "effort", maxEffortBytes, false);
@@ -100,8 +81,6 @@ function normalizeEffort(value) {
   return value;
 }
 
-// Mirrors the CLI's --fast/--no-fast toggle: a strict boolean, with undefined
-// leaving the model default in place.
 function normalizeFast(value) {
   if (value === undefined) return undefined;
   if (typeof value !== "boolean") {
@@ -118,8 +97,6 @@ function normalizeUltrafast(value) {
   return value;
 }
 
-// The model choice in `options`, a model object or a model ID with the
-// deprecated top-level options, as `{ model, effort, fast, ultrafast }`.
 export function normalizeModelChoice(options) {
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
     if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast") || Object.hasOwn(options, "ultrafast")) {
@@ -173,7 +150,6 @@ export function normalizeAgentOptions(value) {
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
-  // Derived from the caller's provider every time, so normalizing again agrees.
   const custom = options.provider !== null && typeof options.provider === "object"
     ? customProviderDefinition(options.provider)
     : undefined;
@@ -183,7 +159,6 @@ export function normalizeAgentOptions(value) {
   options.customProvider = custom;
   options.providerName = custom ? custom.name : options.provider;
   const subscription = subscriptionProviders.has(options.provider);
-  // Gateway needs its key; every other provider runs on the host's credentials.
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !subscription && !custom);
   if (subscription && typeof options.credentials !== "function") {
     throw new TypeError(`provider "${options.provider}" needs a credentials() function`);
@@ -191,7 +166,6 @@ export function normalizeAgentOptions(value) {
   if (!subscription && !custom && options.credentials !== undefined) {
     throw new TypeError("credentials needs provider \"codex\", \"grok\" or a custom provider");
   }
-  // A custom provider's key is never refreshed, so it has no onCredentials or refreshLock.
   for (const name of ["onCredentials", "refreshLock"]) {
     if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
   }
@@ -199,7 +173,6 @@ export function normalizeAgentOptions(value) {
     if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
-  // fx's default model is a Gateway id; a custom provider names its own.
   if (custom && options.model === undefined) throw new TypeError("a custom provider needs a model");
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
@@ -208,7 +181,6 @@ export function normalizeAgentOptions(value) {
   if (options.sessionId !== undefined && options.sessionId !== null && !validSessionId(options.sessionId)) {
     throw new TypeError(`sessionId must be ${sessionIdRule}`);
   }
-  // A separate key, so normalizing these options again reads the caller's value.
   if (options.modelCatalog !== undefined) options.modelCatalogBody = modelCatalogBody(options.modelCatalog);
   if (options.persistence !== undefined) {
     const persistence = options.persistence;
@@ -230,12 +202,8 @@ export function normalizeAgentOptions(value) {
   return options;
 }
 
-// Keys for libfx's own session worker; symbols keep them off the engine's
-// public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
-// Marks an error the core answered a request with, as opposed to one from a
-// core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
 
 /**
@@ -262,18 +230,12 @@ export class FxJournalVersionError extends Error {
   }
 }
 
-// A journal this libfx cannot open: more than one load holds
-// (FX_JOURNAL_TOO_LARGE), or events that do not fold (FX_JOURNAL_INVALID).
 function journalLoadError(message, code, cause) {
   const error = new Error(message, cause === undefined ? undefined : { cause });
   error.code = code;
   return error;
 }
 
-// The core's libfx/journal_open errors, by their exact message. The journal
-// tests open a journal for each, so rewording one fails them, except the size
-// limit: libfx refuses a journal over it before the core sees one, so that
-// entry is a backstop.
 const journalOpenErrorCodes = new Map([
   ["Invalid libfx journal", "FX_JOURNAL_INVALID"],
   ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],
@@ -321,11 +283,8 @@ export function createMemoryPersistence() {
   };
 }
 
-// Marks the turn `agent.resume()` starts; never a caller-visible option.
 const resumeTurn = Symbol("libfx.resume");
-// Carries the follow-up a turn runs: `{ id, accepted }`.
 const followUpInput = Symbol("libfx.followUp");
-// Carries the ids of the calls a resumed turn runs again.
 const rerunCallIds = Symbol("libfx.rerun");
 
 function journalAppendError(cause) {
@@ -334,12 +293,6 @@ function journalAppendError(cause) {
   return error;
 }
 
-// Restoring an open turn needs only its newest progress, and the ones it
-// extends when it carries only what is new back to one that carries all of
-// it, and the results of calls no progress has answered yet. So an older
-// progress's state, and an answered call's result, are left out of a load
-// (data: null). A load then grows with the session's committed turns, not
-// with every step of every turn.
 function withoutSupersededProgress(events) {
   const kept = new Array(events.length);
   let superseded = false;
@@ -360,19 +313,14 @@ function withoutSupersededProgress(events) {
   return kept;
 }
 
-// A session id reaches gateway headers; the core applies the same rule.
 function validSessionId(id) {
   return typeof id === "string" && /^[A-Za-z0-9._-]{1,255}$/.test(id) &&
     id !== "." && id !== ".." && id.toLowerCase() !== "v2";
 }
 const sessionIdRule = "1 to 255 letters, digits, '.', '_' or '-'";
 
-// A record is one append's events as UTF-8 JSON. Its shape is libfx's; a
-// store keeps the bytes as they are.
 const journalRecordFormat = "libfx-journal-v1";
-// Checkpoints after the journal since the last one reaches this many bytes.
 const defaultCheckpointAfterBytes = 1024 * 1024;
-// A turn id reaches the journal and tool calls; the core applies the same rule.
 const turnIdRule = "1 to 128 letters, digits, '.', '_' or '-'";
 
 function validTurnId(id) {
@@ -383,7 +331,6 @@ function checkOnAmbiguous(onAmbiguous) {
   if (onAmbiguous !== undefined && typeof onAmbiguous !== "function") throw new TypeError("onAmbiguous must be a function");
 }
 
-// A call's input as the model wrote it: JSON when it parses, else the text.
 function parsedToolInput(text) {
   try { return JSON.parse(text); } catch { return text; }
 }
@@ -418,8 +365,6 @@ function decodeJournalRecord(data) {
   return value.events;
 }
 
-// The last `seq` a checkpoint covers, from its header: `FXSN`, a version
-// byte, then the seq as a little-endian u64. The core checks the rest.
 function checkpointSeq(bytes) {
   if (bytes.byteLength < 13 || decoder.decode(bytes.subarray(0, 4)) !== "FXSN") {
     throw journalLoadError("Invalid libfx journal", "FX_JOURNAL_INVALID");
@@ -427,9 +372,6 @@ function checkpointSeq(bytes) {
   return Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(5, true));
 }
 
-// Reads what `persistence.load()` returns: the latest checkpoint, if any, and
-// the records after it, as the events the core folds after that checkpoint.
-// Modeled in `tests/tla/durable/SnapshotTail.tla`.
 async function loadPersistence(persistence) {
   const loaded = await persistence.load();
   if (!loaded || typeof loaded !== "object") {
@@ -454,15 +396,11 @@ async function loadPersistence(persistence) {
   let bytes = 0;
   for await (const record of records) {
     if (!record || !validCursor(record.cursor)) throw new TypeError("each journal record needs a cursor string");
-    // The load limit applies once an open turn's older progress is dropped.
     const data = persistenceBytes(record.data, "a journal record's data");
     bytes += data.byteLength;
-    // A store may return records the checkpoint already covers.
     for (const event of decodeJournalRecord(data)) if (!(Number.isSafeInteger(event?.seq) && event.seq <= covered)) events.push(event);
     head = record.cursor;
   }
-  // A store whose log holds entries of its own between records names the
-  // entry the next record follows.
   if (loaded.head !== undefined) {
     if (loaded.head !== null && !validCursor(loaded.head)) throw new TypeError("persistence.load() head must be a cursor string or null");
     head = loaded.head;
@@ -470,18 +408,12 @@ async function loadPersistence(persistence) {
   return { checkpoint, events, head, tailBytes: bytes, lastSeq: events.at(-1)?.seq ?? covered };
 }
 
-// What a record's events say about turns, in order, for a store that tracks
-// them without reading records: a turn started, ended, or yielded, an input
-// was accepted or handed back unplaced, or the step the open turn is at, as
-// its tool steps finished and the state of its calls.
 function journalMarks(events) {
   const marks = [];
   for (const event of events) {
     if (event?.type === "turn_progress") {
       if (typeof event.turnId === "string") marks.push({ start: event.turnId });
-      // The inputs its model request carries for the first time.
       for (const id of Array.isArray(event.inputs) ? event.inputs : []) if (typeof id === "string") marks.push({ placed: id });
-      // A progress that carries only what is new counts all the turn's steps.
       const steps = Number.isSafeInteger(event.steps) ? event.steps : event.data?.execution?.tool_steps?.length;
       if (Number.isSafeInteger(steps)) marks.push({ step: `${steps}:${String(event.data?.tool_state ?? "none")}` });
     } else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
@@ -615,7 +547,6 @@ function workspacePathInside(root, path) {
   return root === "/" ? path.startsWith("/") : path === root || path.startsWith(`${root}/`);
 }
 
-// fx only reads AGENTS.md files below the workspace root or the host home.
 function workspaceInstructionPathAllowed(info, path) {
   return validWorkspacePath(path) && path.endsWith("/AGENTS.md") &&
     (workspacePathInside(info.root, path) || workspacePathInside(info.home, path));
@@ -851,7 +782,6 @@ function yieldToHostTask() {
 }
 
 function createRuntime(options) {
-  // Creating this inside a Wasm call would retain that instance through the error stack.
   const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
@@ -859,10 +789,7 @@ function createRuntime(options) {
   const steering = [];
   let steeringBytes = 0;
   let steeringOpen = false;
-  // A steer that cannot join the running turn waits to run next.
   let steeringHandoff = false;
-  // Raw payloads beside ACP frames: the core copies inbound bytes into its
-  // own memory and publishes outbound bytes for the agent to take.
   const inboundAttachments = new Map();
   const outboundAttachments = new Map();
   let nextOutboundAttachment = 1;
@@ -1152,7 +1079,6 @@ function createRuntime(options) {
     steeringBytes += value.length;
   }
 
-  // The core takes queued steering at a boundary; until then it can be withdrawn.
   function withdrawSteering(id) {
     const index = steering.findIndex((entry) => entry.id === id);
     if (index < 0) return false;
@@ -1161,7 +1087,6 @@ function createRuntime(options) {
     return true;
   }
 
-  // Each message is its input id, a newline, then the text.
   function steeringTake(outputPtr, outputCap) {
     const entry = steering[0];
     if (!entry) return 0;
@@ -1190,7 +1115,6 @@ function createRuntime(options) {
     const key = id >>> 0;
     const value = inboundAttachments.get(key);
     if (!value) return -1;
-    // An empty payload needs no output buffer, whose pointer may be arbitrary.
     if (value.length > 0) {
       const output = checkedBytes(outputPtr, outputCap);
       if (!output || value.length > output.length) return -1;
@@ -1209,7 +1133,6 @@ function createRuntime(options) {
     return id;
   }
 
-  // Resolves once the agent's journal holds every event the core sent.
   function journalFlush() {
     if (typeof options.journalFlush !== "function") return -1;
     return Promise.resolve().then(() => options.journalFlush()).then(() => 0, () => -1);
@@ -1524,7 +1447,6 @@ function createRuntime(options) {
       }
       if (content.length > 0xffffffff) return -1;
       const copied = Math.min(content.length, outCap);
-      // Reacquire views: memory may have grown while the host read was pending.
       bytes(outPtr, copied).set(content.subarray(0, copied));
       const view = new DataView(memory().buffer, resultPtr, 8);
       view.setUint32(0, content.length, true);
@@ -1533,8 +1455,6 @@ function createRuntime(options) {
     });
   }
 
-  // Runs one host workspace effect under a deadline and the shared Ctrl+C
-  // abort path. `finish` maps the host value to an ABI status.
   function runWorkspaceOperation(timeoutMs, label, start, finish) {
     const controller = new AbortController();
     let resolveAbort;
@@ -1644,8 +1564,6 @@ function createRuntime(options) {
     fx_host_tool_result_release() { pendingHostToolResult = null; },
     fx_steering_take: steeringTake,
     fx_steering_close() { steeringOpen = false; clearSteering(); },
-    // -1 once the turn takes no more steering, else twice how many steers
-    // wait, plus one when a handoff does.
     fx_steering_state() { return steeringOpen ? steering.length * 2 + (steeringHandoff ? 1 : 0) : -1; },
     fx_attachment_size: attachmentSize,
     fx_attachment_take: attachmentTake,
@@ -1688,7 +1606,6 @@ function createRuntime(options) {
     openSteering() { clearSteering(); steeringOpen = true; },
     steer: queueSteering,
     withdrawSteering,
-    // Ends the running turn at its next safe point; false when none runs.
     handOffSteering() {
       if (!steeringOpen) return false;
       steeringHandoff = true;
@@ -1804,7 +1721,6 @@ export async function createFxTerminal(options) {
     unsubscribeKeyData = options.terminal.onKeyData?.(forwardData);
     unsubscribeResize = options.terminal.onResize(signalResize);
   } catch (error) {
-    // The rejected factory never transfers this promise to a caller.
     interactive.catch(() => {});
     releaseSubscriptions();
     runtime.abort();
@@ -1856,7 +1772,6 @@ function promptImageDataBytes(prompt) {
   }, 0);
 }
 
-// Returns a Uint8Array view of an ArrayBuffer or typed array, or null.
 function byteView(value) {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
@@ -1865,7 +1780,6 @@ function byteView(value) {
 
 const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// Returns the decoded length of canonical, unwrapped base64, or -1.
 function canonicalBase64ByteLength(value) {
   if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return -1;
   const groups = value.length / 4;
@@ -1896,8 +1810,6 @@ function checkPromptImagesByteLength(byteLength) {
   }
 }
 
-// Pixel inputs carry a private source and byteLength until preparation;
-// reference-only inputs remain public image descriptors without pixel data.
 function normalizePromptImage(block, index) {
   const sourceRef = normalizeImageSourceRef(block.sourceRef, `image prompt block ${index}`);
   const reference = sourceRef === undefined ? {} : { sourceRef };
@@ -1931,7 +1843,6 @@ function normalizePromptImage(block, index) {
   return { type: "image", source: "bytes", data: bytes, mimeType: block.mimeType, byteLength: bytes.byteLength, ...reference };
 }
 
-// With deferImageLimits, byte limits apply after resizeImage instead.
 function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
@@ -1977,10 +1888,6 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   return prompt;
 }
 
-// Image bytes travel beside the frame as attachment references, but the model
-// request carries them base64 encoded and the native host caps that request at
-// 8 MiB. Images therefore count at their encoded size, the same budget they
-// had inside the frame. With countImages false, only the frame counts.
 function promptFrameSize(prompt, countImages = true) {
   const encodedImageBytes = countImages ? promptImageDataBytes(prompt) : 0;
   const projected = prompt.map((block) => block.type !== "image" ? block : {
@@ -1999,8 +1906,6 @@ function checkPromptFrameSize(prompt, countImages) {
   }
 }
 
-// Returns prompt blocks whose images carry { mimeType, bytes }. Synchronous
-// sources only: base64 is decoded and caller bytes are used in place.
 function preparePromptImages(blocks) {
   return blocks.map((block) => block.type !== "image" || block.data === undefined ? block : {
     type: "image",
@@ -2016,12 +1921,9 @@ function resizedPromptImage(value, index) {
     value.mimeType.length === 0 || value.mimeType.length > 128) {
     throw new TypeError(`resizeImage must return non-empty bytes and a mimeType for image prompt block ${index}`);
   }
-  // Copied because a hook may reuse its output buffer for the next image.
   return { bytes: bytes.slice(), mimeType: value.mimeType };
 }
 
-// Reads Blob images and applies resizeImage, then checks the final byte and
-// frame limits. Returns null when the turn is cancelled first.
 async function materializePromptImages(blocks, isCancelled, resizeImage) {
   let prepared = [];
   let imageBytes = 0;
@@ -2054,7 +1956,6 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
     prepared.push(image);
     if (imageBytes > maxPromptImagesBytes) {
       prepared = omitReferencedImageData(prepared);
-      // Do not read more referenced Blobs after the actual aggregate overflows.
       blocks = omitReferencedImageData(blocks);
       imageBytes = prepared.reduce((total, entry) => total + (entry.bytes?.byteLength ?? 0), 0);
     }
@@ -2078,8 +1979,6 @@ function normalizeSteeringInput(input) {
   return text;
 }
 
-// A tool set's shape, so a checkpoint can tell when the tools it continues
-// with changed since it was saved.
 function toolSchemaHash(descriptors) {
   const shape = JSON.stringify([...descriptors].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
   let hash = 0x811c9dc5;
@@ -2087,11 +1986,6 @@ function toolSchemaHash(descriptors) {
   return hash.toString(16).padStart(8, "0");
 }
 
-// `tools` is an array of descriptors, or an object of descriptors keyed by
-// name. What `idempotent` and `writes` mean after a crash and for calls that
-// run together is modeled in `tests/tla/durable/ToolReplay.tla`, whose
-// `replay: "safe"` is an idempotent tool that does not write, and in
-// `tests/tla/durable/ParallelBatch.tla`.
 function normalizeHostTools(value) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
   let entries;
@@ -2142,10 +2036,6 @@ function normalizeHostTools(value) {
       description,
       inputSchema: schema,
       ...(writes === undefined ? {} : { writes }),
-      // The engine reads `idempotent`: such a tool runs beside others unless
-      // it `writes`, and one that does not write starts before its intent is
-      // stored. It is also in the shape a checkpoint records, so a change to
-      // it counts as a changed tool set.
       ...(idempotent === true ? { idempotent: true } : {}),
     });
     executors.set(name, execute);
@@ -2153,8 +2043,6 @@ function normalizeHostTools(value) {
   return { descriptors, executors };
 }
 
-// The model catalog a host supplies, as the response body the core would
-// otherwise fetch: `{ data }` as AI Gateway returns it, or the entries alone.
 function modelCatalogBody(value) {
   const entries = Array.isArray(value) ? value : value?.data;
   if (!Array.isArray(entries)) throw new TypeError("modelCatalog must be an array of catalog entries or { data: [...] }");
@@ -2253,16 +2141,12 @@ export async function createFxEngine(options = {}) {
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
-  // Recorded in every checkpoint this agent saves, so a later one can tell
-  // it continues with another libfx, other tools, or another model.
   const checkpointMeta = {
     libfxVersion: String(fxSdkApiVersion),
     toolSchemaHash: toolSchemaHash(hostTools.descriptors),
     model: options.model ?? "",
   };
   const initialCheckpoint = checkpointBytes(options.checkpoint);
-  // Checked before the core starts, and with the core's message, so both
-  // backends report it the same way.
   if (initialCheckpoint && initialCheckpoint.byteLength > maxCheckpointBytes) {
     throw new Error("libfx checkpoint is too large");
   }
@@ -2270,8 +2154,6 @@ export async function createFxEngine(options = {}) {
   let nextId = 1;
   let sessionId = null;
   const hookScopes = new Map();
-  // Observation never participates in effects, journal barriers, or retries.
-  // Contain both throws and rejected promises, including an error handler's.
   const hookError = (error) => {
     try { Promise.resolve(options.hooks?.onError?.(error)).catch(() => {}); } catch {}
   };
@@ -2300,31 +2182,18 @@ export async function createFxEngine(options = {}) {
   let closing = false;
   let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
-  // Events go to the store in the order the core sends them, one append at
-  // a time: events that arrive together become one record, and so do all
-  // the events that arrive while an append is in flight. Each record's append
-  // names the cursor of the one before it, so a store refuses a write that
-  // does not continue what it holds, and says with `barrier` whether anyone
-  // waits for it: the core before an action others can see, such as a tool
-  // call with effects, or a caller for its input.
   const persistence = options.persistence ?? null;
   const wantsMarks = persistence?.marks === true || persistence?.[journalMarksWanted] === true;
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
-  // The store's last cursor, and the last seq its records hold.
   let journalHead = null;
   let appendedSeq = 0;
-  // Record bytes stored since the last checkpoint.
   let bytesSinceCheckpoint = 0;
   let appendTail = Promise.resolve();
-  // One per agent, so a store can tell a repeated write from another writer's.
   const writerId = crypto.randomUUID();
-  // Pipelined appends and barriers are modeled in `tests/tla/durable/Journal.tla`,
-  // and two processes appending to one log in `tests/tla/durable/Fencing.tla`.
   const journal = persistence && {
     append(events, barrier) {
       const data = encodeJournalRecord(events);
       const lastSeq = events.at(-1)?.seq;
-      // A store that tracks turns without reading records asks for marks.
       const marks = wantsMarks ? { marks: journalMarks(events) } : {};
       const appended = appendTail.then(async () => {
         const result = await persistence.append({ expected: journalHead, idempotencyKey: `${writerId}:${events[0]?.seq}`, data, barrier, ...marks });
@@ -2334,22 +2203,14 @@ export async function createFxEngine(options = {}) {
         bytesSinceCheckpoint += data.byteLength;
         journalHook("journal.commit", { cursor: result.cursor, firstSeq: Number.isSafeInteger(events[0]?.seq) ? events[0].seq : null, lastSeq: Number.isSafeInteger(lastSeq) ? lastSeq : null, eventCount: events.length });
       });
-      // A failed append fails every later one: they would not continue it.
       appendTail = appended;
       return appended;
     },
   };
   let resumable = false;
-  // The host's ids for the turn a crash left open and the last turn that
-  // ended, so a retried prompt continues or skips its turn.
   let openTurnId = null;
   let lastTurnId = null;
-  // The calls the open turn left running: `{ id, name, arguments }`, and
-  // what the resume tells the model about each one it does not run again.
   let ambiguousCalls = [];
-  // Asks `onAmbiguous` about each of them, once. Returns the ids of the
-  // calls to run again, and the rest, which the resume answers as possibly
-  // run.
   const settleAmbiguous = (onAmbiguous) => {
     const calls = ambiguousCalls;
     ambiguousCalls = [];
@@ -2358,19 +2219,11 @@ export async function createFxEngine(options = {}) {
       : calls.filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun").map((call) => call.id);
     return { rerun, answered: calls.filter((call) => !rerun.includes(call.id)) };
   };
-  // Continues the open turn: the calls it left running run again or are
-  // answered as possibly run, and each answered one ends for the turn's
-  // viewers as it does for the model. Modeled in
-  // `tests/tla/durable/Resumption.tla`.
   const resumeOpenTurn = (promptOptions) => {
     const { rerun, answered } = settleAmbiguous(promptOptions.onAmbiguous);
     return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered);
   };
-  // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
-  // A follow-up this agent queued starts when the turn ahead of it ends, ahead
-  // of any the journal held: those have no caller, so each waits for
-  // `resume()` to start it, oldest first.
   const runNextFollowUp = (resuming = false) => {
     if (activeTurn || closing || journalFailure) return;
     const index = followUps.findIndex((entry) => (entry.held === true) === resuming);
@@ -2388,18 +2241,11 @@ export async function createFxEngine(options = {}) {
   let journalQueue = [];
   let journalFlushScheduled = false;
   const journalPending = new Set();
-  // The append in flight, and whether anyone waits for the events queued
-  // behind it.
   let journalInFlight = null;
   let journalBarrier = false;
   let journalFailure = null;
-  // Set by `turn.cancel({ reason: "handoff" })`: the journal keeps the open
-  // turn for another agent, so this one stores nothing more.
   let handedOff = false;
   const handedOffError = () => new Error("this agent handed its session off; open it again to continue");
-  // Input events (`accepted:<id>`, `withdrawn:<id>`) once stored, and the
-  // steer and withdraw calls waiting for them, which resolve only then
-  // (`tests/tla/durable/Inbox.tla`).
   const durableInputs = new Set();
   const inputWaiters = new Map();
   const waitForInput = (key) => {
@@ -2426,17 +2272,14 @@ export async function createFxEngine(options = {}) {
       inputWaiters.delete(key);
     }
   };
-  // close() reports a failure no turn or prompt call has reported yet.
   let journalFailureReported = false;
   const reportJournalFailure = () => {
     journalFailureReported = true;
     return journalFailure;
   };
-  // `barrier`: the core waits for these events before it goes on.
   const queueJournalEvents = (events, barrier = false) => {
     if (journalFailure || !Array.isArray(events) || events.length === 0) return;
     if (handedOff) {
-      // The agent that opens the session next decides about these inputs.
       const dropped = events
         .filter((event) => event?.type === "input_accepted" || event?.type === "input_withdrawn")
         .map((event) => `${event.type === "input_accepted" ? "accepted" : "withdrawn"}:${event.data?.id}`);
@@ -2444,18 +2287,12 @@ export async function createFxEngine(options = {}) {
       return;
     }
     journalQueue.push(...events);
-    // A caller waits for its steer or withdrawal to be stored.
     if (barrier || events.some((event) => event?.type === "input_accepted" || event?.type === "input_withdrawn")) journalBarrier = true;
-    // A turn notes a new config right before its first progress, a barrier:
-    // the two go out in one write instead of two in a row.
     if (events.every((event) => event?.type === "session_config")) return;
     if (journalFlushScheduled) return;
     journalFlushScheduled = true;
     queueMicrotask(flushJournal);
   };
-  // Sends the queued events as one record, unless an append is in flight:
-  // then they wait for it, with any that arrive meanwhile, and go out
-  // together once it lands.
   function flushJournal() {
     journalFlushScheduled = false;
     if (journalFailure || journalInFlight || journalQueue.length === 0) return;
@@ -2473,15 +2310,12 @@ export async function createFxEngine(options = {}) {
     const settled = appended.then(() => {
       settleInputs(batch);
     }, (error) => {
-      // Later events would leave a gap after the failed batch.
       journalQueue = [];
       if (journalFailure) return;
       journalFailure = journalAppendError(error);
       emit("journal.error", { error: error instanceof Error ? error.name : "Error" });
       journalHook("journal.error", { error: error instanceof Error ? error.name : "Error", fenced: error?.code === "FX_FENCED" || error?.cause?.code === "FX_FENCED" });
       rejectInputWaiters([...inputWaiters.keys()], journalFailure);
-      // Nothing the turn does from here can be saved, and after a fence the
-      // session has another owner: stop the turn and its effects now.
       activeTurn?.cancel();
     }).finally(() => {
       journalPending.delete(settled);
@@ -2491,8 +2325,6 @@ export async function createFxEngine(options = {}) {
     journalInFlight = settled;
     journalPending.add(settled);
   }
-  // The journal's own work, such as a heartbeat, ends with the agent: once,
-  // after the last append settles.
   let journalClosed = null;
   function closeJournal() {
     journalClosed ??= journalSettled().catch(() => {}).then(() => checkpointing);
@@ -2500,7 +2332,6 @@ export async function createFxEngine(options = {}) {
   }
   async function journalSettled() {
     for (;;) {
-      // This caller waits for every event queued so far.
       if (journalQueue.length > 0) journalBarrier = true;
       if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
       if (journalPending.size === 0) break;
@@ -2511,33 +2342,23 @@ export async function createFxEngine(options = {}) {
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
-  // A checkpoint saved by another libfx, with other tools, or for another
-  // model still restores; the host hears what changed.
   const compareCheckpointMeta = (saved) => {
     if (!saved || typeof saved !== "object") return;
     const changed = Object.keys(checkpointMeta).filter((key) => typeof saved[key] === "string" && saved[key] !== "" && saved[key] !== checkpointMeta[key]);
     if (changed.length) emit("checkpoint.mismatch", { sessionId, changed, saved, current: checkpointMeta });
   };
-  // Saves a checkpoint once the records since the last one reach
-  // `checkpointAfterBytes`, or with `force` whatever their size, at a point
-  // no turn is running: a turn's end, or where it yielded. A failed save
-  // leaves the journal as it was; the next turn's end tries again. Returns
-  // the save in flight, which never rejects.
   let checkpointing = null;
   const maybeCheckpoint = (force = false) => {
     if (checkpointing) return checkpointing;
     if (!persistence?.saveCheckpoint || closing || handedOff || journalFailure) return Promise.resolve();
     checkpointing = (async () => {
-      // The turn's last records may still be in flight; count them first.
       await journalSettled();
-      // A save begun before close() finishes; close() waits for it.
       if (activeTurn) return;
       if (bytesSinceCheckpoint === 0 || (!force && bytesSinceCheckpoint < checkpointAfterBytes)) return;
       const response = await request("libfx/snapshot", { sessionId, checkpointMeta });
       const id = response?.snapshotAttachment;
       if (!Number.isSafeInteger(id) || id <= 0) return;
       const bytes = runtime.takeAttachment?.(id);
-      // The core took it after every event this agent stored, and no later.
       if (!(bytes instanceof Uint8Array) || response.atSeq !== appendedSeq) return;
       const through = journalHead;
       const covered = bytesSinceCheckpoint;
@@ -2550,7 +2371,6 @@ export async function createFxEngine(options = {}) {
     return checkpointing;
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
-  // Adds the host's credentials to the provider's own requests.
   const providerAuth = subscriptionProviders.has(options.provider)
     ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
     : options.customProvider && options.credentials
@@ -2565,7 +2385,6 @@ export async function createFxEngine(options = {}) {
       endpoint = `${url.origin}${url.pathname}`;
       path = url.pathname;
     } catch {}
-    // A supplied catalog answers the core's catalog request without the network.
     if (options.modelCatalogBody && method === "GET" && path === "/coding-agent/v1/models") {
       return new Response(options.modelCatalogBody, { status: 200, headers: { "content-type": "application/json" } });
     }
@@ -2619,7 +2438,6 @@ export async function createFxEngine(options = {}) {
     const execute = hostTools.executors.get(name);
     const issuerSessionId = requestedSessionId ?? sessionId;
     const scope = hookScopes.get(`${issuerSessionId}:${toolCallId}`);
-    // Hook metadata is not authority to execute a foreign session's tool.
     const turn = issuerSessionId === sessionId
       ? activeTurn
       : null;
@@ -2636,8 +2454,6 @@ export async function createFxEngine(options = {}) {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
       const execution = Promise.resolve().then(() => {
         if (controller.signal.aborted || !isCurrentTurn(turn)) return;
-        // The model's call id is stable across restores of a persisted
-        // session, so a tool can key its own retries on it.
         return execute(input, {
           signal: controller.signal,
           executionId: String(toolCallId ?? ""),
@@ -2670,7 +2486,6 @@ export async function createFxEngine(options = {}) {
       controller.signal.removeEventListener("abort", onAbort);
       turn.toolControllers.delete(controller);
     }
-    // Providers reject an empty error result, which would end the session.
     if (isError && content === "") content = `Tool ${String(name)} failed without a message`;
     return { content, isError, rich, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
   };
@@ -2712,8 +2527,6 @@ export async function createFxEngine(options = {}) {
     pending.set(id, { resolve, reject });
     try { send({ jsonrpc: "2.0", id, method, params }); } catch (error) { pending.delete(id); reject(error); }
   });
-  // Raw payloads ride beside the next frame instead of inside it. Payloads
-  // left by an earlier frame that never reached the core are dropped first.
   let nextAttachmentId = 1;
   const attachBytes = (payloads) => {
     if (typeof runtime.writeAttachment !== "function") throw new Error("fx runtime does not accept binary attachments");
@@ -2737,8 +2550,6 @@ export async function createFxEngine(options = {}) {
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
   const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined) => {
-    // A journaled turn given a time to stop at yields before its first model
-    // request after it, keeping the turn open.
     const stopAt = journal && yieldAt !== undefined ? { yieldAt } : {};
     if (resuming) {
       return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(rerun.length ? { rerun } : {}), ...stopAt } } });
@@ -2752,8 +2563,6 @@ export async function createFxEngine(options = {}) {
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
       ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
     });
-    // A follow-up's turn places it; the core records it as accepted first
-    // when the host could not. A journaled turn's first progress records its id.
     const fx = {
       ...(followUp ? { inputId: followUp.id, inputAccepted: followUp.accepted } : {}),
       ...((journal || options.hooks) && turnId ? { turnId } : {}),
@@ -2764,7 +2573,6 @@ export async function createFxEngine(options = {}) {
   runtime.exited.then((code) => {
     hookScopes.clear();
     closing = true;
-    // An agent whose core exited writes nothing more.
     if (journal) void closeJournal().catch(() => {});
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     coreExitError = error;
@@ -2809,7 +2617,6 @@ export async function createFxEngine(options = {}) {
       return;
     }
     if (message.method === "libfx/journal_flush") {
-      // Every append the core sent before this request is already queued.
       let failure = null;
       try { await journalSettled(); } catch (error) { failure = error; }
       if (closing) return;
@@ -2869,7 +2676,6 @@ export async function createFxEngine(options = {}) {
     if (journal) {
       const { events, checkpoint } = loaded;
       const params = { sessionId, ...(options.inputsDurable === true ? { inputsDurable: true } : {}) };
-      // One call: attaching again would drop the first attachment.
       const attachments = [];
       if (events.length > 0) {
         const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
@@ -2896,7 +2702,6 @@ export async function createFxEngine(options = {}) {
       journalHead = loaded.head;
       appendedSeq = loaded.lastSeq;
       bytesSinceCheckpoint = loaded.tailBytes;
-      // Follow-ups the journal holds, as accepted; each waits for `resume()`.
       for (const held of Array.isArray(opened?.followUps) ? opened.followUps : []) {
         followUps.push({ id: held.id, text: held.text, accepted: true, held: true });
       }
@@ -2915,22 +2720,14 @@ export async function createFxEngine(options = {}) {
     get sessionId() {
       return sessionId;
     },
-    // What libfx's session worker needs beyond the public surface.
     [engineInternals]: {
-      // Resolves once every record the session started has landed: a
-      // turn's result does not wait for its last ones.
       settled() {
         return journal ? journalSettled() : Promise.resolve();
       },
-      // Saves a checkpoint now, at a turn's end or where it yielded, whatever
-      // has accumulated since the last; resolves once it is stored or skipped.
       checkpoint() {
         return maybeCheckpoint(true);
       },
-      // Resolves when the core this agent runs on exits.
       exited: runtime.exited,
-      // The turn the journal left open, if any, and the calls it left
-      // running, as `{ executionId, name, input }`.
       get openTurn() {
         if (!resumable) return null;
         return {
@@ -2960,7 +2757,6 @@ export async function createFxEngine(options = {}) {
         }
         if (turnId === lastTurnId) return endedTurn(turnId);
       }
-      // A new prompt ends a turn the last process left open as interrupted.
       resumable = false;
       ambiguousCalls = [];
       return normalizeTurn(startTurn(input, { ...promptOptions, turnId: turnId ?? `turn_${crypto.randomUUID()}` }));
@@ -2982,7 +2778,6 @@ export async function createFxEngine(options = {}) {
         resumable = false;
         return resumeOpenTurn(promptOptions);
       }
-      // With no open turn, the follow-ups the journal held are the work left.
       const next = followUps.find((entry) => entry.held);
       if (!next) return null;
       let started = null;
@@ -3011,7 +2806,6 @@ export async function createFxEngine(options = {}) {
       const started = new Promise((resolve, reject) => { entry.resolveTurn = resolve; entry.rejectTurn = reject; });
       let accepted;
       if (journal && activeTurn && typeof runtime.steer !== "function") {
-        // The native core records it now, ahead of the turn that will run it.
         entry.accepted = true;
         accepted = request("libfx/follow_up", { sessionId, id, text })
           .then(() => waitForInput(`accepted:${id}`))
@@ -3022,8 +2816,6 @@ export async function createFxEngine(options = {}) {
             throw error;
           });
       } else {
-        // Its own turn records it with the first progress, a barrier; it is
-        // accepted once that is stored.
         accepted = started.then(() => (journal ? waitForInput(`accepted:${id}`) : undefined)).then(() => ({ id }));
       }
       followUps.push(entry);
@@ -3038,12 +2830,6 @@ export async function createFxEngine(options = {}) {
      * them as `checkpoint` to restore it in a new agent.
      */
     checkpoint() {
-      // One checkpoint runs at a time: each holds an outbound attachment until
-      // it is taken, and the native table holds only a few. An idle call still
-      // sends its request before returning, ahead of a later prompt(). The slot
-      // is claimed before that send, so a call from an event handler during it
-      // still waits. The count drops before the caller's own reaction to `run`,
-      // so a call made right after awaiting the previous one is idle.
       const previous = pendingCheckpoints > 0 ? checkpointTail : null;
       pendingCheckpoints++;
       let release;
@@ -3063,14 +2849,11 @@ export async function createFxEngine(options = {}) {
       const turn = activeTurn;
       turn?.cancel();
       if (turn) await turn.result.catch(() => {});
-      // A checkpoint being taken needs the core; it finishes first.
       await checkpointing;
       closing = true;
-      // A journal keeps these; the next `resume()` runs them.
       for (const entry of followUps.splice(0)) entry.rejectTurn?.(new Error("fx agent closed before the follow-up ran"));
       runtime.closeStdin();
       await runtime.exited;
-      // Every append the session started has landed, or close reports why.
       if (journal) {
         let failure = null;
         try {
@@ -3085,8 +2868,6 @@ export async function createFxEngine(options = {}) {
   };
   return agent;
 
-  // `answered`: calls a resumed turn answers as possibly run before it goes
-  // on, whose `tool_end` comes first.
   function normalizeTurn(rawTurn, answered = []) {
     const toolNames = new Map();
     const started = new Set();
@@ -3101,7 +2882,6 @@ export async function createFxEngine(options = {}) {
         return delta ? { type: "reasoning_delta", delta } : null;
       }
       if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
-        // A steer shows where it joined the turn, with the id it was sent with.
         const id = update._meta?.fx?.steering?.inputId;
         return { type: "user_message", text: update.content.text, ...(typeof id === "string" ? { id } : {}) };
       }
@@ -3164,7 +2944,6 @@ export async function createFxEngine(options = {}) {
     };
   }
 
-  // A turn the journal shows already ended, returned for a retried prompt.
   function endedTurn(id) {
     return {
       id,
@@ -3186,8 +2965,6 @@ export async function createFxEngine(options = {}) {
     return result;
   }
 
-  // The input object rides the event when it fits the preview budget; larger
-  // inputs become a bounded JSON prefix plus an explicit marker.
   function toolStartInput(rawInput) {
     if (rawInput === undefined || rawInput === null) return {};
     const serialized = JSON.stringify(rawInput);
@@ -3203,12 +2980,9 @@ export async function createFxEngine(options = {}) {
     const followUp = promptOptions[followUpInput] ?? null;
     const normalized = resuming ? [] : normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
     const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
-    // Blob reads and resizeImage run before the prompt frame is sent.
     const asyncImages = hasPixels && (resizeImage !== undefined ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
-    // resizeImage decides the final image sizes, so they are counted after it runs.
     checkPromptFrameSize(normalized, resizeImage === undefined);
-    // Snapshot caller-owned bytes, which could change before an async send.
     const prompt = asyncImages
       ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)
       : preparePromptImages(normalized);
@@ -3230,7 +3004,6 @@ export async function createFxEngine(options = {}) {
     const promptStarted = asyncImages ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
     let pendingSteeringCount = 0;
     let pendingSteeringBytes = 0;
-    // This turn's steers: whether each reached the core, or was withdrawn first.
     const steers = new Map();
     const withdrawnSteer = (id) => Object.assign(new Error("steer was withdrawn"), { code: "FX_STEER_WITHDRAWN", id });
     const startSteer = (id, text) => {
@@ -3251,8 +3024,6 @@ export async function createFxEngine(options = {}) {
           const accepted = () => (journal ? waitForInput(`accepted:${id}`) : Promise.resolve());
           if (typeof runtime.steer === "function") {
             runtime.steer(text, id);
-            // The web core accepts it when it takes it at the next boundary,
-            // and shows where it joined the turn then.
             return accepted().then(() => ({ id }), (error) => (error?.code === "FX_STEER_WITHDRAWN" ? { id, withdrawn: true } : Promise.reject(error)));
           }
           return request("libfx/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
@@ -3276,8 +3047,6 @@ export async function createFxEngine(options = {}) {
     let finished = false;
     let cancelled = false;
     const turn = {
-      // The host's id: the one it gave, or for a resumed turn, the one the
-      // turn started with.
       id: resuming ? openTurnId : promptOptions.turnId ?? null,
       push(update, size = encoder.encode(JSON.stringify(update)).length) {
         if (cancelled || finished) { discardedBytes += size; return; }
@@ -3308,14 +3077,11 @@ export async function createFxEngine(options = {}) {
         resolvePromptStart?.(true);
         resolvePromptStart = null;
       },
-      // Resolves `{ id }` once the steer is accepted: in a journaled session,
-      // once its acceptance is stored. The promise carries `id` at once.
       steer(text, id = `in_${crypto.randomUUID()}`) {
         const steered = startSteer(id, text).then((value) => value ?? { id });
         steered.id = id;
         return steered;
       },
-      // 'withdrawn' when the model never saw the steer, else 'already_placed'.
       withdraw(id) {
         const local = steers.get(id);
         if (!local) return Promise.resolve("already_placed");
@@ -3335,9 +3101,6 @@ export async function createFxEngine(options = {}) {
           return "withdrawn";
         });
       },
-      // For libfx's session worker: a steer that cannot join the turn, such
-      // as one with images, ends the turn at its next safe point, at once
-      // while the model streams a reply, so that steer can run next.
       [engineInternals]: {
         endForSteer() {
           const send = () => {
@@ -3359,7 +3122,6 @@ export async function createFxEngine(options = {}) {
         if (finished || cancelled) return;
         if (reason === "handoff") {
           handedOff = true;
-          // The journal keeps queued follow-ups for the next agent.
           for (const entry of followUps.splice(0)) entry.rejectTurn?.(handedOffError());
         }
         cancelled = true;
@@ -3429,19 +3191,14 @@ export async function createFxEngine(options = {}) {
     } else {
       try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt); } catch (error) { response = Promise.reject(error); }
     }
-    // Appends after a turn's first progress are lazy, so the result does not
-    // wait for them; `close()` does. A failure already seen fails the turn.
     turn.result = response
       .then((value) => {
         if (journalFailure) throw reportJournalFailure();
         if (value.stopReason === "yielded" && !cancelled) {
-          // The core keeps the turn open: `resume()` continues it here, or
-          // a later agent continues it from the journal.
           resumable = true;
           openTurnId = turn.id;
           ambiguousCalls = [];
         } else if (!handedOff) {
-          // A handed-off turn stays open for the next agent.
           if (turn.id) lastTurnId = turn.id;
           openTurnId = null;
         }
@@ -3452,8 +3209,6 @@ export async function createFxEngine(options = {}) {
         rejectImagePrep = null;
         resolvePromptStart?.(error);
         resolvePromptStart = null;
-        // A failed append is why the core stopped, including when the turn
-        // was cancelled because of it; report the host's error.
         if (journalFailure) {
           terminalError = reportJournalFailure();
           throw terminalError;
@@ -3468,7 +3223,6 @@ export async function createFxEngine(options = {}) {
         resumeOutput = null;
         signal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
-        // A steer still queued when the turn ends never reached the model.
         if (typeof runtime.withdrawSteering === "function") {
           const untaken = [...steers.keys()].filter((id) => runtime.withdrawSteering(id));
           rejectInputWaiters(untaken.map((id) => `accepted:${id}`), new Error("the turn ended before it took the steer"));

@@ -20,14 +20,7 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 JAR = os.environ.get("TLA2TOOLS_JAR", os.path.expanduser("~/.local/share/tla/tla2tools.jar"))
 
-# (spec, bug, [(text to replace, replacement), ...], invariant that must fail)
-# The last field may be a tuple when the bug breaks several invariants; any
-# one of them counts. An optional fifth field lists invariants to add to the
-# .cfg for that run; a witness uses it with no edits to prove a behavior is
-# reachable. Mutants run TLC with one worker so the first violation reported
-# is deterministic.
 MUTANTS = [
-    # Journal.tla
     ("Journal", "pass a barrier before the World acknowledges it",
      [("    /\\ acked >= waiting\n", "")],
      "PassedBarriersDurable"),
@@ -49,7 +42,6 @@ MUTANTS = [
      [("    /\\ ~alive\n    /\\ queue = <<>>\n", "    /\\ ~alive\n")],
      "PipelineInOrder"),
 
-    # ToolReplay.tla
     ("ToolReplay", "a never tool starts before its intent is durable",
      [("    /\\ (c \\in jIntent \\/ Policy[c] = \"safe\")\n", "")],
      "NeverStartsWithoutDurableIntent"),
@@ -74,7 +66,6 @@ MUTANTS = [
        "                      THEN \"interrupted\"")],
      "InterruptedMeansUnknown"),
 
-    # Fencing.tla
     ("Fencing", "append without the position check: two processes both win the intent",
      [("    IF Len(log) = view[p]\n    THEN", "    IF TRUE\n    THEN")],
      "OneIntent"),
@@ -82,14 +73,11 @@ MUTANTS = [
      [("    /\\ status[p] = \"active\"\n    /\\ pc[p] = \"may_run\"",
        "    /\\ pc[p] = \"may_run\"")],
      "FencedNeverActs"),
-    # Breaks two invariants: a second run, and a result written by a process
-    # that did not win the intent. Either report counts.
     ("Fencing", "recover runs the tool again instead of recording interrupted",
      [("    /\\ CasAppend(p, \"interrupted\", \"idle\")",
        "    /\\ CasAppend(p, \"step\", \"may_run\")")],
      ("AtMostOneRun", "ResultByRunner")),
 
-    # Inbox.tla
     ("Inbox", "resolve the caller's promise before the input is durable",
      [("    /\\ i \\in jAccepted\n    /\\ i \\notin acked",
        "    /\\ i \\in submitted\n    /\\ i \\notin acked")],
@@ -105,7 +93,6 @@ MUTANTS = [
        "{i \\in jAccepted : i \\notin jWithdrawn}")],
      "PlacedOnce"),
 
-    # Resumption.tla
     ("Resumption", "fx -c asks the user after an unclean exit",
      [("THEN /\\ autoResumes' = autoResumes + 1\n"
        "            /\\ notices' = notices + 1\n"
@@ -123,7 +110,6 @@ MUTANTS = [
      [("/\\ notices' = notices + 1", "/\\ notices' = notices")],
      "ModelToldEveryTime"),
 
-    # ParallelBatch.tla
     ("ParallelBatch", "a writer starts while earlier calls still run",
      [("    /\\ i \\in Writes => \\A j \\in 1..(i - 1) : status[j] = \"done\"\n", "")],
      ("WriterRunsAlone", "WriterAfterEarlier")),
@@ -140,12 +126,9 @@ MUTANTS = [
     ("ParallelBatch", "fault injection: a crash drops a durable result",
      [("IF status[i] = \"done\" THEN \"done\" ELSE \"waiting\"", "\"waiting\"")],
      "ResultsInModelOrder"),
-    # Witness: no code change; NoReaderOverlap is added to the .cfg and must
-    # be violated, proving that readers really run in parallel by default.
     ("ParallelBatch", "witness: two readers run at the same time",
      [], "NoReaderOverlap", ["NoReaderOverlap"]),
 
-    # SnapshotTail.tla
     ("SnapshotTail", "store a snapshot of events that are not durable yet",
      [("\\E at \\in 0..dlen :", "\\E at \\in 0..Len(log) :")],
      "SnapshotNotAhead"),
@@ -197,7 +180,6 @@ def run_mutant(java, spec, edits, workdir, extra_invariants=()):
     (workdir / f"{spec}.tla").write_text(text)
     cfg = (HERE / f"{spec}.cfg").read_text()
     if extra_invariants:
-        # Every .cfg here ends with its INVARIANTS (or PROPERTIES) section.
         cfg = cfg.rstrip("\n") + "\n" + "".join(f"    {name}\n" for name in extra_invariants)
     (workdir / f"{spec}.cfg").write_text(cfg)
     result = subprocess.run(

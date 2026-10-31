@@ -103,8 +103,6 @@ test "hook configuration OOM is not converted to an ACP parameter error" {
         var fixture: Fixture = .{};
         const alloc: Allocator = .{ .ptr = &fixture, .vtable = &.{ .alloc = Fixture.allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = Fixture.free } };
         if (handler == handleNewLibfxSession) {
-            // That handler parses the optional session ID first, even for {}.
-            // Fail the first hooks allocation, not an allocation in that parse.
             fixture.fail_index = std.math.maxInt(usize);
             try std.testing.expect(try requestedLibfxSessionId(alloc, "{}") == null);
             fixture.fail_index = fixture.alloc_index;
@@ -123,8 +121,6 @@ pub fn handleNewLibfxSession(
     alloc: Allocator,
     msg: *jsonrpc.Message,
 ) !void {
-    // Checked before the active session is released, so a bad request
-    // leaves it in place.
     const requested = requestedLibfxSessionId(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidSessionId => return state.writer.writeError(alloc, msg.id, .{
@@ -260,7 +256,6 @@ pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionS
     next.preferences.provider = session.provider;
     next.preferences.effort = session.effort;
     next.preferences.fast_mode = session.fast_mode;
-    // Ultrafast keeps its durable baseline, not the process-local request.
 
     const revision = try js_host_session_store.commit(alloc, next, session.wasm_revision);
     if (session.wasm_revision) |old| alloc.free(old);
@@ -392,7 +387,6 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
-    // Validate the client system prompt before any session side effect.
     var client_system_prompt = client_instructions.parse(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -943,8 +937,6 @@ fn handleRestoreSession(
     defer if (session_host_owned) if (session_host) |h| h.destroy();
 
     if (state.active_session) |*active| {
-        // Loading the active session into another workspace releases it and
-        // reopens it through the ordinary rebinding path below.
         if (sameSessionId(active.session_id, session_id) and workspace != null) {
             server.cancelAndReapActivePrompt(state);
             try server.releaseActiveSession(state);
@@ -992,8 +984,6 @@ fn handleRestoreSession(
         }
     }
 
-    // One backend per process: the saved state comes from v2 when this
-    // connection keeps sessions there, else from v1.
     var store: ?session_store.Store = null;
     var store_owned = true;
     defer if (store_owned) if (store) |*value| value.deinit(alloc);
@@ -1011,7 +1001,6 @@ fn handleRestoreSession(
         .message = "Session store not available",
     });
     if (backend == .v2) {
-        // Converting a v1 session can be slow; the client is told why (D61).
         var notice: ConversionNotice = .{ .state = state, .alloc = alloc, .session_id = session_id };
         backend.v2.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer backend.v2.notice = null;
@@ -1087,13 +1076,9 @@ fn handleRestoreSession(
         durable.history,
         durable.permission_state,
     );
-    // A v2 session's downloads are its blobs (D44); v1 keeps them in its folder.
     const session_dir: ?[]u8 = if (v2 != null) null else try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
     defer if (session_dir) |path| alloc.free(path);
 
-    // Read before the active session is released, so an unreadable prompt
-    // fails this restore without replacing a different active session. A
-    // same-session `cwd` rebind has already released it above.
     const saved_files: SavedFiles = if (v2) |value| .{ .v2 = value } else .{ .v1 = &writable.? };
     var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, saved_files) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1274,8 +1259,6 @@ fn appendProjectMcpConfigs(
             },
         );
     }
-    // Project servers run in the session's workspace, which a client `cwd`
-    // may have moved away from the directory fx was launched in.
     for (workspace.configs.items) |*config| {
         if (config.transport != .stdio or config.cwd != null) continue;
         config.cwd = try alloc.dupe(u8, workspace_root);
@@ -1552,7 +1535,6 @@ fn activateSession(
     if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
     if (activation.credential) |credential| server.adoptServerCredential(state, credential);
     const start = server.loadStartingMode(state, state.alloc);
-    // Nothing after this load can fail before the session takes ownership.
     const files: SavedFiles = if (restored_writable) |*writable| .{ .v1 = writable } else .{ .v2 = activation.v2.? };
     const tool_identities = try restoredToolIdentities(state.alloc, files);
     state.active_session = .{
@@ -1653,7 +1635,6 @@ fn handleLoadFailure(
         "session operation=load outcome=failed error={s}",
         .{@errorName(err)},
     );
-    // v2 names a storage fault (D29); v1 keeps its messages below.
     if (state.sessions_v2 != null) {
         if (v2StorageFaultMessage("Session could not be loaded", err)) |message| {
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
@@ -1693,7 +1674,6 @@ fn handleLoadFailure(
         err == error.SessionPathUnsafe or
         err == error.DurablePathUnsafe)
     {
-        // A v1 session that can't be converted says why (D61).
         if (state.sessions_v2) |*store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
             const message = try alloc.print("Session could not be loaded (InvalidSessionFormat): {s}", .{problem});
             defer alloc.free(message);
@@ -1721,7 +1701,6 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     switch (server.sessionsBackend(state)) {
         .v1 => {},
         .v2 => |v2_store| return listV2Sessions(state, alloc, msg, v2_store, params),
-        // As v1 answers when its store cannot open.
         .v2_unavailable => return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}"),
     }
     var store = (if (state.cfg.home_override) |home|
@@ -1756,7 +1735,6 @@ fn listV2Sessions(
     v2_store: *session_adapter.Store,
     params: ListSessionsParams,
 ) !void {
-    // Matched as v1 matches it: exactly, after trailing slashes.
     const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
     var page = session_adapter.listPage(v2_store, alloc, cwd, params.continuation, session_store.session_list_default_limit) catch |err| {
         debug_trace.logf("acp", "session operation=list outcome=failed backend=v2 error={s}", .{@errorName(err)});
@@ -1895,7 +1873,6 @@ fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, sessio
         var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
         return store.visitConversationHistory(alloc, session_id, &visitor);
     }
-    // Every saved turn, as v1 replays it, not only those in memory.
     if (active.v2) |v2| {
         const Visitor = struct {
             state: *server.ServerState,
@@ -2075,9 +2052,6 @@ fn planToolCallFrame(
     result: ?types.PersistedToolResult,
 ) !ReplayToolCall {
     const name = tool_call_presentation.acpToolName(call.name);
-    // MCP identity comes from the live catalog, or from the identity recorded
-    // when the session made the call; it is never guessed from the exposed
-    // name. Servers served over ACP connect only on the next turn.
     const mcp_identity = if (registry.lookup(call.name) == null)
         (if (mcp) |runtime| runtime.toolIdentity(arena, call.name) catch null else null) orelse
             if (identities) |record| try record.lookup(arena, call.name) else null
@@ -2085,8 +2059,6 @@ fn planToolCallFrame(
         null;
     const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
     const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, call.name, call.arguments_json);
-    // Parsed with the arena and returned in the frame; no deinit, the caller's
-    // arena frees it in bulk.
     const parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
         std.json.Value,
         arena,
@@ -2104,9 +2076,6 @@ fn planToolCallFrame(
         .kind = tool_call_presentation.mapToolKind(name),
         .status = replayStatus(result),
         .raw_input = if (parsed) |p| p.value else null,
-        // Result content follows the same unmasked tool-update content
-        // contract as the live path; only arguments are masked for display
-        // (redactToolArgumentsJson).
         .content_text = if (result) |r| if (r.output.len > 0)
             tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
         else
@@ -2153,8 +2122,6 @@ fn planExecutionReplay(
             } else null;
             try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, call, result) });
         }
-        // Results without a surviving call record (e.g. trimmed history) still
-        // replay as completed frames so the transcript stays faithful.
         for (step.tool_results, 0..) |result, i| {
             if (matched[i]) continue;
             const call: types.ToolCall = .{
@@ -2166,7 +2133,6 @@ fn planExecutionReplay(
         }
         steering_index = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, step_index + 1);
     }
-    // Entries past the last step still replay, in order, rather than vanish.
     _ = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, null);
     return frames.toOwnedSlice(arena);
 }
@@ -2287,7 +2253,6 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     else if (active.wasm_state) |durable|
         durable.updated_at_ms
     else if (v2_info) |info|
-        // Not saved yet: a new session has no line before its first prompt.
         if (info.updated_ms > 0) info.updated_ms else io_mod.milliTimestamp()
     else
         io_mod.milliTimestamp();
@@ -2410,7 +2375,6 @@ pub fn writeModeConfigOption(
         try writeJsonStr(mode.name, w);
         try w.writeAll(",\"description\":");
         try writeJsonStr(mode.description, w);
-        // ACP leaves extra value fields to `_meta`.
         try w.writeAll(",\"_meta\":{\"fx\":{\"permissionMode\":");
         try writeJsonStr(permissions.permissionModeLabel(mode.permission_mode), w);
         try w.writeAll("}}}");
@@ -2532,8 +2496,6 @@ pub fn writeEffortConfigOption(
         try writeJsonStr(effort.displayLabel(), w);
         try w.writeAll("}");
     }
-    // A persisted effort the active model does not advertise still renders, so
-    // the select never shows a value outside its own option list.
     if (!current_listed) {
         try w.writeAll(",{\"value\":");
         try writeJsonStr(current.label(), w);
@@ -3357,8 +3319,6 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         .{},
     );
     defer captured_file.close(io_mod.getIo());
-    // Each session response lists the model catalog, which grows with the
-    // Gateway's, so the whole capture is read rather than a fixed slice.
     const captured = try io_mod.readFileToEnd(alloc, &captured_file, 1024 * 1024);
     defer alloc.free(captured);
     try std.testing.expectEqual(

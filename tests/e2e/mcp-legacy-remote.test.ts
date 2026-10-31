@@ -1169,8 +1169,6 @@ describe("version-scoped legacy MCP remote transports", () => {
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(10_000);
         tui = null;
-        // Exit leaves the session for the server to expire rather than
-        // holding the prompt for a DELETE round trip.
         expect(streamable.deleteCalls).toBe(0);
       },
       40_000,

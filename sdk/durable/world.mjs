@@ -1,6 +1,3 @@
-// Sessions kept in a World the app supplies: its store, streams and queue,
-// such as Workflow's Postgres World. `local()` and `vercel()` are this with
-// the World libfx bundles for each.
 
 const durabilityTag = Symbol.for("libfx.durability");
 
@@ -53,7 +50,6 @@ export function world(source, options = {}) {
     if (typeof value !== "boolean") throw new TypeError(`${name}() ${key} must be a boolean`);
   }
   if (pollMs !== undefined && !(Number.isSafeInteger(pollMs) && pollMs > 0)) throw new TypeError(`${name}() pollMs must be a positive integer`);
-  // Renewed every third of it, so a lease shorter than a second renews faster than a write lands.
   if (leaseMs !== undefined && !(Number.isSafeInteger(leaseMs) && leaseMs >= 1000)) throw new TypeError(`${name}() leaseMs must be an integer of at least 1000`);
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
@@ -62,8 +58,6 @@ export function world(source, options = {}) {
     if (value !== undefined && typeof value !== "function") throw new TypeError(`${name}() ${key} must be a function`);
   }
   if (livenessKnown && !alive) throw new TypeError(`${name}() livenessKnown needs alive()`);
-  // Only the backstop's own message coming back continues a turn a dead
-  // request ran.
   if (runInRequest && !queueLeases) throw new TypeError(`${name}() runInRequest needs queueLeases`);
   return {
     [durabilityTag]: true,

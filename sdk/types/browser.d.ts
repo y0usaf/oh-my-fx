@@ -1,4 +1,3 @@
-// `libfx` in browsers and other non-Node hosts, and `libfx/browser` (browser.js).
 import type {
   FxAgent,
   FxAgentOptions,

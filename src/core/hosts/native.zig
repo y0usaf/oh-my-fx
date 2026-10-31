@@ -169,8 +169,6 @@ fn run_clipboard_process(
     };
 }
 
-// Publish eager file representations so the pasteboard server owns them after
-// this short-lived process exits.
 fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) host.ClipboardError!bool {
     if (comptime builtin.target.os.tag != .macos) return false;
 

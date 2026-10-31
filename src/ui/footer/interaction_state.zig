@@ -19,8 +19,6 @@ pub const approval_hint = "1–3 choose now    ↑↓ or tab options    enter co
 pub const approval_amendment_hint = "1–3 choose now    ↑↓ options    tab amend    enter confirm    esc cancel";
 pub const approval_hint_compact = "1–3 choose now    enter confirm    esc cancel";
 pub const approval_hint_minimal = "enter confirm    esc cancel";
-// Ordered widest-first; every variant keeps the enter/esc controls so narrow
-// terminals never lose the submit and cancel instructions.
 pub const approval_hint_variants = [_][]const u8{ approval_hint, approval_hint_compact, approval_hint_minimal };
 pub const approval_amendment_hint_variants = [_][]const u8{ approval_amendment_hint, approval_hint_compact, approval_hint_minimal };
 

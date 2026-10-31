@@ -1,6 +1,3 @@
-// Driver plumbing scenarios: a real Zig binary writes its trace to
-// MCPV2_TRACE, and the driver checks it through the bridge. The second case is
-// a known-bad control that must be REJECTED.
 
 import type { Scenario } from "../scenario";
 

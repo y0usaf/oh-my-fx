@@ -1,13 +1,3 @@
-// Runtime driver: drives the real `fx acp` binary from a worktree through
-// directed and seeded-random speed scenarios, records what a client observes
-// (configOptions projections, JSON-RPC errors, and the lane each prompt sends
-// to a local fake Gateway), and asks TLC whether each observed run is a
-// behavior of tests/tla/acp/AcpSpeed.tla (trace validation via tests/tla/acp/AcpSpeedTrace.tla).
-//
-//   bun tests/tla/drivers/acp/speed/driver.ts --label main   # from the repository root, after zig build
-//
-// No live model calls: completions come from the fake Gateway in the
-// worktree's own tests/e2e/tmux-helpers.ts.
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,11 +5,9 @@ import { REPO_ROOT, outDir } from "../../lib/tlc";
 import { sha256File, sha256Text, tlcToolchain, utcStamp, writeJson } from "./tlc";
 import { Acp, NO_VIEW, type Observation, type View, laneOf, validate, viewOf } from "./trace";
 
-// ---------------------------------------------------------------- catalog --
-
-const BOTH = "openai/gpt-6-astra"; // Fast (priority tier) and Ultrafast
-const FAST_ONLY = "openai/gpt-5.6-priority"; // Fast only
-const PLAIN = "anthropic/claude-plain"; // neither
+const BOTH = "openai/gpt-6-astra";
+const FAST_ONLY = "openai/gpt-5.6-priority";
+const PLAIN = "anthropic/claude-plain";
 const MODELS = [BOTH, FAST_ONLY, PLAIN];
 const SUP_FAST = [BOTH, FAST_ONLY];
 const SUP_ULTRA = [BOTH];
@@ -43,8 +31,6 @@ const CATALOG = [
   },
   { id: PLAIN, name: "Claude Plain", type: "language", owned_by: "anthropic", tags: ["tool-use"] },
 ];
-
-// ------------------------------------------------------------------ plans --
 
 type PlanOp =
   | { op: "fast" | "ultrafast"; value: boolean }
@@ -95,9 +81,6 @@ function randomPlans(count: number, steps: number, seed: number): Plan[] {
     () => to(pick(MODELS)), () => to(pick(MODELS)), () => to(pick(MODELS)),
     () => P, () => P, () => U, () => R,
   ];
-  // The v2 session store saves a chat at its first turn, so resuming earlier
-  // fails with "Session not found" on main too. Resume therefore only follows
-  // a prompt (an explicit assumption in tests/tla/acp/AcpSpeed.tla).
   return Array.from({ length: count }, (_, index) => {
     const name = `r${String(index + 1).padStart(2, "0")}-seed${seed}`;
     const initialModel = pick(MODELS);
@@ -112,8 +95,6 @@ function randomPlans(count: number, steps: number, seed: number): Plan[] {
     return { name, initialModel, defaultFast, ops };
   });
 }
-
-// ------------------------------------------------------------------ runner --
 
 type Helpers = {
   startDynamicFakeGateway: (respond: (body: string) => Response, options: object) => any;
@@ -162,9 +143,6 @@ async function runPlan(plan: Plan, worktree: string, helpers: Helpers, dir: stri
     FX_TRACE_SCOPES: "acp,catalog",
   })) {
     if (value === undefined) continue;
-    // FX_PROVIDER and FX_MODEL are process overrides: fx then resumes every
-    // chat on the process's model instead of the chat's saved one, which no
-    // real ACP host (fx-plus included) does. The Gateway is already the default.
     if (["VERCEL_OIDC_TOKEN", "FX_PROVIDER", "FX_MODEL", "FX_FAST", "FX_ULTRAFAST", "FX_SESSIONS_V2", "FX_PERMISSION_MODE", "FX_DEBUG_RECORD"].includes(key)) continue;
     env[key] = value;
   }
@@ -250,8 +228,6 @@ async function runPlan(plan: Plan, worktree: string, helpers: Helpers, dir: stri
   return { observations, processes, error };
 }
 
-// ---------------------------------------------------------------- controls --
-
 function syntheticTrace(): Observation[] {
   const v = (fast: string, ultra: string): View => ({ model: BOTH, fast, ultra });
   return [
@@ -279,14 +255,11 @@ function tamper(observations: Observation[]): Observation[] | null {
   return null;
 }
 
-// -------------------------------------------------------------------- main --
-
 function argValue(name: string): string | undefined {
   const index = process.argv.indexOf(name);
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-// Session store backend under test ("0" = v1 event log, "1" = v2); unset uses fx's default.
 const SESSIONS_V2 = argValue("--sessions-v2");
 
 function git(worktree: string, ...args: string[]): string {
@@ -341,7 +314,6 @@ async function main() {
     console.log(`${plan.name}: ${verdict} (${run.observations.length} steps)${run.error ? ` ${run.error}` : where}`);
   }
 
-  // Controls show the bridge separates conforming from non-conforming runs.
   const controls = [];
   const synthetic = syntheticTrace();
   controls.push({ name: "synthetic-conforming", expect: "ACCEPTED", got: (await validate(synthetic, join(reportDir, "controls", "synthetic-conforming"), TRACE_CATALOG)).verdict });

@@ -660,7 +660,6 @@ pub const WorkerRuntime = struct {
             op.stage(),
             self.isCancelRequested(),
         );
-        // No transaction acknowledgement survived this fallback; do not promise rollback.
         if (op.stage() == .publication) feedback.publication = .uncertain;
         self.compaction_presentation.settle(op.id, feedback, io_mod.milliTimestamp());
     }
@@ -1551,8 +1550,6 @@ pub const WorkerRuntime = struct {
     pub fn finishProcessing(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "finish processing queued={d}", .{self.queuedPromptCount()});
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        // Close steering admission without moving entries, preserving the exact
-        // order in which steering and ordinary prompts were submitted.
         const finished_turn_id = self.active_turn_id;
         self.finishCompactionActivityLocked(finished_turn_id);
         for (self.queued_prompts.items) |*prompt| {
@@ -2299,8 +2296,6 @@ pub const WorkerRuntime = struct {
                     preserved = ownership.preserve();
                 }
             } else {
-                // The unique active turn bridges queue take to ownership
-                // registration while both operations remain mutex-serialized.
                 self.preserve_prompt_snapshot_turn_id = turn_id;
                 preserved = true;
             }
@@ -4542,15 +4537,12 @@ test "interactive prompt during running manual compaction waits without cancelli
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
 
-    // The compaction is a wait boundary: no cancel, no immediate interrupt.
     try std.testing.expect(!runtime.isCancelRequested());
     try std.testing.expectEqual(@as(?u64, null), runtime.steering_cancel_turn_id);
     var snapshot = try runtime.snapshotSteeringPresentation(alloc);
     defer snapshot.deinit(alloc);
     try std.testing.expect(snapshot.waits_for_boundary);
 
-    // A compaction work item never takes a steering boundary; finishing it
-    // promotes the waiting prompt to a continuation that runs next.
     runtime.settleCompactionActivity(taken.compact_context.operation_id.?, .{
         .outcome = .succeeded,
         .stage = .publication,
@@ -4572,7 +4564,6 @@ test "interactive prompt during in-turn compaction activity waits without cancel
     runtime.worker_processing = true;
     runtime.active_turn_id = 41;
 
-    // In-turn compaction reports through the activity channel, not the tool feed.
     const operation = runtime.beginCompactionActivity(.automatic, 41);
     runtime.runCompactionActivity(operation, .summary);
 
@@ -4581,7 +4572,6 @@ test "interactive prompt during in-turn compaction activity waits without cancel
     try std.testing.expect(!runtime.isCancelRequested());
     try std.testing.expectEqual(@as(?u64, null), runtime.steering_cancel_turn_id);
 
-    // The next model boundary drains the waiting steer as same-turn guidance.
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .model));
     defer {
         for (guidance) |text| alloc.free(text);
@@ -4615,7 +4605,6 @@ test "interactive prompt after in-turn compaction settled steers immediately" {
 
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
 
-    // No active boundary remains, so immediate-steer semantics are unchanged.
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expectEqual(@as(?u64, 41), runtime.steering_cancel_turn_id);
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));

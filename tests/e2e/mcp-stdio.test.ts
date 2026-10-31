@@ -2389,7 +2389,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(result.stdout).toContain(
       "failure=MCP server exited with code 7 before completing startup: npm error code E401 npm error Incorrect or missing password.",
     );
-    // One launch per offered protocol version, then no restart of a server that keeps exiting.
     const launches = readAttemptedPids(root.launchLogPath);
     expect(launches).toHaveLength(4);
     const trace = readFileSync(root.traceLogPath, "utf8");
@@ -2465,7 +2464,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(result.stdout).toContain(
       "failure=MCP server wrote output that is not an MCP message before completing startup: not json",
     );
-    // fx ended the child itself, so a fresh launch could behave differently.
     const launches = readAttemptedPids(root.launchLogPath);
     expect(launches).toHaveLength(2);
     const trace = readFileSync(root.traceLogPath, "utf8");
@@ -2549,7 +2547,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       recordLaunchAttempts: true,
       restartLimit: 1,
     });
-    // The first launch runs the server; every relaunch fails during startup.
     const profilePath = join(root.home, ".fx", "mcp.json");
     const profile = JSON.parse(readFileSync(profilePath, "utf8"));
     profile.mcp.fixture.command = [
@@ -2565,7 +2562,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
       fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
       async () => {
-        // Call again only after fx has seen the first server exit.
         const deadline = Date.now() + 5_000;
         while (!readFileSync(root.traceLogPath, "utf8").includes("stdio dispatcher failed")) {
           if (Date.now() >= deadline) {
@@ -2600,7 +2596,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     expect(secondResult).toContain(
       "MCP server stopped and could not be restarted: MCP server exited with code 5 before completing startup: relaunch blocked by test",
     );
-    // One recovery restart, whose startup may launch once per protocol it tries.
     const trace = readFileSync(root.traceLogPath, "utf8");
     expect(trace.match(/restarting stdio server server=fixture generation=\d+ attempt=1/g)).toHaveLength(1);
     expect(trace).not.toContain("attempt=2");
@@ -3251,8 +3246,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       const cancelStartedAt = Date.now();
       await tui.sendKeys("C-c");
-      // fx restores and re-delivers SIGINT after cleanup, so tmux records a
-      // signal exit without a numeric pane status.
       await waitForTtyAskExit(tui, null, 5_000);
       expect(Date.now() - cancelStartedAt).toBeLessThan(5_000);
       expect(activeGateway.requests).toHaveLength(0);
@@ -3488,8 +3481,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   test.skipIf(!tmuxAvailable())(
     "MCP resource and prompt commands mask secret-shaped protocol diagnostics",
     async () => {
-      // Secret-shaped needles are written as concatenated fragments so
-      // interactive tool-result masking never rewrites the literal in flight.
       const secretNeedle = ["SERVICE_", "TOKEN=fixture-token-123456"].join("");
       const root = createRoot("tui-feature-protocol-error-masked", MODERN_FIXTURE, {
         mode: "feature_protocol_error",
@@ -4175,7 +4166,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.sendText("1");
       await tui.waitForText("Interactive Ask elicitation complete.", 20_000);
 
-      // The answer went back to the server in the call's second round.
       const calls = readWire(root.wireLogPath).filter((entry) =>
         entry.message.method === "tools/call"
       );
@@ -5995,14 +5985,12 @@ describe("MCP-v2 engine (FX_MCP_ENGINE=v2)", () => {
     ["2025", LEGACY_FIXTURE, LEGACY_RESULT],
   ] as const) {
     test(`fx ask selects and calls a ${era} stdio tool`, async () => {
-      // MCP-v2 speaks 2025-11-25 and newer; the 2025 fixture defaults to 2024.
       const root = createRoot(`v2-call-${era}`, fixture, { legacyVersion: "2025-11-25", specClient: true });
       gateway = startToolGateway(`V2_${era}_DONE`);
       const result = await ask(root, "Use the stdio MCP echo tool.");
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(`V2_${era}_DONE`);
       expect(modelSaw()).toContain(resultText);
-      // The server's instructions come with the selected tool.
       if (era === "2026") expect(modelSaw()).toContain("Use the modern echo tool.");
       expect(calls(root)).toHaveLength(1);
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
@@ -6114,7 +6102,6 @@ describe("MCP-v2 engine (FX_MCP_ENGINE=v2)", () => {
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the direct legacy elicitation fixture.");
     await tui.waitForText("MCP server fixture requests choice", 20_000);
-    // The shell submits a single compact choice without a review step.
     await tui.sendText("1");
     await tui.waitForText("V2 2025 elicitation complete.", 20_000);
 
@@ -6148,7 +6135,6 @@ describe("MCP-v2 engine (FX_MCP_ENGINE=v2)", () => {
     const result = await ask(root, "Find a tool on nope.");
     expect(result.code).toBe(0);
     expect(modelSaw()).toContain("server_not_found");
-    // Nothing needed the configured server, so it never started.
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
 });

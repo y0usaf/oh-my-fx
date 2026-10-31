@@ -651,8 +651,6 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
         TIMEOUT,
       );
 
-      // No key exists anywhere in this environment, so the api-key leaf skips
-      // the which-key column and opens the paste field directly.
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Paste or type a key", TIMEOUT);
@@ -787,8 +785,6 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
         const pane = await session.waitForComposer(10_000);
         expect(pane).toContain("Run /help for commands");
         const escapes = await session.capturePaneEscapes();
-        // editor.foreground #FF0000 quantizes to xterm-256 color 196 without
-        // truecolor (Apple_Terminal), and themes the hint text at startup.
         expect(escapes).toContain("38;5;196");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -813,11 +809,9 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
             "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
             "e2e-pair-light.json": { name: "Pair Light", type: "light", colors: { hint: "#00FF00" } },
           },
-          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" },
         );
         expect(pane).toContain("Run /help for commands");
-        // The light sibling's hint (#00FF00 -> xterm-256 46) applies, not the
-        // pinned dark theme's (#0000FF -> 21).
         expect(escapes).toContain("38;5;46");
         expect(escapes).not.toContain("38;5;21");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -842,10 +836,9 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           {
             "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
           },
-          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal, no e2e-pair-light.json on disk
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" },
         );
         expect(pane).toContain("Run /help for commands");
-        // Builtin fx-light hint, not the mismatched dark theme's blue.
         expect(escapes).toContain("38;5;235");
         expect(escapes).not.toContain("38;5;21");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -869,10 +862,9 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           root,
           {
             "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
-            // Misdeclared: named -light but says dark, with a green marker.
             "e2e-pair-light.json": { name: "Pair Light", type: "dark", colors: { hint: "#00FF00" } },
           },
-          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" },
         );
         expect(pane).toContain("Run /help for commands");
         expect(escapes).toContain("38;5;235");
@@ -900,10 +892,9 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           {
             "e2e-accent.json": { name: "E2E Accent", type: "dark", colors: { hint: "#FF0000" } },
           },
-          { settingsTheme: "e2e-accent", colorFgBg: "15;0" }, // dark terminal, no FX_THEME
+          { settingsTheme: "e2e-accent", colorFgBg: "15;0" },
         );
         expect(pane).toContain("Run /help for commands");
-        // The configured theme's hint (#FF0000 -> xterm-256 196) applies.
         expect(escapes).toContain("38;5;196");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -930,7 +921,6 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
           { settingsTheme: "e2e-accent", fxTheme: "dark", colorFgBg: "15;0" },
         );
         expect(pane).toContain("Run /help for commands");
-        // Builtin fx-dark hint (255), not the configured theme's red.
         expect(escapes).toContain("38;5;255");
         expect(escapes).not.toContain("38;5;196");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -953,14 +943,12 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
         const { pane, escapes, stderrPath } = await startThemedSession(
           root,
           {},
-          { settingsTheme: "dark", colorFgBg: "15;0" }, // dark terminal, pinned dark
+          { settingsTheme: "dark", colorFgBg: "15;0" },
         );
         expect(pane).toContain("Run /help for commands");
-        expect(escapes).toContain("38;5;255"); // fx-dark hint
-        expect(escapes).not.toContain("38;5;235"); // fx-light hint
+        expect(escapes).toContain("38;5;255");
+        expect(escapes).not.toContain("38;5;235");
 
-        // The terminal reports a light-mode change mid-session (DEC 997);
-        // a pinned variant must not follow it.
         session!.sendKeysImmediate(["-H", "1b", "5b", "3f", "39", "39", "37", "3b", "32", "6e"]);
         await new Promise((resolve) => setTimeout(resolve, 1500));
 

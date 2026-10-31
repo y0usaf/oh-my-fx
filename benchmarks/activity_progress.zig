@@ -298,7 +298,6 @@ test "paired growth measurement cancels a slowdown during the window" {
         fn time(self: *@This(), harness: *Harness, alloc: std.mem.Allocator, index: usize) !u64 {
             try harness.update(alloc, index);
             self.calls += 1;
-            // The machine runs 2.5 times slower for the second half of the window.
             return if (self.calls > samples_per_batch) 2_500 else 1_000;
         }
     };

@@ -843,9 +843,6 @@ async function verifyOldestTranscriptEntrySurvives(
     if (pane.includes(firstChatMarker(config))) break;
   }
   const oldestMarker = firstChatMarker(config);
-  // The full transcript opens with a session/network record block, so the
-  // oldest conversation entry can sit just below the clamped top viewport;
-  // page back down until it is visible.
   let oldestPane = await session.capturePane();
   for (let page = 0; page < 128 && !oldestPane.includes(oldestMarker); page += 1) {
     await session.sendKeys("NPage");
@@ -885,7 +882,6 @@ async function verifyResumedTranscriptNavigation(
   const newest = await waitForMode(session, "full", draft);
   expect(newest).toContain(LIVE_DONE);
 
-  // The footer can stay visible while the scrolled page is still being built.
   let older = newest;
   for (let sent = 0; sent < 512; sent += 64) {
     const previous = older;
@@ -973,9 +969,6 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       HISTORY_DONE,
       config.historyTimeoutMs ?? TIMEOUT * 4,
     );
-    // Held transcript rows settle into native scrollback on the frames
-    // right after the answer completes; wait for the settled markers
-    // instead of asserting one racy snapshot.
     await waitForScrollback(session, compactToolMarker(0), TIMEOUT);
     const history = await waitForScrollback(
       session,
@@ -1134,7 +1127,6 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     writeMetrics();
     const finalScrollback = await waitForScrollback(session, LIVE_DONE, TIMEOUT * 2);
     expect(finalScrollback).toContain(LIVE_DONE);
-    // Terminal reset may duplicate a visible line in tmux; durable state must not.
     expect(committedAssistantOccurrences(paths.home, LIVE_DONE)).toBe(1);
     if ((config.settledCycles ?? 0) > 0) {
       await thrashViewer(
@@ -1148,7 +1140,6 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         paths.tapePath,
       );
     }
-    // Settled history bounds the streaming prefix measured above at every geometry.
     await measurePrimaryResize(session, paths.tracePath, paths.tapePath, 120, 36);
     for (const [cols, rows] of RESIZE_SIZES) {
       primaryResizeBytes.push(await measurePrimaryResize(
@@ -1181,16 +1172,13 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     const budgetTransitions = (config.settledCycles ?? 0) > 0
       ? summary.settledTransitions
       : summary.transitions;
-    // The budget includes terminal backpressure and host jitter.
     expect(budgetTransitions.full.p95Ms).toBeLessThan(3_500);
     expect(budgetTransitions.scroll.p95Ms).toBeLessThan(3_500);
     expect(budgetTransitions.close.p95Ms).toBeLessThan(2_500);
     expect(budgetTransitions.resize.p95Ms).toBeLessThan(3_000);
     if ((config.settledCycles ?? 0) > 0) {
-      // Opening after a resize may emit one repair frame and the Full viewport.
       expect(summary.settledTerminalBytes.full.maxBytes).toBeLessThan(64 * 1024);
     }
-    // Full-open cost must remain independent of total chat size.
     expect(summary.terminalBytes.full.maxBytes).toBeLessThan(128 * 1024);
     expect(summary.terminalBytes.close.maxBytes).toBeLessThan(
       Math.max(...primaryResizeBytes) + VIEWPORT_ALLOWANCE_BYTES,
@@ -1324,7 +1312,6 @@ test.skipIf(!tmuxAvailable())(
         await active.sendHexBytes(CTRL_O);
         await active.waitForText(FULL_FOOTER, TIMEOUT);
         let previous = await active.waitForText("SAVED_ROW_0300", TIMEOUT);
-        // Each accepted page must show earlier original rows, including cache misses.
         for (let page = 0; page < 6; page++) {
           const first = Number(previous.match(/SAVED_ROW_(\d+)/)?.[1]);
           expect(first).toBeGreaterThan(1);

@@ -110,11 +110,8 @@ const Ring = struct {
 };
 
 var mutex: std.Io.Mutex = .init;
-// Zero-initialized storage stays in .bss; unused slots are never read.
 var ring: Ring = std.mem.zeroes(Ring);
 
-// Keep format specialization at the caller while sharing ring mutation without
-// adding another Event-sized stack copy.
 inline fn record(kind: Kind, turn_id: u64, step_id: u64, subagent_id: u64, failed: bool, comptime fmt: []const u8, args: anytype) void {
     var recorded: Event = .{
         .timestamp_ms = io_mod.milliTimestamp(),

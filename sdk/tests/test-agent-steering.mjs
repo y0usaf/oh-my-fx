@@ -111,7 +111,6 @@ try {
     events.filter((event) => event.type === "text_delta" || event.type === "user_message"),
     [
       { type: "text_delta", delta: "before" },
-      // The steer shows where it joined the turn, with its id.
       { type: "user_message", text: "focus on\ntests", id: steered.id },
       { type: "text_delta", delta: "after" },
     ],

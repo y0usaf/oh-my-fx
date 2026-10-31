@@ -57,8 +57,6 @@ pub fn withholdOldestImages(
     var sizes: std.ArrayList(usize) = .empty;
     for (messages) |message| {
         for (message.images) |image| {
-            // An unreadable attachment cannot be serialized either; it
-            // still counts toward the image limit.
             try sizes.append(arena, image_attachments.attachmentEncodedBytes(image) orelse 0);
         }
         if (message.tool_result_memory) |memory| {
@@ -121,7 +119,6 @@ test "oldest images leave until the request fits" {
     const sizes = [_]usize{ 400, 400, 400 };
     try std.testing.expectEqual(@as(usize, 0), oldestImagesToWithhold(&sizes, 1000, limits));
     try std.testing.expectEqual(@as(usize, 1), oldestImagesToWithhold(&sizes, 1001, limits));
-    // 1300 - 400 + 320 = 1220, then 1220 - 400 + 320 = 1140, then 1060.
     try std.testing.expectEqual(@as(usize, 3), oldestImagesToWithhold(&sizes, 1300, limits));
     try std.testing.expectEqual(@as(usize, 3), oldestImagesToWithhold(&sizes, 50_000, limits));
     try std.testing.expectEqual(@as(usize, 0), oldestImagesToWithhold(&.{}, 50_000, limits));
@@ -158,7 +155,6 @@ test "withholding keeps history and names how to reload each image" {
         .{ .role = .tool, .content = "<path>a.png</path>", .tool_result_memory = .{ .tool_images = &tool_images, .tool_image_handle = "image-result-call_a" } },
     };
 
-    // 12,500 bytes against 9,000: the attachment (4,000 encoded) is enough.
     const first = try withholdOldestImages(arena, &messages, 12_500, .{ .max_request_bytes = 9000 }, 4096);
     try std.testing.expectEqual(@as(usize, 1), first.withheld);
     try std.testing.expectEqual(@as(usize, 0), first.messages[0].images.len);
@@ -166,7 +162,6 @@ test "withholding keeps history and names how to reload each image" {
     try std.testing.expect(std.mem.endsWith(u8, first.messages[0].content.?, "compare these"));
     try std.testing.expectEqual(@as(usize, 2), first.messages[1].tool_result_memory.?.tool_images.len);
 
-    // Against 5,000 every image leaves, oldest first.
     const second = try withholdOldestImages(arena, &messages, 12_500, .{ .max_request_bytes = 5000 }, 4096);
     try std.testing.expectEqual(@as(usize, 3), second.withheld);
     try std.testing.expectEqual(@as(usize, 0), second.messages[1].tool_result_memory.?.tool_images.len);
@@ -175,12 +170,10 @@ test "withholding keeps history and names how to reload each image" {
         second.messages[1].content.?,
     );
 
-    // The caller's messages are unchanged.
     try std.testing.expectEqual(@as(usize, 1), messages[0].images.len);
     try std.testing.expectEqual(@as(usize, 2), messages[1].tool_result_memory.?.tool_images.len);
     try std.testing.expectEqualStrings("compare these", messages[0].content.?);
 
-    // A request that already fits is returned as is.
     const unchanged = try withholdOldestImages(arena, &messages, 9000, .{ .max_request_bytes = 9000 }, 4096);
     try std.testing.expectEqual(@as(usize, 0), unchanged.withheld);
     try std.testing.expectEqual(@as([*]const ChatMessage, &messages), unchanged.messages.ptr);

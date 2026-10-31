@@ -14,7 +14,6 @@ pub const FinishResult = union(enum) {
     presentation_failed: anyerror,
 };
 
-// A result acknowledges history. An error retains the finish for settlement.
 pub const FinishFn = *const fn (*anyopaque, FinishedPrompt) anyerror!FinishResult;
 
 pub const DeferredFinishCommit = enum {
@@ -72,23 +71,16 @@ pub const SgrState = struct {
             return;
         }
 
-        // Exact full-body match against the known single-parameter codes the
-        // markdown renderer emits; multi-parameter SGRs (e.g. "1;38;5;245")
-        // count for every attribute and the color they carry.
         if (std.mem.eql(u8, body, "1")) self.bold = true else if (std.mem.eql(u8, body, "2")) self.dim = true else if (std.mem.eql(u8, body, "3")) self.italic = true else if (std.mem.eql(u8, body, "4")) self.underline = true else if (std.mem.eql(u8, body, "9")) self.strike = true else if (std.mem.eql(u8, body, "22")) {
             self.bold = false;
             self.dim = false;
         } else if (std.mem.eql(u8, body, "23")) self.italic = false else if (std.mem.eql(u8, body, "24")) self.underline = false else if (std.mem.eql(u8, body, "29")) self.strike = false else if (std.mem.eql(u8, body, "39")) {
             self.fg = .none;
         } else {
-            // Multi-parameter SGRs (e.g. "1;38;5;245") apply each attribute
-            // they carry; color-spec parameters are not attributes.
             if (std.mem.findScalar(u8, body, ';') != null) {
                 var params = std.mem.splitScalar(u8, body, ';');
                 while (params.next()) |param| {
                     if (std.mem.eql(u8, param, "38") or std.mem.eql(u8, param, "48")) {
-                        // Skip the color space and value parameters so their
-                        // digits are not mistaken for attributes.
                         if (params.next()) |space| {
                             const skip: usize = if (std.mem.eql(u8, space, "2")) 3 else 1;
                             for (0..skip) |_| _ = params.next();
@@ -200,7 +192,6 @@ pub const AssistantPacer = struct {
     pub fn rethemeInlineCode(self: *AssistantPacer, light: bool) void {
         const from = shared_theme.builtin(!light).inline_code_open;
         const to = shared_theme.builtin(light).inline_code_open;
-        // The rewrite is in place, so both builtin opens must be the same length.
         comptime std.debug.assert(shared_theme.fx_dark.inline_code_open.len == shared_theme.fx_light.inline_code_open.len);
 
         var index: usize = 0;
@@ -213,8 +204,6 @@ pub const AssistantPacer = struct {
             }
         }
 
-        // Theme-owned opens re-emit from the active theme at restore time, so
-        // there is nothing to rewrite in the tracker itself.
     }
 
     pub fn deferFinish(self: *AssistantPacer, alloc: Allocator, finished: FinishedPrompt) !bool {
@@ -349,7 +338,6 @@ pub const AssistantPacer = struct {
         const i = self.emittablePrefixLen();
         if (i == 0) return;
 
-        // Restore tracked SGR state because other renderers may reset it between ticks.
         if (self.sgr.isActive()) {
             var prefix_buf: [96]u8 = undefined;
             const reset = "\x1b[0m";
@@ -368,7 +356,6 @@ pub const AssistantPacer = struct {
         while (i < self.pending.items.len) {
             const first = self.pending.items[i];
             if (first == 0x1b) {
-                // Keep ANSI sequences atomic and hold incomplete tails for a later tick.
                 const end = display_width.ansiSequenceEnd(self.pending.items, i);
                 if (end > i) {
                     if (!ansiSequenceComplete(self.pending.items, i, end)) break;
@@ -525,7 +512,6 @@ test "partial UTF-8 at buffer tail is held until rest arrives" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // 0xc3 begins a two-byte sequence.
     try pacer.enqueue(alloc, &[_]u8{0xc3});
 
     try pacer.tick(alloc, 0, cap.callbacks());
@@ -1023,8 +1009,6 @@ test "theme change retints active code before the next block" {
     try pacer.tick(alloc, 0, cap.callbacks());
     const emitted_before_theme_change = cap.emitted.items.len;
 
-    // Production flips the active theme first; the pacer's restore re-resolves
-    // theme-owned opens against it.
     const previous = shared_theme.current();
     defer shared_theme.activate(previous);
     shared_theme.activate(shared_theme.fx_light);
@@ -1147,7 +1131,6 @@ test "any foreground color restores after a row reset, not just known opens" {
     const opens_len = sgr.writeOpens(&opens);
     try std.testing.expectEqualStrings("\x1b[38;5;204m", opens[0..opens_len]);
 
-    // Combined forms carry the color with the attribute.
     sgr.apply("\x1b[1;38;2;255;0;0m");
     try std.testing.expect(sgr.fg == .other);
     try std.testing.expect(sgr.bold);

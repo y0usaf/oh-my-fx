@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// `libfx/chatgpt` against a fake OpenAI: the paste-the-address sign-in, device
-// code sign-in and refresh, with the error each mistake produces. No network.
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
 import {
@@ -48,7 +46,6 @@ const rejectsWith = (promise, code) => assert.rejects(promise, (error) => {
   return true;
 });
 
-// startSignIn: the CLI's own authorize request, with an S256 challenge of the secret verifier.
 const signIn = await startSignIn();
 {
   const url = new URL(signIn.url);
@@ -68,7 +65,6 @@ const signIn = await startSignIn();
   assert.notEqual(other.verifier, signIn.verifier);
 }
 
-// finishSignIn: every paste people make, then the exchange.
 const callback = `http://localhost:1455/auth/callback?code=the-code&scope=openid&state=${signIn.state}`;
 for (const pasted of [callback, `\`${callback}\``, ` "${callback}" `, `<${callback}>`, callback.slice(callback.indexOf("?"))]) {
   const server = openai();
@@ -87,7 +83,6 @@ for (const pasted of [callback, `\`${callback}\``, ` "${callback}" `, `<${callba
   });
 }
 
-// finishSignIn mistakes, none of which reach OpenAI.
 {
   const server = openai();
   await rejectsWith(finishSignIn(signIn, "chrome-error://chromewebdata/", { fetch: server.fetch }), "LIBFX_CHATGPT_SIGN_IN_INVALID_ADDRESS");
@@ -101,12 +96,10 @@ for (const pasted of [callback, `\`${callback}\``, ` "${callback}" `, `<${callba
   await assert.rejects(finishSignIn({ url: signIn.url }, callback), TypeError);
 }
 
-// An expired or reused code, and an OpenAI failure.
 await rejectsWith(finishSignIn(signIn, callback, { fetch: openai({ tokenStatus: 401 }).fetch }), "LIBFX_CHATGPT_SIGN_IN_EXPIRED");
 await rejectsWith(finishSignIn(signIn, callback, { fetch: openai({ tokenStatus: 400 }).fetch }), "LIBFX_CHATGPT_SIGN_IN_EXPIRED");
 await rejectsWith(finishSignIn(signIn, callback, { fetch: openai({ tokenStatus: 503 }).fetch }), "LIBFX_CHATGPT_SIGN_IN_FAILED");
 
-// Device code: pending, then entered.
 {
   const server = openai({ pollAnswers: [403, 404, 200] });
   const device = await startDeviceSignIn({ fetch: server.fetch });
@@ -129,7 +122,6 @@ await rejectsWith(finishSignIn(signIn, callback, { fetch: openai({ tokenStatus: 
   });
 }
 
-// completeDeviceSignIn waits at OpenAI's interval and stops on abort.
 {
   const server = openai({ pollAnswers: [403, 200] });
   const device = { ...(await startDeviceSignIn({ fetch: server.fetch })), intervalMs: 10 };
@@ -141,13 +133,11 @@ await rejectsWith(finishSignIn(signIn, callback, { fetch: openai({ tokenStatus: 
   );
 }
 
-// An expired device code explains how to turn device code sign-in on.
 await assert.rejects(
   pollDeviceSignIn({ verificationUrl: "", userCode: "X", deviceAuthId: "d", intervalMs: 1000, expiresAt: Date.now() - 1 }, { fetch: openai().fetch }),
   (error) => error.code === "LIBFX_CHATGPT_DEVICE_CODE_EXPIRED" && /security settings/.test(error.message),
 );
 
-// refreshCredentials rotates the refresh token.
 {
   const server = openai();
   const refreshed = await refreshCredentials({ accessToken: jwt("old"), refreshToken: "rt-1" }, { fetch: server.fetch });

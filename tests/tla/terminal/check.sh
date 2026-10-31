@@ -1,17 +1,4 @@
 #!/bin/sh
-# Model-check the shell snapshot and terminal lifecycle designs with TLC and
-# require each config's expected verdict.
-#
-# ShellSnapshot: the in-memory owner of a captured shell environment
-# (src/core/terminal/shell_snapshot.zig), shared by the root agent and every
-# subagent: single-flight capture, leases, refresh, and approval epochs.
-# TerminalLifecycle: hosted terminal processes across fx exits and crashes.
-#
-# Each design config must pass every invariant and liveness property with
-# deadlock checking on. Each <Model>-<mutation>.cfg enables one broken rule,
-# checks safety only, and must be rejected by the named invariant.
-#
-# Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
 
 cd "$(dirname "$0")"

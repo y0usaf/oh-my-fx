@@ -89,9 +89,6 @@ fn isKindChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or c == '_';
 }
 
-// ---------------------------------------------------------------------------
-// Kind fields: the bytes between `kind` and `crc`
-
 pub const Role = enum { root, child };
 pub const Host = enum { app, ask, acp, sdk, child };
 /// Hosts end a turn with `cancel` or `failed` (D21); the manager writes
@@ -379,8 +376,6 @@ pub const Fields = struct {
                 return null;
             },
             else => {
-                // A number, `true`, `false` or `null`: up to the next
-                // delimiter of the enclosing object.
                 var j = i;
                 while (j < bytes.len and bytes[j] != ',' and bytes[j] != '}') j += 1;
                 return if (j < bytes.len) j else null;
@@ -564,9 +559,6 @@ pub fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []co
     try out.append(gpa, '"');
 }
 
-// ---------------------------------------------------------------------------
-// Session ids
-
 /// v1's id alphabet, so converted sessions keep their ids, minus the names
 /// the v2 layout reserves: a leading `.` (`.tmp`, `.trash`) and the index files.
 pub fn validId(id: []const u8) bool {
@@ -642,9 +634,6 @@ const Cursor = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 
 test "header round trip" {
@@ -714,7 +703,6 @@ test "every kind's fields round trip, raw values byte for byte" {
     try testing.expectEqualStrings("p1", created.parent.?);
     try testing.expectEqual(@as(u64, 9), created.forked_from.?.seq);
 
-    // Whitespace, key order and number spelling inside opaque JSON survive.
     const data = "{ \"b\": 1.50, \"a\": [1e3, \"\\u00e9\"] }";
     const item = (try roundTrip(arena, .{ .item = .{ .turn = 4, .type = "steering", .data = data } })).item;
     try testing.expectEqualStrings("steering", item.type);
@@ -841,7 +829,6 @@ test "Fields fast paths decode exactly what the full parse decodes" {
     for ([_][]const u8{ "true", "false", "null", "1" }) |raw| try Cases.check(bool, arena, raw);
     for ([_][]const u8{ "\"app\"", "\"ask\"", "\"sdk\"", "\"a\\u0070p\"", "3" }) |raw| try Cases.check(E, arena, raw);
     for ([_][]const u8{ "\"plain\"", "\"\"", "\"with \\\"quote\\\" inside\"", "\"tab\\t\"", "\"caf\u{e9}\"" }) |raw| try Cases.check([]const u8, arena, raw);
-    // Every fast answer above was checked; these must take the fast path.
     try std.testing.expectEqual(@as(?u64, 42), fastValue(u64, "42"));
     try std.testing.expectEqualStrings("plain", fastValue([]const u8, "\"plain\"").?);
     try std.testing.expect(fastValue([]const u8, "\"a\\nb\"") == null);

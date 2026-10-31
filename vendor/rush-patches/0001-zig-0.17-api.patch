@@ -1,0 +1,240 @@
+diff --git a/src/host/RealHost.zig b/src/host/RealHost.zig
+index 0a16061..901eb2c 100644
+--- a/src/host/RealHost.zig
++++ b/src/host/RealHost.zig
+@@ -107,7 +107,7 @@ pub fn formatLocalTime(_: RealHost, allocator: std.mem.Allocator, timestamp: i64
+     if (local_result == null) return error.Unexpected;
+     if (format.len == 0) return allocator.dupe(u8, "");
+ 
+-    const format_z = try allocator.dupeZ(u8, format);
++    const format_z = try allocator.dupeSentinel(u8, format, 0);
+     defer allocator.free(format_z);
+     const minimum_len = std.math.add(usize, format.len, 1) catch return error.OutOfMemory;
+     if (minimum_len > local_time_max_buffer_len) return error.Unexpected;
+@@ -1176,7 +1176,7 @@ fn linuxListDir(allocator: std.mem.Allocator, path: []const u8) ListDirError!hos
+ 
+ fn linuxGetDents(fd: i32, buffer: []u8) ListDirError!usize {
+     while (true) {
+-        const rc = std.os.linux.getdents64(fd, buffer.ptr, buffer.len);
++        const rc = std.os.linux.getdents64(fd, buffer.ptr, @intCast(buffer.len));
+         switch (std.os.linux.errno(rc)) {
+             .SUCCESS => return rc,
+             .INTR => continue,
+@@ -1357,7 +1357,7 @@ fn linuxWait(pid: host.Pid) WaitError!host.WaitStatus {
+     const linux = std.os.linux;
+     var status: u32 = 0;
+     while (true) {
+-        const wait_rc = linux.waitpid(pid, &status, 0);
++        const wait_rc = linux.waitpid(pid, @ptrCast(&status), 0);
+         switch (linux.errno(wait_rc)) {
+             .SUCCESS => return decodeWaitStatus(status),
+             .INTR => continue,
+@@ -1370,7 +1370,7 @@ fn linuxWaitNonBlocking(pid: host.Pid) WaitError!?host.WaitStatus {
+     const linux = std.os.linux;
+     var status: u32 = 0;
+     while (true) {
+-        const wait_rc = linux.waitpid(pid, &status, linux.W.NOHANG | linux.W.UNTRACED);
++        const wait_rc = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG | linux.W.UNTRACED);
+         switch (linux.errno(wait_rc)) {
+             .SUCCESS => return if (wait_rc == 0) null else decodeWaitStatus(status),
+             .INTR => continue,
+@@ -1383,7 +1383,7 @@ fn linuxWaitJobEvent(pid: host.Pid) WaitError!host.WaitStatus {
+     const linux = std.os.linux;
+     var status: u32 = 0;
+     while (true) {
+-        const wait_rc = linux.waitpid(pid, &status, linux.W.UNTRACED);
++        const wait_rc = linux.waitpid(pid, @ptrCast(&status), linux.W.UNTRACED);
+         switch (linux.errno(wait_rc)) {
+             .SUCCESS => return decodeWaitStatus(status),
+             .INTR => continue,
+@@ -1396,7 +1396,7 @@ fn linuxWaitJobEventInterruptible(pid: host.Pid) WaitError!host.WaitStatus {
+     const linux = std.os.linux;
+     var status: u32 = 0;
+     while (true) {
+-        const wait_rc = linux.waitpid(pid, &status, linux.W.UNTRACED);
++        const wait_rc = linux.waitpid(pid, @ptrCast(&status), linux.W.UNTRACED);
+         switch (linux.errno(wait_rc)) {
+             .SUCCESS => return decodeWaitStatus(status),
+             .INTR => if (peekPendingSignal()) |signal| return .{ .signaled = signal } else continue,
+@@ -1409,7 +1409,7 @@ fn linuxWaitInterruptible(pid: host.Pid) WaitError!host.WaitStatus {
+     const linux = std.os.linux;
+     var status: u32 = 0;
+     while (true) {
+-        const wait_rc = linux.waitpid(pid, &status, 0);
++        const wait_rc = linux.waitpid(pid, @ptrCast(&status), 0);
+         switch (linux.errno(wait_rc)) {
+             .SUCCESS => return decodeWaitStatus(status),
+             .INTR => if (peekPendingSignal()) |signal| return .{ .signaled = signal } else continue,
+diff --git a/src/shell/builtin.zig b/src/shell/builtin.zig
+index b3aef0c..22683aa 100644
+--- a/src/shell/builtin.zig
++++ b/src/shell/builtin.zig
+@@ -609,7 +609,7 @@ fn findHashPath(shell: anytype, utility: []const u8) !?[]const u8 {
+ 
+     const allocator = shell.scratchAllocator();
+     if (std.mem.indexOfScalar(u8, utility, '/') != null) {
+-        const utility_z = try allocator.dupeZ(u8, utility);
++        const utility_z = try allocator.dupeSentinel(u8, utility, 0);
+         return if (shell.host.isExecutableZ(utility_z)) utility else null;
+     }
+ 
+diff --git a/src/shell/builtin_history.zig b/src/shell/builtin_history.zig
+index 109c9ab..767cd90 100644
+--- a/src/shell/builtin_history.zig
++++ b/src/shell/builtin_history.zig
+@@ -323,7 +323,7 @@ fn createFcTempFile(shell: anytype, contents: []const u8) ![]const u8 {
+     while (attempt < 100) : (attempt += 1) {
+         const path = try std.fmt.allocPrint(allocator, "/tmp/rush-fc-{}-{}", .{ pid, attempt });
+         errdefer allocator.free(path);
+-        const path_z = try allocator.dupeZ(u8, path);
++        const path_z = try allocator.dupeSentinel(u8, path, 0);
+         defer allocator.free(path_z);
+ 
+         const fd = shell.host.openZ(path_z, .{
+@@ -364,7 +364,7 @@ fn deleteFcTempFile(shell: anytype, path: []const u8) void {
+         else => @TypeOf(shell.host),
+     };
+     if (!@hasDecl(HostType, "deleteFileZ")) return;
+-    const path_z = shell.scratchAllocator().dupeZ(u8, path) catch return;
++    const path_z = shell.scratchAllocator().dupeSentinel(u8, path, 0) catch return;
+     defer shell.scratchAllocator().free(path_z);
+     // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+     shell.host.deleteFileZ(path_z) catch {};
+@@ -372,7 +372,7 @@ fn deleteFcTempFile(shell: anytype, path: []const u8) void {
+ 
+ fn readFcTempFile(shell: anytype, path: []const u8) ![]const u8 {
+     const allocator = shell.scratchAllocator();
+-    const path_z = try allocator.dupeZ(u8, path);
++    const path_z = try allocator.dupeSentinel(u8, path, 0);
+     defer allocator.free(path_z);
+     const fd = try shell.host.openZ(path_z, .{ .access = .read_only });
+     defer shell.host.close(fd) catch {};
+@@ -391,9 +391,9 @@ fn runFcEditor(shell: anytype, editor: []const u8, path: []const u8) !result.Exi
+     const allocator = shell.scratchAllocator();
+     const editor_path_z = (try fcResolveEditorPathZ(shell, editor)) orelse return error.FileNotFound;
+     defer allocator.free(editor_path_z);
+-    const editor_arg_z = try allocator.dupeZ(u8, editor);
++    const editor_arg_z = try allocator.dupeSentinel(u8, editor, 0);
+     defer allocator.free(editor_arg_z);
+-    const path_z = try allocator.dupeZ(u8, path);
++    const path_z = try allocator.dupeSentinel(u8, path, 0);
+     defer allocator.free(path_z);
+     const argv = try allocator.allocSentinel(?[*:0]const u8, 2, null);
+     defer allocator.free(argv);
+@@ -427,7 +427,7 @@ fn fcEditorEnvp(shell: anytype) ![:null]const ?[*:0]const u8 {
+ fn fcResolveEditorPathZ(shell: anytype, editor: []const u8) !?[:0]u8 {
+     const allocator = shell.scratchAllocator();
+     if (std.mem.indexOfScalar(u8, editor, '/') != null) {
+-        const editor_z = try allocator.dupeZ(u8, editor);
++        const editor_z = try allocator.dupeSentinel(u8, editor, 0);
+         errdefer allocator.free(editor_z);
+         if (shell.host.isExecutableZ(editor_z)) return editor_z;
+         allocator.free(editor_z);
+@@ -444,7 +444,7 @@ fn fcResolveEditorPathZ(shell: anytype, editor: []const u8) !?[:0]u8 {
+         else
+             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, editor });
+         defer allocator.free(candidate_text);
+-        const candidate = try allocator.dupeZ(u8, candidate_text);
++        const candidate = try allocator.dupeSentinel(u8, candidate_text, 0);
+         errdefer allocator.free(candidate);
+         if (shell.host.isExecutableZ(candidate)) return candidate;
+         allocator.free(candidate);
+diff --git a/src/shell/eval.zig b/src/shell/eval.zig
+index c0ca89f..7d8922c 100644
+--- a/src/shell/eval.zig
++++ b/src/shell/eval.zig
+@@ -31,7 +31,7 @@ const job_control_signals = [_]u8{
+ };
+ 
+ fn validateAst(value: anytype) void {
+-    if (zig_builtin.mode != .ReleaseFast and zig_builtin.mode != .ReleaseSmall) value.validate();
++    if (zig_builtin.mode != .fast and zig_builtin.mode != .small) value.validate();
+ }
+ 
+ pub fn evalProgram(comptime Host: type, shell: anytype, program: ast.Program) EvalError!result.EvalResult {
+@@ -2268,7 +2268,7 @@ fn evalDotBuiltin(shell: anytype, args: []const []const u8) EvalError!result.Eva
+ 
+ fn readDotScript(shell: anytype, path: []const u8) ![]const u8 {
+     const allocator = shell.allocator;
+-    const path_z = try allocator.dupeZ(u8, path);
++    const path_z = try allocator.dupeSentinel(u8, path, 0);
+     defer allocator.free(path_z);
+ 
+     const fd = try shell.host.openZ(path_z, .{ .access = .read_only });
+@@ -2630,13 +2630,13 @@ fn evalTerminalTest(shell: anytype, operand: []const u8) bool {
+ 
+ fn fileStatus(shell: anytype, path: []const u8, follow_symlinks: bool) !?host_mod.FileStatus {
+     if (path.len == 0) return null;
+-    const path_z = try shell.scratchAllocator().dupeZ(u8, path);
++    const path_z = try shell.scratchAllocator().dupeSentinel(u8, path, 0);
+     return shell.host.fileTestStatusZ(path_z, follow_symlinks);
+ }
+ 
+ fn fileAccess(shell: anytype, path: []const u8, access: host_mod.FileAccess) !bool {
+     if (path.len == 0) return false;
+-    const path_z = try shell.scratchAllocator().dupeZ(u8, path);
++    const path_z = try shell.scratchAllocator().dupeSentinel(u8, path, 0);
+     return shell.host.fileAccessZ(path_z, access);
+ }
+ 
+@@ -2759,7 +2759,7 @@ fn evalEnvBuiltin(shell: anytype, args: []const []const u8, assignments: []const
+     const path = if (std.mem.indexOfScalar(u8, command, '/') != null)
+         command
+     else
+-        try shell.scratchAllocator().dupeZ(u8, command_path);
++        try shell.scratchAllocator().dupeSentinel(u8, command_path, 0);
+     const request: host_mod.SpawnRequest = .{
+         .path = path,
+         .argv = argv,
+@@ -4626,7 +4626,7 @@ fn applyRedirection(
+ 
+     switch (redirection.op) {
+         .input, .output, .append, .read_write, .clobber => {
+-            const path = try shell.scratchAllocator().dupeZ(u8, try expandWord(shell, redirection.target));
++            const path = try shell.scratchAllocator().dupeSentinel(u8, try expandWord(shell, redirection.target), 0);
+             const opened = try openRedirectionPath(shell, path, redirection.op);
+             if (opened != target) {
+                 defer shell.host.close(opened) catch {};
+@@ -4667,7 +4667,7 @@ fn applyOutputAndErrorRedirection(
+     };
+     try frames.append(shell.scratchAllocator(), .{ .target = .stderr, .saved = stderr_saved });
+ 
+-    const path = try shell.scratchAllocator().dupeZ(u8, try expandWord(shell, redirection.target));
++    const path = try shell.scratchAllocator().dupeSentinel(u8, try expandWord(shell, redirection.target), 0);
+     const file_op: ast.RedirectionOperator = switch (redirection.op) {
+         .output_and_error => .output,
+         .append_and_error => .append,
+@@ -8219,7 +8219,7 @@ fn searchExternalCommand(
+     std.debug.assert(command.len != 0);
+     const allocator = shell.scratchAllocator();
+     if (std.mem.indexOfScalar(u8, command, '/') != null) {
+-        const command_z = try allocator.dupeZ(u8, command);
++        const command_z = try allocator.dupeSentinel(u8, command, 0);
+         if (shell.host.isExecutableZ(command_z)) {
+             if (try pathIsDirectory(shell, command, .other)) return .not_executable;
+             return .{ .executable = command_z };
+@@ -8309,7 +8309,7 @@ fn makeShellFallbackArgv(
+     const argv = try allocator.allocSentinel(?[*:0]const u8, args.len + 2, null);
+     argv[0] = default_shell_path.ptr;
+     argv[1] = path.ptr;
+-    for (args, 0..) |arg, index| argv[index + 2] = (try allocator.dupeZ(u8, arg)).ptr;
++    for (args, 0..) |arg, index| argv[index + 2] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
+     return argv;
+ }
+ 
+@@ -8476,13 +8476,13 @@ fn resolveCommandPathWithSearchPath(shell: anytype, command: [:0]const u8, searc
+         if (shell.host.isExecutableZ(candidate)) return candidate;
+     }
+ 
+-    return allocator.dupeZ(u8, command);
++    return allocator.dupeSentinel(u8, command, 0);
+ }
+ 
+ fn findCommandPath(shell: anytype, command: []const u8, search_path: ?[]const u8) !?[]const u8 {
+     const allocator = shell.scratchAllocator();
+     if (std.mem.indexOfScalar(u8, command, '/') != null) {
+-        const command_z = try allocator.dupeZ(u8, command);
++        const command_z = try allocator.dupeSentinel(u8, command, 0);
+         return if (shell.host.isExecutableZ(command_z)) command else null;
+     }
+ 

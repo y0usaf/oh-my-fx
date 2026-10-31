@@ -887,7 +887,6 @@ pub const Grid = struct {
     fn dispatchOsc(self: *Grid) !void {
         const payload = self.osc_buffer.items;
         if (payload.len < 2 or payload[0] != '8' or payload[1] != ';') return;
-        // Skip params section (between the two `;`).
         var i: usize = 2;
         while (i < payload.len and payload[i] != ';') : (i += 1) {}
         if (i >= payload.len) return;
@@ -898,8 +897,6 @@ pub const Grid = struct {
             return;
         }
 
-        // A repeated open with the same parameters resumes one logical link.
-        // Different IDs on the same URI must remain separate on the terminal.
         for (self.hyperlink_pool.items, 0..) |existing, idx| {
             if (existing.eql(uri, params)) {
                 const active_params: []const u8 = if (params.len > 0)
@@ -1165,14 +1162,12 @@ pub const Grid = struct {
         }
         self.last_printable_idx = null;
 
-        // Apply any deferred wrap before writing.
         if (self.pending_wrap and self.autowrap) {
             self.cursor_col = 1;
             self.advanceRowOrScroll();
         }
         self.pending_wrap = false;
 
-        // Wide char that doesn't fit: wrap early (autowrap) or clamp.
         if (self.cursor_col + width - 1 > self.cols) {
             if (self.autowrap) {
                 self.cursor_col = 1;
@@ -1211,8 +1206,6 @@ pub const Grid = struct {
         if (self.cursor_col + width <= self.cols) {
             self.cursor_col += width;
         } else {
-            // Cursor ends at the last column. Defer wrap until the
-            // next printable write (lazy-wrap).
             self.cursor_col = self.cols;
             if (self.autowrap) self.pending_wrap = true;
         }
@@ -1698,7 +1691,6 @@ pub const Grid = struct {
                 self.eraseRange(0, total);
             },
             3 => {
-                // ED 3 clears scrollback only; this emulator has no scrollback model.
             },
             else => {},
         }
@@ -2398,15 +2390,11 @@ pub const Grid = struct {
             }
             if (first == 0) continue;
 
-            // Cursor-addressed rows must reopen OSC 8 links because tmux ends
-            // an active hyperlink at an automatic terminal wrap.
             if (cur_hyperlink != 0) {
                 try out.writeAll("\x1b]8;;\x1b\\");
                 cur_hyperlink = 0;
             }
             try out.print("\x1b[{d};{d}H", .{ r, first });
-            // Repainting one wide glyph across another can leave both cells
-            // blank on real terminals unless the old span is erased first.
             if (hasShiftedWideCellOverlap(prev, next, r, first, last)) {
                 try out.print("\x1b[{d}X", .{last - first + 1});
             }
@@ -2432,8 +2420,6 @@ pub const Grid = struct {
                     cell.width == 2 and
                     col + 1 == next.cols and
                     suffix != null;
-                // With DECAWM disabled, terminals can drop suffix codepoints
-                // from a display unit whose base ends at the right margin.
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7h");
                 try emitCodepoint(out, cell.codepoint);
                 if (suffix) |bytes| {
@@ -3243,7 +3229,6 @@ fn applyHyperlinkRemap(style: *Style, remap: []const u32) void {
 
 /// Transitions between OSC 8 hyperlinks without closing a valid active link first.
 fn emitHyperlinkTransition(out: *std.Io.Writer, grid: Grid, prev_id: u32, next_id: u32) !void {
-    // OSC 8 permits opening a new link without explicitly closing the active one.
     if (next_id == 0) {
         try out.writeAll("\x1b]8;;\x1b\\");
         return;
@@ -4706,7 +4691,6 @@ test "revision one checkpoint restores URI-only links without params" {
     const current = try grid.checkpointPayload(alloc);
     defer alloc.free(current);
 
-    // Revision one encoded only the URI; remove the revision-two empty params length.
     const uri_start = std.mem.find(u8, current, uri) orelse return error.MissingTestUri;
     const uri_end = uri_start + uri.len;
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, current[uri_end .. uri_end + 4]);

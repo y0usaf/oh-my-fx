@@ -40,7 +40,6 @@ export async function readPrompt(request) {
   return prompt
 }
 
-// All public examples share this transport policy; the agent code stays in each example.
 export async function gatewayFetch(input, init) {
   const request = new Request(input, init)
   const url = new URL(request.url)

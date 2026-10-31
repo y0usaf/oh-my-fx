@@ -14,8 +14,8 @@ const addon = resolve(process.argv[2] || fileURLToPath(new URL("../../zig-out/li
 const native = createRequire(import.meta.url)(addon);
 assert.equal(typeof native.coreFetchDisposition, "function", "rebuild libfx.node with coreFetchDisposition before running this suite");
 const eofDelayMs = 30;
-const cleanupBoundMs = 500; // 100 ms policy budget plus scheduling allowance.
-const realFetch = globalThis.fetch; // All agents share Node's default TCP pool.
+const cleanupBoundMs = 500;
+const realFetch = globalThis.fetch;
 const sse = (value) => `data: ${typeof value === "string" ? value : JSON.stringify(value)}\n\n`;
 const textFrame = (delta) => sse({ type: "text-delta", delta });
 const finishFrame = (reason) => sse({ type: "finish", finishReason: { unified: reason, raw: reason } });
@@ -97,7 +97,7 @@ async function newTurn(record, extra = {}) {
       init.signal.addEventListener("abort", () => {
         posted.aborts++; posted.abortAt = performance.now(); posted.aborted.resolve();
       }, { once: true });
-      return realFetch(input, init); // Preserve the real Response and default dispatcher.
+      return realFetch(input, init);
     },
     ...extra,
   }), "fresh native agent initialization");
@@ -128,7 +128,7 @@ async function completedTurn(turn, record, reading) {
 async function closedAgent(agent, closing = agent.close()) {
   assert.equal(await bounded(closing, "native agent.close cleanup", cleanupBoundMs), undefined);
   agents.delete(agent);
-  await nextLoop(); // Let the shared fetch pool take its ordinary idle/reuse turn.
+  await nextLoop();
 }
 async function drainedAgent(agent, record) {
   const started = performance.now(), closing = agent.close();
@@ -157,7 +157,6 @@ try {
       assert.equal(native.pushCoreFetchResponse(core, fetchHandle, Buffer.concat(held)), 1);
       released = true;
       held.length = 0;
-      // JS cannot deliver EOF here. Wait only for the native worker to retire.
       const deadline = performance.now() + cleanupBoundMs;
       while (native.coreFetchActive(core, fetchHandle)) {
         assert.ok(performance.now() < deadline, "native retirement must finish within the bounded getter wait");
@@ -191,8 +190,6 @@ try {
       coreFetchConsumed(core, fetchHandle) {
         stats.consumedReads++;
         const prior = native.coreFetchDisposition(core, fetchHandle) === 2;
-        // Hold finish until the old getter reads false after text was pushed,
-        // then retire before returning false to its separate active read.
         if (!prior && pendingFinish(fetchHandle)) { stats.forcedSplitReads++; releaseFinish(core, fetchHandle); }
         return prior;
       },
@@ -270,7 +267,7 @@ try {
     record.tailBytes = Buffer.byteLength(tail);
     record.tailAt = performance.now();
     record.response.write(tail);
-    endAfterDelay(record); // Offer EOF before 100 ms so a timer-only fix cannot pass.
+    endAfterDelay(record);
     const closing = agent.close();
     await bounded(record.aborted.promise, ">64 KiB tail must abort before the offered 30 ms EOF", cleanupBoundMs);
     assert.equal(record.response.writableEnded, false, "byte-limit abort must precede HTTP EOF");
@@ -341,7 +338,7 @@ try {
   throw error;
 } finally {
   for (const record of requests) clearTimeout(record.endTimer);
-  server.closeAllConnections(); // Release real bodies first so failed reads cannot hang teardown.
+  server.closeAllConnections();
   for (const agent of agents) await bounded(agent.close().catch(() => {}), "failure teardown", cleanupBoundMs).catch(() => {});
   await new Promise((done) => server.close(done));
 }

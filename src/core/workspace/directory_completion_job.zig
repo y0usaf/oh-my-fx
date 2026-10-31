@@ -66,7 +66,6 @@ const Task = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     cancel: std.atomic.Value(bool) = .init(false),
-    // Main-only. Worker output is read only after acquire-observing done.
     abandoned: bool = false,
     rows: ?completion.Rows = null,
     failure: ?(path_completion.Error || error{ Cancelled, OutOfMemory }) = null,
@@ -87,7 +86,6 @@ const Task = struct {
     }
 
     fn run(self: *Task) void {
-        // All operation scratch and directory handles are gone before publication.
         defer self.done.store(true, .release);
         self.rows = self.lookup() catch |err| {
             self.failure = err;
@@ -169,7 +167,6 @@ pub const Job = struct {
         try self.startWith(alloc, request, spawn);
     }
 
-    // Spawn injection exercises exactly the allocation/ownership failure path.
     fn startWith(self: *Job, alloc: std.mem.Allocator, request: Request, comptime start_thread: anytype) !void {
         std.debug.assert(self.task == null);
         var owned = request;
@@ -249,7 +246,6 @@ test "directory completion stale success and failure never stage another occurre
         defer job.deinit(alloc);
         const task = job.task.?;
         if (failed) task.failure = error.PathUnavailable else task.rows = try completion.Rows.copy(alloc, &.{.{ .path = "./a", .kind = .file, .matched_spans = &.{} }});
-        // Same query, new scope, and then original scope: the episode still differs.
         bindTest(&state, "@./a", 2);
         bindTest(&state, "@./a", 1);
         task.done.store(true, .release);
@@ -287,7 +283,6 @@ test "directory completion supersession keeps one latest copied pending request 
     state.at_offset += 1;
     try std.testing.expect(!job.pending.?.matches(&state));
     state.at_offset -= 1;
-    // Hidden owners cancel/drop work immediately, but never join the old task.
     job.reconcile(alloc, &state, false);
     try std.testing.expect(job.pending == null);
     try std.testing.expect(state.directory_request == null);
@@ -400,7 +395,6 @@ test "directory completion reap starts latest pending only after old task is don
     try std.testing.expect(job.harvest(alloc, alloc, &state, true));
     try std.testing.expectEqual(@as(u64, 2), job.task.?.request.id);
     try std.testing.expect(job.pending == null);
-    // Final join also works with an actual live task, with no harvest required.
     job.stop(alloc);
 }
 

@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// The remote test fixture must reject incomplete setup before a suite starts
-// creating sessions. These checks use fake credentials and make no requests.
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -44,7 +42,6 @@ for (const key of Object.keys(required)) {
   }
 }
 
-// A development OIDC token cannot authenticate the local api-workflow proxy.
 const oidcOnly = { ...required, VERCEL_OIDC_TOKEN: "fake-oidc-not-an-access-token" };
 delete oidcOnly.WORKFLOW_VERCEL_AUTH_TOKEN;
 const oidc = run(["--input-type=module", "-e", `${noNetwork} await import(${JSON.stringify(fixture)});`], oidcOnly);
@@ -57,7 +54,6 @@ const valid = run(["--input-type=module", "-e", `${noNetwork} const { vercelStor
 assert.equal(valid.status, 0, valid.stderr);
 checks += 1;
 
-// Exercise the real suite entry point too, not only the fixture's import.
 const suite = run(["--experimental-wasm-jspi", "sdk/tests/test-durable.mjs", "vercel", "native"], oidcOnly);
 assert.equal(suite.status, 1);
 assert.ok(suite.stderr.includes("WORKFLOW_VERCEL_AUTH_TOKEN"));

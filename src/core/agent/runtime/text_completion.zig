@@ -119,8 +119,6 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const completion = switch (streamed) {
         .failed => |failure| {
-            // Provider error bodies are third-party text: mask secrets and
-            // neutralize control bytes before the detail reaches /trace.
             const masked = text_utils.maskSecrets(alloc, failure.detail orelse "") catch return error.OutOfMemory;
             defer alloc.free(masked);
             var detail_buf: [512]u8 = undefined;
@@ -225,17 +223,11 @@ pub const CompactorCaller = struct {
     fn send(context: *anyopaque, alloc: Allocator, call: compactor.Call) compactor.CallError!compactor.Reply {
         const self: *CompactorCaller = @ptrCast(@alignCast(context));
         const own = std.mem.eql(u8, call.model, self.model);
-        // Only the conversation's own model reads it; the request is built
-        // for that model.
         var conversation: ?agent_stream_provider.RequestData = null;
         if (call.after_conversation) {
             if (!own or self.conversation == null) return .{ .failed = .{ .reason = .provider, .detail = try alloc.dupe(u8, "kind=no_conversation") } };
             conversation = self.conversation;
         }
-        // After the conversation, the agent's own options, reasoning too: the
-        // provider reuses its cache only for the same settings. Another model
-        // keeps the user's provider routing but none of the options chosen
-        // for this one.
         var options: model_capabilities.ResolvedProviderOptions = if (conversation) |sent| sent.provider_options else if (own) self.provider_options else .{
             .prompt_caching = self.provider_options.prompt_caching,
             .provider_order = self.provider_options.provider_order,
@@ -349,11 +341,8 @@ test "a compactor request after the conversation sends it unchanged, then the re
     try testing.expectEqual(@as(usize, 1), fake.tools);
     try testing.expectEqual(types.ToolChoice.auto, fake.tool_choice);
     try testing.expect(!fake.ultrafast);
-    // The provider reuses its cache only for the agent's own reasoning.
     try testing.expect(fake.reasoning.?.eql(types.ReasoningEffort.literal("high")));
 
-    // Without it, one system message and one user message, no tools, at the
-    // reasoning asked for.
     call.after_conversation = false;
     const alone = try caller.vtable.send(caller.context, testing.allocator, call);
     defer testing.allocator.free(alone.text);
@@ -364,7 +353,6 @@ test "a compactor request after the conversation sends it unchanged, then the re
     try testing.expect(!fake.ultrafast);
     try testing.expect(fake.reasoning.?.eql(types.ReasoningEffort.literal("none")));
 
-    // Another model never reads the conversation.
     call.after_conversation = true;
     call.model = "other";
     const other = try caller.vtable.send(caller.context, testing.allocator, call);
@@ -419,7 +407,6 @@ test "a compactor request carries host-managed authority without secret bytes an
     try testing.expectEqual(types.CredentialSource.host_managed, caller.credential_source.?);
     var cancel = std.atomic.Value(bool).init(false);
     var call: compactor.Call = .{ .model = "m", .reasoning = types.ReasoningEffort.literal("none"), .system = "s", .user = "u", .max_bytes = 1024, .cancel_flag = &cancel, .trace_ctx = .{} };
-    // The conversation's model and the fallback model alike.
     for ([_][]const u8{ "m", "other" }, 1..) |model, calls| {
         call.model = model;
         fake.credential_source = null;

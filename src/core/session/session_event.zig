@@ -17,10 +17,6 @@ pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
-// Version 3 adds CommittedFilePresentation.content_handle on tool_result
-// frames: previous/after snapshots may live in a result-store artifact with
-// only the handle inline. Version 1 and 2 frames never carry the field and
-// remain readable.
 pub const conversation_schema_version: u8 = 3;
 
 /// Every historical frame version a reader must still accept. Writers always
@@ -120,7 +116,6 @@ pub const ConversationInterruption = struct {
             cancellation_origin: std.json.Value = .{ .string = "turn" },
         };
         const wire = try std.json.innerParse(Wire, alloc, source, options);
-        // The default enum decoder also accepts numeric tags, not just names.
         if (wire.cancellation_origin != .string) return error.UnexpectedToken;
         const origin = std.meta.stringToEnum(types.CancellationOrigin, wire.cancellation_origin.string) orelse
             return error.InvalidEnumTag;
@@ -136,8 +131,6 @@ pub const ConversationInterruption = struct {
         };
     }
 
-    // Keep ordinary record bytes unchanged. Older strict readers reject the
-    // optional compaction origin; they cannot safely replay those records.
     pub fn jsonStringify(self: ConversationInterruption, writer: *std.json.Stringify) !void {
         try writer.beginObject();
         try writer.objectField("reason");
@@ -1474,9 +1467,6 @@ fn applyDelta(
                 if (current.last_subagent_work_id) |old| alloc.free(old);
                 current.last_subagent_work_id = id;
             }
-            // A session owns at most one active model turn. Clearing its
-            // checkpoint in the same reduction as the history commit closes
-            // the crash window between durable completion and a later clear.
             if (current.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
             current.recovery_checkpoint = null;
             current.updated_at_ms = envelope.timestamp_ms;
@@ -1669,7 +1659,6 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             }
             try writer.writeByte('}');
         },
-        // Only old logs hold these; the snapshot itself is not kept.
         .usage_checkpointed => try writer.writeAll("{\"usage\":null}"),
         .recovery_checkpoint_set => |payload| {
             try writer.writeAll("{\"checkpoint\":");
@@ -1740,7 +1729,6 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 var owned = preferences;
                 owned.deinit(alloc);
             }
-            // An old session's `usage` is accepted and not kept.
             const subagent_child = if (object.get("subagent_child")) |raw|
                 if (raw == .bool and raw.bool)
                     true
@@ -3142,7 +3130,6 @@ test "conversation cancellation provenance roundtrips history projection with ow
             try appendHistoryTurnConversationEvents(alloc, &events, copy);
             try std.testing.expectEqual(@as(usize, 2), events.items.len);
             try std.testing.expectEqual(origin, events.items[1].interrupted.cancellation_origin);
-            // This in-memory writer reports injected allocation failure as WriteFailed.
             const encoded = encodeConversationFrame(alloc, .{ .seq = 2, .timestamp_ms = 1, .event = events.items[1] }) catch |err|
                 return if (err == error.WriteFailed) error.OutOfMemory else err;
             defer alloc.free(encoded);

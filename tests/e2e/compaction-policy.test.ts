@@ -14,7 +14,6 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
   mkdirSync(cwd, { mode: 0o700 });
   const model = "fixture/compaction";
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
-  // Tags in user text are the user's words, not structure.
   const originalUser = "Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>" +
     (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) + "USER_REFERENCE_END" : "");
   const assistant = "VERIFIED_VALUE=73\n" + Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") + "PENDING_CHECK=transport-resume\n";
@@ -59,8 +58,6 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     phase = "continue";
     const result = await ask(["--resume-id", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
     expect(result.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-    // The turn is only a user message and a final reply, which both stay, so
-    // there is nothing for the model to summarize.
     expect(summaryCalls).toBe(0);
     const rows = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const checkpoints = rows.filter(row => row.event?.context_checkpoint);
@@ -77,8 +74,6 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     const continuedText = JSON.stringify(continued.prompt);
     const shown = (text: string) => JSON.stringify(text).slice(1, -1);
     expect(continuedText).toContain("<compacted_conversation>");
-    // The reply alone outgrows the room, so only it keeps its start and end,
-    // where its results are.
     const final: string = payload.turns[0].final;
     expect(final.length).toBeLessThan(assistant.length);
     expect(final.startsWith("VERIFIED_VALUE=73\n")).toBe(true);
@@ -87,7 +82,6 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     expect(continuedText).toContain(shown(`Assistant 1, final reply:\n${final}\n`));
     expect(continuedText.length).toBeLessThan(assistant.length / 2);
     if (userHeavy) {
-      // Too large for the room as well: the user message keeps its start and end.
       const kept: string = payload.turns[0].users[0];
       expect(kept.length).toBeLessThan(originalUser.length);
       expect(kept.startsWith("Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>")).toBe(true);
@@ -100,7 +94,6 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     }
     expect(continuedText).toContain("Saved word for word: turn M1.");
     expect(continuedText).not.toContain("Assistant reference 7000:");
-    // Either way the whole turn is saved word for word as M1.
     const record = readFileSync(join(sessionDir, "tool-results", "compacted-M1.txt"), "utf8");
     expect(record).toContain(`User 1:\n${originalUser}\n`);
     expect(record).toContain("Assistant reference 7000:");

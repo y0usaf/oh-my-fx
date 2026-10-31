@@ -996,9 +996,6 @@ test "full projection wraps a long tool status instead of clipping it" {
 
 test "full projection shows a terminal session launch command in full" {
     const alloc = std.testing.allocator;
-    // `interact` carries no command argument, so the launch command reaches
-    // the full transcript only through the stored command display. The status
-    // phrase itself was frozen at the compact activity bound.
     const launch = "cd . && python3 - <<'PYEOF' import pathlib led = pathlib.Path(\"docs/workflows/ledger.md\"); " ++
         "s = led.read_text() old = \"Fixed in draft (b226cd28e,\" assert old in s LAUNCH_COMMAND_TAIL";
     var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
@@ -1076,8 +1073,6 @@ test "full projection keeps semantic arguments beside a wrapped tool heading" {
     const painted = try paintProjectionRowsForTest(alloc, &projection, 24);
     defer alloc.free(painted);
 
-    // The heading wraps instead of clipping, and the argument rows beside it
-    // stay: a heading wider than the terminal is never used to hide one.
     try std.testing.expect(std.mem.find(u8, painted, "FULL_ARGUMENT_TAIL") != null);
     try std.testing.expect(std.mem.find(u8, painted, "…") == null);
     try std.testing.expect(std.mem.find(u8, painted, "command: printf") != null);
@@ -1120,8 +1115,6 @@ test "full projection keeps short session input that a long heading contains by 
     const painted = try paintProjectionRowsForTest(alloc, &projection, 80);
     defer alloc.free(painted);
 
-    // "y" occurs inside "python3" in the heading, which does not make the
-    // typed input visible.
     try std.testing.expect(std.mem.find(u8, painted, "Sent input to cd . && python3") != null);
     try std.testing.expect(std.mem.find(u8, painted, "chars: y") != null);
     try std.testing.expect(std.mem.find(u8, painted, "session_id: shell-922") != null);
@@ -1155,8 +1148,6 @@ test "full projection keeps arguments that appear only past the first status lin
     const painted = try paintProjectionRowsForTest(alloc, &projection, 80);
     defer alloc.free(painted);
 
-    // The heading shows only the first status line, so the argument keeps
-    // its own row even though the raw status mentions it later.
     try std.testing.expect(std.mem.find(u8, painted, "path: SECOND_LINE_ARGUMENT") != null);
 }
 
@@ -1235,9 +1226,6 @@ test "stored result projection streams terminal-safe head middle and tail pages"
     try std.testing.expect(std.mem.find(u8, tail, "TAIL-SENTINEL") != null);
     try std.testing.expect(std.mem.find(u8, tail, "after") != null);
 
-    // Every physical row reserves the two-cell result prefix. Escaping ESC
-    // adds three cells while the four-byte emoji occupies two, so the marker
-    // begins one content cell past its raw byte offset.
     const middle_marker_row = @as(u32, 1) +
         @as(u32, @intCast((half_result_bytes + 1) / (24 - 2)));
     const middle = try renderProjectionViewportSource(
@@ -1589,8 +1577,6 @@ test "viewport selector sees the degraded measurement when a stored segment is u
     });
     defer alloc.free(selected);
 
-    // The unreadable segment degrades during the measure walk, so the selector
-    // must be handed the post-degrade totals, not the pre-degrade document.
     const post_degrade = try measureProjection(alloc, &projection, null, 80);
     try std.testing.expectEqual(@as(u32, 1), recorder.calls);
     try std.testing.expectEqual(post_degrade.total_rows, recorder.measurement.?.total_rows);
@@ -1665,9 +1651,6 @@ test "a window walk degrade re-selects the offset in the same frame" {
     });
     defer alloc.free(selected);
 
-    // Deleting the stored result between the measure and window walks forces
-    // the window walk to degrade; the pipeline must re-measure and re-select
-    // rather than emit a window at the stale offset.
     try std.testing.expectEqual(@as(u32, 2), saboteur.calls);
     try std.testing.expectEqual(@as(?u16, 8), saboteur.visible_rows);
     const post_degrade = try measureProjection(alloc, &projection, &capability, 80);
@@ -3451,7 +3434,6 @@ test "projection measurement continues across a stored segment boundary" {
     );
     defer capability.deinit();
 
-    // Envelope trimming leaves the stored segment ending mid-row.
     const handle = try result_store.storeLargeResultManaged(
         alloc,
         &capability,
@@ -3477,8 +3459,6 @@ test "projection measurement continues across a stored segment boundary" {
     } });
     try projection.segments.append(alloc, .{ .static = try alloc.dupe(u8, "\nafter\n") });
 
-    // before / ALPHA / BRAVO / after: the newline opening the final static
-    // segment terminates BRAVO's row rather than counting as a row of its own.
     const measurement = try measureProjection(alloc, &projection, &capability, 80);
     try std.testing.expectEqual(@as(u32, 4), measurement.total_rows);
 
@@ -3531,7 +3511,6 @@ test "projection window applies the carriage return column reset measurement use
     const measurement = try measureProjection(alloc, &projection, null, 10);
     try std.testing.expectEqual(@as(u32, 1), measurement.total_rows);
 
-    // The overwritten tail must not wrap onto a row past the measured document.
     const row = try renderProjectionViewportSource(alloc, &projection, null, 10, 1, 0);
     defer alloc.free(row);
     try std.testing.expect(std.mem.find(u8, row, "BB") != null);
@@ -3851,7 +3830,6 @@ fn walkProjectionSegments(
             else
                 appendStoredResultContent(alloc, walker, capability, projection.styles, stored.*) catch |err| {
                     if (err == error.InputPending) return err;
-                    // Rows walked so far are stale once the segment degrades.
                     _ = degradeStoredResult(stored, err);
                     projection.invalidateMeasurement();
                     return error.StoredSegmentDegraded;
@@ -4246,9 +4224,6 @@ const CommandFrameReader = union(enum) {
         return source;
     }
 
-    // noinline keeps the comptime-known error returns behind a call
-    // boundary; inlined into a `!CommandFrameReader` result location they
-    // each materialize a union-sized (~8KB) error-union constant.
     noinline fn initInto(
         out: *CommandFrameReader,
         alloc: Allocator,
@@ -5356,9 +5331,6 @@ fn openStoredResultReader(
     return reader;
 }
 
-// noinline keeps the comptime-known error returns behind a call boundary;
-// inlined into a `!StoredResultReader` result location they each materialize
-// a union-sized (~8KB) error-union constant.
 noinline fn openStoredResultReaderInto(
     out: *StoredResultReader,
     alloc: Allocator,
@@ -6100,8 +6072,6 @@ fn commandLineRecordOrdinal(
     line_index: usize,
 ) usize {
     const ordinal = block.lines.items[line_index].record_ordinal;
-    // Hand-built legacy/test blocks predate explicit ordinals and leave every
-    // line at the default zero. Runtime-ingested records are strictly ordered.
     if (line_index > 0 and ordinal == 0) return line_index;
     return ordinal;
 }

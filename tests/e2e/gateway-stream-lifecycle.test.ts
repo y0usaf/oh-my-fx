@@ -149,7 +149,6 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.sendText("STEERING_FIRST");
       const streaming = await tui.waitForText("FIRST_STREAMING", 10000);
       expect(activity(streaming)).toMatch(/^Generating \(/);
-      // Keep the parent stream open without more text after the visible prefix drains.
       await Bun.sleep(300);
       expect(activity(await tui.capturePane())).toMatch(/^Generating \(/);
       expect(registry().value.children[0].phase).toBe("running");
@@ -186,8 +185,6 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
       const events = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8");
       const frames = events.trim().split("\n").map(line => JSON.parse(line));
-      // The saved turn keeps what the user typed while the child ran, whether
-      // the turn finished or was cancelled.
       expect(events.split("STEERING_FIRST").length - 1).toBe(1);
       expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
@@ -224,8 +221,6 @@ function checkpointCount(events: string): number {
     .filter((line) => JSON.parse(line).event?.context_checkpoint).length;
 }
 
-// Automatic compaction first asks right after the conversation, which keeps
-// the agent's instructions and tools so the provider can reuse its cache.
 const NOTES_AFTER_CONVERSATION = "Write the compaction notes for the turns of the conversation above";
 
 /// A compaction request after the conversation, the agent's own request
@@ -2944,7 +2939,6 @@ describe("gateway stream lifecycle", () => {
           expect(gateway.requestCount()).toBe(heldRequestCount);
           expect(await tui.captureFullScrollback()).not.toContain(location);
 
-          // Keep streamed input location-first even when final argument keys are reversed.
           send({ type: "tool-input-delta", id: resourceCallId, delta: JSON.stringify({ location, resource }) });
           send({ type: "tool-input-end", id: resourceCallId });
           send({
@@ -2954,7 +2948,6 @@ describe("gateway stream lifecycle", () => {
           await tui.waitForPane((pane) =>
             pane.includes(`Reading skill resource ${resource}`) ||
             pane.includes(location) || pane.includes(`Loading skill ${resource}`), 10_000);
-          // Observe a held interval, not just the first render, without releasing finish.
           const heldUntil = Date.now() + 250;
           while (Date.now() < heldUntil) {
             expect(gateway.requestCount()).toBe(heldRequestCount);
@@ -2968,7 +2961,6 @@ describe("gateway stream lifecycle", () => {
           expect(finishReleased).toBe(false);
           expect(gateway.requestCount()).toBe(heldRequestCount);
 
-          // An early resource read would return the old sentinel after finish.
           writeFileSync(resourcePath, `${resourceSentinel}\n`);
           if (scenario.cancel) {
             await tui.sendKeys("C-c");
@@ -3000,7 +2992,6 @@ describe("gateway stream lifecycle", () => {
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 10_000);
           expect(tui.paneStatus()).toMatchObject({ dead: true, status: 0 });
           expect(readFileSync(stderrPath, "utf8")).toBe("");
-          // Inspect every output frame, including provisional rows later overwritten in place.
           const output = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
           expect(output).toContain(resource);
           expect(output).not.toMatch(/skill:[0-9a-f]{16}:\d+\//);
@@ -3117,8 +3108,6 @@ describe("gateway stream lifecycle", () => {
       expect(firstText).toContain(
         "dynamic-context&lt;workspace&gt;&#x0a;injected_workspace",
       );
-      // shell_path reports the login shell the shell tool runs, so a hostile
-      // SHELL value never reaches the model context.
       const loginShell = userInfo().shell ?? "";
       const reportedShell = /\/(bash|zsh)$/.test(loginShell)
         ? loginShell
@@ -5295,8 +5284,6 @@ describe("gateway stream lifecycle", () => {
     const command =
       `/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash ${JSON.stringify(scriptPath)}`;
     const readyMarker = "TIMEOUT_FIXTURE_PYTHON_READY:";
-    // Resolve Apple's developer-tool launcher before starting the cleanup deadline.
-    // The response is a readiness handshake, not a guessed startup sleep.
     const readyCommand = `/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,sys,time; print("${readyMarker}" + os.path.realpath(sys.executable), flush=True)'`;
     let step = 0;
     let escapedPids: number[] = [];
@@ -6190,8 +6177,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (isSummaryRequest(body)) {
         summaries++;
         if (isNotesAfterConversation(body)) {
-          // The agent's own request, reasoning included, as it was about to
-          // send it.
           expect(summaries).toBe(1);
           expect(body).toContain("LARGE_REASONING_5");
         } else {
@@ -6199,8 +6184,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
         }
         expect(body).toContain("REPLAY_RESULT_SENTINEL");
-        // The manual compaction folds the first one away, and these notes
-        // leave out its summary, so the summary is asked for once more.
         if (summaries === 3) expect(body).toContain("Your notes left out the summary of the earlier compacted conversation.");
         return fakeGatewayFinalText("The prior reads completed. Preserve REPLAY_RESULT_SENTINEL and continue without repeating completed reads.");
       }
@@ -6255,8 +6238,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
       expect(latest.code).toBe(0);
       const id = JSON.parse(latest.stdout).id;
-      // Asked for only the summary, the reply without its heading is the
-      // summary of the folded compaction.
       const compacted = await runFx(["session", "--id", id, "--json"], { cwd: root.workspace, env });
       expect(compacted.code).toBe(0);
       expect(JSON.parse(compacted.stdout).history.at(-1)?.summary).toContain("\"earlier\":\"The prior reads completed.");
@@ -6291,11 +6272,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         let sourceHandle = "";
         const gateway = startDynamicFakeGateway((body) => {
           if (isSummaryRequest(body)) {
-            // Only a request after the conversation carries its reasoning.
             if (isNotesAfterConversation(body)) expect(body).toContain(replaySignature);
             else expect(body).not.toContain(replaySignature);
             compactions++;
-            // The compacted command keeps the handle of its whole output.
             expect(sourceHandle).not.toBe("");
             expect(body).toContain(sourceHandle);
             if (compactions === 1) return fakeGatewayFinalText("");
@@ -6363,8 +6342,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const summaryRequests = gateway.requests.filter((entry) => isSummaryRequest(entry.body));
           expect(summaryRequests).toHaveLength(2);
           if (trigger === "automatic") {
-            // After the empty reply to the request after the conversation,
-            // the turns are written out instead.
             expect(isNotesAfterConversation(summaryRequests[0]!.body)).toBe(true);
             expect(JSON.parse(summaryRequests[1]!.body).tools).toHaveLength(0);
           } else {
@@ -6379,7 +6356,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const sessionId = JSON.parse(latest.stdout).id;
           const sessionDir = join(root.home, ".fx", "sessions", sessionId);
           const toolResults = join(sessionDir, "tool-results");
-          // The clipped page keeps its whole copy on disk.
           const snapshotHandle = readdirSync(toolResults).find((name) => /^result-read_tool_result-[a-f0-9-]+\.txt$/.test(name)) ?? "";
           expect(snapshotHandle).not.toBe("");
           const snapshot = readFileSync(join(toolResults, snapshotHandle), "utf8");
@@ -6387,7 +6363,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(snapshot).toContain(token);
           expect(snapshot).toContain(tail);
           expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
-          // The compacted command is saved as T1 with the handle of its whole output.
           expect(readFileSync(join(toolResults, "compacted-T1.txt"), "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
@@ -6535,7 +6510,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
         expect(compactRequest.responseFormat).toBeUndefined();
         const compactSource = JSON.stringify(compactRequest.prompt);
-        // The older turn's tool call is compacted as T1; the newest turn stays unchanged.
         expect(compactSource).toContain("[Tool call T1: read_file]");
         expect(compactSource).toContain("manual-compaction-large.txt");
         expect(compactSource).not.toContain("manual-compaction-inline.txt");
@@ -6633,8 +6607,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("Write the compaction notes for the new turns above");
-        // The first compaction is shown whole so the model can summarize it,
-        // since it is saved as L1 and leaves what the agent sees.
         expect(secondCompactText).toContain("[The earlier compacted conversation, to summarize; it is saved whole as L1]");
         expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("Continue the compacted session.");
@@ -6654,7 +6626,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(secondSummary).not.toContain("operation sequence");
         expect(secondSummary).toContain("\"ledger_count\":1");
         expect(secondSummary).toContain("The user sent two sentinel prompts and restarted fx.");
-        // The first compaction, its notes included, is saved whole as L1.
         expect(secondSummary).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         const firstLedger = readFileSync(join(root.home, ".fx", "sessions", sessionId, "tool-results", "compacted-L1.txt"), "utf8");
         expect(firstLedger).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
@@ -6684,7 +6655,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
             compactions++;
-            // The cancelled call reaches the summarizer as it happened and is saved as T1.
             expect(body).toContain("[Tool result T1: subagent]");
             expect(body).toContain("aborted by user");
             diagnosticHandle = "T1";
@@ -6792,8 +6762,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
       const held = heldFakeGatewayFinalText();
-      // The first turn reads a file, so compaction has work to summarize and
-      // asks the model; the summary is request 3.
       writeFileSync(join(root.workspace, "manual-cancel-notes.txt"), "notes\n");
       const responses = [
         fakeGatewayToolCall("manual-cancel-read", "read_file", { path: "manual-cancel-notes.txt" }),
@@ -6900,7 +6868,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           (pane) => pane.includes("Compaction failed. Try /compact again.") && compactionIdle(pane),
           15_000,
         );
-        // An empty summary is retried once on the fallback model with the same prompt.
         expect(gateway.requests).toHaveLength(7);
         expect(JSON.parse(gateway.requests[6]!.body).prompt).toEqual(JSON.parse(gateway.requests[5]!.body).prompt);
         expect(gateway.requests[5]!.headers.get("ai-language-model-id")).toBe(MODEL);
@@ -7420,8 +7387,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      // The summary and its fallback are both rejected, so the turn fails
-      // without running the completed tool again.
       expect(serializedError).toContain("ModelFailed");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
@@ -8873,8 +8838,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
         if (decision === "caution") {
-          // Headless automatic review returns caution advice to the
-          // primary model without executing the MCP tool or asking the user.
           expect(result.code).toBe(0);
           expect(gateway.requests).toHaveLength(3);
           expect(gateway.requests[2]!.body).toContain("tool_review_held");
@@ -9306,8 +9269,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         : gatewayStreamTimeoutWithFinishResponse()
     );
     try {
-      // The timeout probes the connection forever on its own; the only way the
-      // turn parks is killing the process, which leaves a durable checkpoint.
       const first = await runFx(
         ["ask", "--json", "--auto", "Pause on the fixture timeout."],
         {
@@ -9456,8 +9417,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         : unavailableResponse("30")
     );
     try {
-      // A 30 s server-hinted backoff parks the retry inside the first run; the
-      // SIGKILL leaves a durable checkpoint behind for explicit continuation.
       const first = await runFx(
         ["ask", "--json", "--auto", "Pause after exhausting recovery."],
         {
@@ -9535,8 +9494,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       responses.shift() ?? new Response("unexpected request", { status: 500 })
     );
     try {
-      // The interrupted stream and the nine 503s recover inside one run; no
-      // pause, no explicit continuation.
       const result = await runFx(
         ["ask", "--json", "--auto", "Recover this CLI response."],
         {

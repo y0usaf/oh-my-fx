@@ -186,7 +186,6 @@ pub const Operations = struct {
     ) !void {
         try lockMutexUntil(&server.recovery_lock, deadline, cancel_flag);
         defer server.recovery_lock.unlock(io_mod.getIo());
-        // Keep a resource watch from replacing the listener while it is being stopped.
         try lockMutexUntil(&server.subscription_lifecycle_lock, deadline, cancel_flag);
         defer server.subscription_lifecycle_lock.unlock(io_mod.getIo());
 

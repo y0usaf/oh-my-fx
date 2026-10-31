@@ -1,4 +1,3 @@
-// `libfx/mcp` (mcp.js): tools and instructions from a host-owned MCP client.
 import type { FxAgentHostTool } from "./libfx.cjs";
 
 /**

@@ -27,7 +27,6 @@ pub const NoticeTone = enum {
     warning,
     @"error",
     cancelled,
-    // Renders in the neutral body color so the line reads like a normal response.
     neutral,
 };
 
@@ -552,8 +551,6 @@ pub const RouteRecoveryStatus = struct {
             .checking_liveness => "checking the connection",
             .paused => "recovery paused",
         };
-        // Connectivity waits and liveness probes are un-budgeted: no attempt
-        // counter and no raw error names, just the honest current state.
         if (action_value == .waiting_for_connectivity or action_value == .checking_liveness) {
             if (self.delay_seconds > 0) {
                 return std.mem.print(
@@ -596,9 +593,6 @@ pub const RouteRecoveryStatus = struct {
         ) catch "⚠ Recovering model response";
     }
 
-    // Display names for paused and terminal recovery states; single source so
-    // the stall and generic branches cannot drift. In-progress resume copy
-    // stays in recoveryLabel, where the wording reads differently mid-flight.
     fn pausedCauseDisplayName(cause: ModelRecoveryCause) []const u8 {
         return switch (cause) {
             .network_interrupted => "Network interrupted",
@@ -698,8 +692,6 @@ pub const RouteRecoveryStatus = struct {
         buf: []u8,
         name: []const u8,
     ) []const u8 {
-        // A lifecycle/safety pause (.paused action) can resume; a terminal
-        // stop (no action) is honest about ending.
         const state_text: []const u8 = if (self.action == .paused)
             "recovery paused"
         else
@@ -867,7 +859,6 @@ pub const ToolArgumentIntegrity = enum {
     ) std.mem.Allocator.Error!ToolArgumentIntegrity {
         const integrity = try classifySerialized(alloc, serialized);
         if (integrity != .valid) return integrity;
-        // A complete JSON root is nonempty; only an object can start with '{'.
         return if (std.mem.trimStart(u8, serialized, " \t\r\n")[0] == '{') .valid else .non_object_json;
     }
 };
@@ -901,7 +892,6 @@ pub const ToolArgumentDiagnostic = struct {
         while (true) {
             const token = scanner.next() catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                // Complete input cannot underrun; treat it as the same missing tail.
                 error.UnexpectedEndOfInput, error.BufferUnderrun => .{
                     .failure = .truncated,
                     .input_bytes = raw.len,
@@ -1421,8 +1411,6 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .command_process_presentation = .{ .exit_code = 3 },
     };
     const copy = try dupeToolResultMemory(alloc, source);
-    // Tear down every source allocation; the testing allocator scribbles
-    // freed memory, so an aliased copy reads garbage below.
     freeToolImages(alloc, source_images);
     alloc.free(source.tool_image_handle.?);
     alloc.free(source.output_handle.?);
@@ -1464,8 +1452,6 @@ test "dupeToolResultMemory frees only its own copies on allocation failure" {
         .preview = "preview",
         .command_output_replay = .{ .available = .{ .handle = "cmd-replay-1", .framed_bytes = 7 } },
     };
-    // Every allocation failure point must leave the source's slices untouched
-    // and release exactly what the partial copy allocated.
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(alloc: std.mem.Allocator) !void {
             const copy = try dupeToolResultMemory(alloc, source);
@@ -1543,7 +1529,6 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
-    // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
 };

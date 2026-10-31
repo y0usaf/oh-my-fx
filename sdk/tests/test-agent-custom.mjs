@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-// A custom provider agent: the engine's requests reach an OpenAI-compatible
-// server through the host fetch, with the host's API key on that server's chat
-// URL only, and never touch AI Gateway. No network: every request is answered
-// here.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -75,7 +71,6 @@ async function runTurn(options, prompt = "say ok") {
 const chatRequests = (log) => log.filter((entry) => entry.url === chatUrl);
 const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.includes("ai-gateway.vercel.sh")), false, "a custom provider agent must not call AI Gateway");
 
-// 1. A turn on the host's API key reaches only the provider's chat URL.
 {
   const world = server();
   const asked = [];
@@ -99,7 +94,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   assert.equal(JSON.stringify(events).includes("sk-provider"), false, "libfx diagnostics must not expose the API key");
 }
 
-// 2. Without credentials(), requests carry no key, as a local server expects.
 {
   const world = server();
   const { result, text } = await runTurn({ fetch: world.fetch });
@@ -108,7 +102,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   assert.equal(chatRequests(world.log)[0].headers.get("authorization"), null);
 }
 
-// 3. A tool call round-trips through Chat Completions.
 {
   const world = server({ answer: (index) => index === 0 ? toolCall : reply("alpha is beta") });
   const lookup = {
@@ -132,7 +125,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   assert.equal(second.headers.get("authorization"), "Bearer sk-provider");
 }
 
-// 4. A rejected key is not refreshed or resent; the turn reports the failure.
 {
   const world = server({ answer: () => Response.json({ error: { message: "invalid api key" } }, { status: 401 }) });
   let asked = 0;
@@ -142,8 +134,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   assert.ok(asked >= 1);
 }
 
-// 5. A durable session continues in a new agent, and follows the agent's
-// provider to another base URL with its history, like a change of model.
 {
   const durability = memory();
   const world = server({ answer: (index) => reply(index === 0 ? "first reply" : "second reply") });
@@ -204,8 +194,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   assertNoGateway(world.log);
 }
 
-// 6. A server that quotes the key back in an error never gets it into the
-// turn, its events, or the saved session, even escaped.
 {
   const key = "sk-quoted-back";
   const escaped = [...key].map((char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
@@ -238,7 +226,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   }
   assert.equal(chatRequests(world.log)[0].headers.get("authorization"), `Bearer ${key}`, "the key reached the server");
   assert.match(JSON.stringify(streamed), /bad credential Bearer \*{14}/, "the error reaches the turn with the key masked");
-  // Everything the session saved: its log, with byte payloads as text, and its UI stream.
   const stored = await durability.create().session(sessionId);
   const log = JSON.stringify(await stored.readSince(0), (_, value) => value instanceof Uint8Array ? Buffer.from(value).toString("latin1") : value);
   const lines = await stored.ui.length();
@@ -247,15 +234,12 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   let ui = "";
   for (let line = 0; line < lines; line += 1) ui += new TextDecoder().decode((await reader.read()).value);
   await reader.cancel();
-  // Undoes \u escapes at any depth of JSON nesting, so an escaped copy counts.
   const decoded = (text) => text.replace(/\\+u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
   for (const [where, text] of [["the stream", JSON.stringify(streamed)], ["the events", JSON.stringify(events)], ["the saved log", log], ["the saved UI stream", ui]]) {
     assert.equal(decoded(text).includes(key), false, `${where} must not repeat the key`);
   }
 }
 
-// 7. The key is added to the provider's chat URL and nowhere else, as the
-// engine names a request: origin and path.
 {
   const definition = customProviderDefinition(provider);
   const auth = createSubscriptionAuthorizer([customProviderSpec(definition, () => undefined)], { credentials: () => ({ apiKey: "sk-provider" }) });
@@ -272,7 +256,6 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   }
 }
 
-// 8. Options are checked before anything starts.
 const base = { ...backendOptions, model: "local-model" };
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "codex" } }), /provider.name must be/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "1local" } }), /provider.name must be/);
@@ -286,7 +269,6 @@ await assert.rejects(createFxEngine({ ...base, provider, onCredentials: () => {}
 await assert.rejects(createFxEngine({ ...base, provider, refreshLock: async (_info, refresh) => refresh() }), /refreshLock needs provider "codex" or "grok"/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { contextWindow: 100, maxOutputTokens: 100 } } } }), /maxOutputTokens must be less than contextWindow/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { supportsVision: "yes" } } } }), /supportsVision must be a boolean/);
-// The engine applies the CLI's complete rules to what passes the quick checks.
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, baseUrl: "https://models_example.test/v1" } }));
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} custom provider agent passed`);

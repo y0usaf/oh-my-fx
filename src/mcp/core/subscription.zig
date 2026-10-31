@@ -144,7 +144,6 @@ pub const Table = struct {
                 const s = &t.subs[sub];
                 switch (s.phase) {
                     .pending, .active => out.push(.{ .cancel_listen = s.id }),
-                    // A backoff timer still armed finds it no longer waiting.
                     .waiting => {},
                     .off, .ended => return ignore(out),
                 }
@@ -155,8 +154,6 @@ pub const Table = struct {
                 const sub = t.current(a.id, .pending) orelse return ignore(out);
                 out.sub = sub;
                 const s = &t.subs[sub];
-                // What was asked and acknowledged; more is
-                // never delivered. Nothing of it ends the listen.
                 const agreed = a.filter & s.asked;
                 if (agreed == 0) {
                     out.push(.{ .cancel_listen = s.id });
@@ -169,8 +166,6 @@ pub const Table = struct {
             },
             .notified => |n| {
                 out.action = "note";
-                // Only to the subscription whose listen it
-                // names, after the acknowledgment, inside what was agreed.
                 const sub = t.current(n.id, .active) orelse return ignore(out);
                 if (t.subs[sub].acked & bit(n.kind) == 0) return ignore(out);
                 out.sub = sub;
@@ -190,7 +185,6 @@ pub const Table = struct {
                 t.abrupt(sub, out);
             },
             .retry_due => |r| {
-                // Not a model action: the timer only asks for the resend.
                 if (r.sub >= max_subs or t.config.stdio) return;
                 const s = t.subs[r.sub];
                 if (s.phase == .waiting and s.generation == r.generation) out.push(.{ .relisten = r.sub });
@@ -205,7 +199,6 @@ pub const Table = struct {
                 out.action = "restart";
                 if (!t.config.stdio or t.up) return ignore(out);
                 t.up = true;
-                // Every listen the exit ended goes out again.
                 for (t.subs, 0..) |s, i| if (s.phase == .waiting) out.push(.{ .relisten = @intCast(i) });
             },
         }
@@ -277,7 +270,6 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
         .data = &.{
             .{ .name = "ignored", .value = .{ .boolean = out.ignored } },
             .{ .name = "sub", .value = .{ .int = sub } },
-            // TLC's integers are 32-bit; listen ids stay far below.
             .{ .name = "id", .value = .{ .int = @intCast(@min(id, 1 << 30)) } },
             .{ .name = "filter", .value = .{ .int = switch (event) {
                 .opened => |o| o.filter,
@@ -292,11 +284,6 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
         },
     });
 }
-
-// ---------------------------------------------------------------------------
-// Tests. The model's ghosts are kept beside the table, and its invariants are
-// checked after every step of every event sequence to a small depth, over
-// both transports. Subscription 0 asks for tools, 1 for tools and prompts.
 
 const testing = std.testing;
 
@@ -313,22 +300,20 @@ const World = struct {
     told: [max_ids]u8 = @splat(0),
 
     fn check(w: *World, t: *const Table, before: Table, event: Event, out: *const Output) !void {
-        // The ghosts follow what was sent and what the server sent.
         switch (event) {
             .opened => |o| if (!out.ignored) {
-                try testing.expect(!t.config.stdio or before.up); // NoSendWhileDown
+                try testing.expect(!t.config.stdio or before.up);
                 w.owner[o.id] = o.sub;
             },
             .resent => |r| if (!out.ignored) {
-                try testing.expect(!t.config.stdio or before.up); // NoSendWhileDown
-                try testing.expect(!w.final[before.subs[r.sub].id]); // NoRelistenAfterFinal
+                try testing.expect(!t.config.stdio or before.up);
+                try testing.expect(!w.final[before.subs[r.sub].id]);
                 w.owner[r.id] = r.sub;
             },
             .acknowledged => |a| if (!out.ignored) {
                 w.ack_seen[a.id] = true;
                 w.allowed[a.id] = asks[w.owner[a.id]] & a.filter;
             },
-            // The world ends these listens whatever the client does.
             .lost => |id| if (!before.config.stdio and w.owner[id] != 255) {
                 w.over[id] = true;
             },
@@ -340,32 +325,28 @@ const World = struct {
         for (out.effects()) |effect| switch (effect) {
             .deliver => |d| {
                 const id = event.notified.id;
-                try testing.expectEqual(w.owner[id], d.sub); // SubDemux
-                try testing.expect(w.ack_seen[id]); // AckFirst
-                try testing.expect(w.allowed[id] & bit(d.kind) != 0); // FilterRespected
-                try testing.expect(!w.over[id]); // NothingAfterEnd
+                try testing.expectEqual(w.owner[id], d.sub);
+                try testing.expect(w.ack_seen[id]);
+                try testing.expect(w.allowed[id] & bit(d.kind) != 0);
+                try testing.expect(!w.over[id]);
             },
             .ended => |e| {
                 const id = t.subs[e.sub].id;
                 w.told[id] += 1;
-                try testing.expect(w.told[id] <= 1); // OneEnd
+                try testing.expect(w.told[id] <= 1);
                 w.over[id] = true;
                 if (e.end != .gave_up) w.final[id] = true;
             },
             .cancel_listen => |id| w.over[id] = true,
-            // Only a subscription waiting to listen again does.
             .relisten => |sub| try testing.expectEqual(Phase.waiting, t.subs[sub].phase),
             .arm_retry, .acknowledged => {},
         };
         for (before.subs, t.subs) |b, s| {
-            // A listen that stopped listening is over.
             if ((b.phase == .pending or b.phase == .active) and s.phase != b.phase and s.phase != .active) w.over[b.id] = true;
-            // ActiveListensForSomething, EndTold, and the bound on tries.
             if (s.phase == .active) try testing.expect(s.acked != 0);
             if (s.phase == .ended) try testing.expectEqual(@as(u8, 1), w.told[s.id]);
             try testing.expect(s.tries <= t.config.max_tries);
         }
-        // Where the model has no choice, the core must act.
         switch (event) {
             .final => |f| if (before.current(f.id, .pending) orelse before.current(f.id, .active)) |sub| {
                 try testing.expectEqual(Phase.ended, t.subs[sub].phase);
@@ -463,10 +444,8 @@ test "a listen is acknowledged, delivers what was agreed, and ends once" {
     var t: Table = .init(.{});
     var out: Output = .{};
     t.step(.{ .opened = .{ .sub = 0, .id = 7, .filter = bit(.tools) } }, &out);
-    // Before the acknowledgment nothing is delivered.
     t.step(.{ .notified = .{ .id = 7, .kind = .tools } }, &out);
     try testing.expect(out.ignored);
-    // An acknowledgment naming more than was asked agrees to the overlap.
     t.step(.{ .acknowledged = .{ .id = 7, .filter = bit(.tools) | bit(.prompts) } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .acknowledged = .{ .sub = 0, .filter = bit(.tools) } }}, out.effects());
     t.step(.{ .notified = .{ .id = 7, .kind = .prompts } }, &out);
@@ -495,7 +474,6 @@ test "an abrupt end listens again after the reconnect delay, and gives up after 
     t.step(.{ .opened = .{ .sub = 0, .id = 1, .filter = bit(.tools) } }, &out);
     t.step(.{ .lost = 1 }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .arm_retry = .{ .sub = 0, .generation = 1, .after_ms = 1000 } }}, out.effects());
-    // A stale timer asks for nothing.
     t.step(.{ .retry_due = .{ .sub = 0, .generation = 0 } }, &out);
     try testing.expectEqual(@as(usize, 0), out.effect_count);
     t.step(.{ .retry_due = .{ .sub = 0, .generation = 1 } }, &out);
@@ -506,7 +484,6 @@ test "an abrupt end listens again after the reconnect delay, and gives up after 
     t.step(.{ .resent = .{ .sub = 0, .id = 3 } }, &out);
     t.step(.{ .lost = 3 }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .ended = .{ .sub = 0, .end = .gave_up } }}, out.effects());
-    // An acknowledgment in between starts the count over.
     t.step(.{ .opened = .{ .sub = 0, .id = 4, .filter = bit(.tools) } }, &out);
     t.step(.{ .lost = 4 }, &out);
     t.step(.{ .resent = .{ .sub = 0, .id = 5 } }, &out);
@@ -527,7 +504,6 @@ test "on stdio, a process exit ends every listen, and they go out again when it 
     try testing.expect(out.ignored);
     t.step(.transport_up, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .relisten = 0 }, .{ .relisten = 1 } }, out.effects());
-    // A cancel sends the transport's cancel for a listen in flight.
     t.step(.{ .resent = .{ .sub = 0, .id = 3 } }, &out);
     t.step(.{ .cancel = 0 }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .cancel_listen = 3 }}, out.effects());

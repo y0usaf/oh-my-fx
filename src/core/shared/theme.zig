@@ -50,10 +50,6 @@ pub const Theme = struct {
     red_style: []const u8,
     diff_added_style: []const u8,
     diff_removed_style: []const u8,
-    // When selected, the line number and +/- sign carry the diff color:
-    // green for additions (#30A46C), red for deletions (#E5484D).
-    // Unconfigured builtins keep markers monochrome. Both truecolor and
-    // 256-color variants ship in each theme for terminal capability selection.
     diff_added_marker_truecolor: []const u8,
     diff_removed_marker_truecolor: []const u8,
     diff_added_marker_fallback: []const u8,
@@ -225,8 +221,6 @@ pub fn variantPinned() bool {
     return variant_pinned;
 }
 
-// --- Hex colors and terminal capability resolution ---
-
 pub const HexColor = struct { rgb: Rgb, alpha: u8 };
 
 /// Parses `#rgb`, `#rrggbb`, and `#rrggbbaa` (the forms VS Code themes use).
@@ -339,8 +333,6 @@ pub fn sgrHasParam(open: []const u8, param: []const u8) bool {
             }
             if (std.mem.eql(u8, part, "38") or std.mem.eql(u8, part, "48")) {
                 if (std.mem.eql(u8, part, param)) return true;
-                // Color introducer: 5;n consumes one parameter, 2;r;g;b three.
-                // Skipping keeps RGB triples from reading as bold/italic.
                 const mode = it.next() orelse break;
                 if (std.mem.eql(u8, mode, "2")) {
                     skip = 3;
@@ -379,7 +371,6 @@ pub fn closingFor(open: []const u8) []const u8 {
 fn slotEscapeChecked(alloc: std.mem.Allocator, spec: SlotSpec, truecolor: bool) ParseError![]u8 {
     return slotEscape(alloc, spec, truecolor) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        // Writer.Allocating reports allocation failure as WriteFailed in 0.17.
         error.WriteFailed => error.OutOfMemory,
     };
 }
@@ -399,8 +390,6 @@ fn slotEscape(alloc: std.mem.Allocator, spec: SlotSpec, truecolor: bool) ![]u8 {
     try writer.writeByte('m');
     return out.toOwnedSlice();
 }
-
-// --- theme.json parsing ---
 
 pub const max_theme_bytes: usize = 1024 * 1024;
 
@@ -502,8 +491,6 @@ fn parseSlotSpec(value: std.json.Value) ParseError!SlotSpec {
 
 fn applySlot(theme: *Theme, alloc: std.mem.Allocator, json_key: []const u8, spec: SlotSpec, options: ParseOptions) ParseError!void {
     if (std.mem.eql(u8, json_key, "diff_added_marker") or std.mem.eql(u8, json_key, "diff_removed_marker")) {
-        // Markers resolve both capability forms from one color so the
-        // terminal picks at render time, matching the builtin contract.
         const fg = spec.fg orelse return error.InvalidTheme;
         if (spec.bg != null or spec.bold or spec.italic) return error.InvalidTheme;
         const truecolor = try slotEscapeChecked(alloc, .{ .fg = fg }, true);
@@ -577,8 +564,6 @@ fn applySyntax(theme: *Theme, alloc: std.mem.Allocator, syntax: std.json.ObjectM
     }
 }
 
-// --- VS Code theme schema ---
-
 const VsCodeSlot = struct {
     key: []const u8,
     sources: []const []const u8,
@@ -597,7 +582,6 @@ const vscode_slot_map = [_]VsCodeSlot{
     .{ .key = "system_notice_label", .sources = &.{ "editor.foreground", "foreground" }, .bold = true },
     .{ .key = "system_notice_text", .sources = &.{ "editor.foreground", "foreground" } },
     .{ .key = "dim", .sources = &.{ "editorLineNumber.foreground", "editor.foreground", "foreground" } },
-    // No foreground fallbacks: a link that matches body text stops reading as a link.
     .{ .key = "link", .sources = &.{"textLink.foreground"} },
     .{ .key = "warning", .sources = &.{ "editorWarning.foreground", "terminal.ansiYellow" } },
     .{ .key = "green", .sources = &.{"terminal.ansiGreen"} },
@@ -725,8 +709,6 @@ fn parseVsCode(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
         light = luminance >= 128;
     }
 
-    // Alpha-bearing workbench colors composite over the editor background,
-    // matching how the editor itself renders them.
     const blend_bg = declared_bg orelse if (light) Rgb{ .r = 0xff, .g = 0xff, .b = 0xff } else Rgb{ .r = 0, .g = 0, .b = 0 };
 
     var theme = builtin(light);
@@ -757,8 +739,6 @@ fn parseVsCode(alloc: std.mem.Allocator, root: std.json.ObjectMap, options: Pars
     return theme;
 }
 
-// --- Loading from ~/.fx/themes ---
-
 pub const LoadError = error{ InvalidName, ThemeNotFound, InvalidTheme, OutOfMemory };
 
 /// Returns the sibling variant name for the common `-dark` / `-light`
@@ -774,7 +754,6 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
         const is_light_suffix = std.mem.find(u8, suffix, "light") != null;
         if (is_light_suffix == want_light) return null;
         const base = name[0 .. name.len - suffix.len];
-        // Preserve the suffix capitalization style: GitHub_Light -> GitHub_Dark.
         const replacement: []const u8 = if (std.ascii.isUpper(tail[1]))
             (if (want_light) "Light" else "Dark")
         else
@@ -800,8 +779,6 @@ pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: 
                 debug_trace.logf("theme", "theme_variant_swapped from={s} to={s}", .{ name, sibling });
                 return swapped;
             }
-            // A sibling whose declared variant also mismatches is a user file
-            // error; fall through to the builtin rather than trusting it.
             debug_trace.logf("theme", "theme_sibling_variant_mismatch name={s}", .{sibling});
         } else |err| {
             debug_trace.logf("theme", "theme_sibling_load_failed name={s} err={s}", .{ sibling, @errorName(err) });
@@ -865,7 +842,6 @@ test "every theme slot is populated" {
 }
 
 test "builtin themes pin the historical fx palette bytes" {
-    // Dark defaults.
     try std.testing.expectEqualStrings("\x1b[38;5;240m", fx_dark.divider_style);
     try std.testing.expectEqualStrings("\x1b[38;5;255m", fx_dark.hint_style);
     try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_dark.statusline_style);
@@ -878,7 +854,6 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_dark.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_dark.syntax.comment_style);
 
-    // Light defaults.
     try std.testing.expectEqualStrings("\x1b[38;5;250m", fx_light.divider_style);
     try std.testing.expectEqualStrings("\x1b[38;5;235m", fx_light.hint_style);
     try std.testing.expectEqualStrings("\x1b[38;5;241m", fx_light.statusline_style);
@@ -886,13 +861,11 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.user_card_accent_style);
     try std.testing.expectEqualStrings("\x1b[38;5;235m", fx_light.inline_code_open);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.task_completed_open);
-    // Tool text stays the pre-theme gray in both variants (parity guard).
     try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_light.tool_stdout_style);
     try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_light.tool_stderr_style);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[38;5;243m", fx_light.syntax.comment_style);
 
-    // Diff markers read the same on light and dark in both capability modes.
     try std.testing.expectEqualStrings("\x1b[38;2;48;164;108m", fx_dark.diff_added_marker_truecolor);
     try std.testing.expectEqualStrings("\x1b[38;2;229;72;77m", fx_dark.diff_removed_marker_truecolor);
     try std.testing.expectEqualStrings("\x1b[38;5;71m", fx_dark.diff_added_marker_fallback);
@@ -937,7 +910,6 @@ test "blendOver composites translucent colors onto a background" {
     const solid = blendOver(.{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, 0xff, bg);
     try std.testing.expectEqual(@as(u8, 0xf0), solid.r);
 
-    // 0x26/0xff of #F0F0F0 over #181818.
     const faint = blendOver(.{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, 0x26, bg);
     try std.testing.expect(faint.r > bg.r and faint.r < 0x40);
     try std.testing.expectEqual(faint.r, faint.g);
@@ -978,7 +950,6 @@ test "parse resolves a native theme overlay on the matching builtin" {
     try std.testing.expectEqualStrings(fx_dark.diff_removed_marker_truecolor, theme.diff_removed_marker_truecolor);
     try std.testing.expectEqualStrings("\x1b[38;2;130;210;206m", theme.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[3;38;2;106;153;85m", theme.syntax.comment_style);
-    // Untouched slots inherit the builtin variant.
     try std.testing.expectEqualStrings(fx_dark.hint_style, theme.hint_style);
     try std.testing.expectEqualStrings(fx_dark.syntax.string_style, theme.syntax.string_style);
 }
@@ -990,7 +961,6 @@ test "parse honors a native syntax boolean switch" {
 
     const disabled = try parse(alloc, "{ \"name\": \"no-syntax\", \"syntax\": false }", .{ .truecolor = true });
     try std.testing.expect(!disabled.syntax.enabled);
-    // Style slots keep the builtin defaults; the flag alone gates highlighting.
     try std.testing.expectEqualStrings(fx_dark.syntax.keyword_style, disabled.syntax.keyword_style);
 
     const enabled = try parse(alloc, "{ \"name\": \"yes-syntax\", \"syntax\": true }", .{ .truecolor = true });
@@ -1044,21 +1014,17 @@ test "parse resolves a VS Code theme through the adapter" {
     ;
     const theme = try parse(alloc, doc, .{ .truecolor = true });
     try std.testing.expectEqualStrings("Test Dark", theme.name);
-    try std.testing.expect(!theme.light); // inferred from editor.background, no type field
+    try std.testing.expect(!theme.light);
     try std.testing.expectEqualStrings("\x1b[38;2;240;240;240m", theme.hint_style);
-    // Alpha colors blend over editor.background before resolution.
     const status_expected = blendOver(.{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, 0x99, .{ .r = 0x18, .g = 0x18, .b = 0x18 });
     try std.testing.expectEqualStrings(try alloc.print("\x1b[38;2;{d};{d};{d}m", .{ status_expected.r, status_expected.g, status_expected.b }), theme.statusline_style);
     try std.testing.expectEqualStrings("\x1b[38;2;241;180;103m", theme.warning_style);
     try std.testing.expectEqualStrings("\x1b[38;2;63;162;102m", theme.green_style);
     try std.testing.expectEqualStrings("\x1b[38;2;252;107;131m", theme.red_style);
     try std.testing.expectEqualStrings("\x1b[1;38;2;25;28;34;48;2;129;161;193m", theme.approval_button_active_style);
-    // Exact scope beats prefix; later entries override at equal specificity;
-    // compound selectors never fill a base slot.
     try std.testing.expectEqualStrings("\x1b[38;2;130;210;206m", theme.syntax.keyword_style);
     try std.testing.expectEqualStrings("\x1b[38;2;168;204;124m", theme.syntax.string_style);
     try std.testing.expectEqualStrings("\x1b[3;38;2;106;153;85m", theme.syntax.comment_style);
-    // Unmapped scopes and slots inherit the builtin variant.
     try std.testing.expectEqualStrings(fx_dark.syntax.number_style, theme.syntax.number_style);
 }
 
@@ -1101,7 +1067,6 @@ test "siblingName maps variant suffixes for terminal-mode swaps" {
     try std.testing.expectEqualStrings("cursor-light", (try siblingName(alloc, "cursor-dark", true)).?);
     try std.testing.expectEqualStrings("cursor-dark", (try siblingName(alloc, "cursor-light", false)).?);
     try std.testing.expectEqualStrings("GitHub_Dark", (try siblingName(alloc, "GitHub_Light", false)).?);
-    // Already on the wanted variant, or no recognizable suffix.
     try std.testing.expect((try siblingName(alloc, "cursor-dark", false)) == null);
     try std.testing.expect((try siblingName(alloc, "monokai", true)) == null);
     try std.testing.expect((try siblingName(alloc, "-dark", true)) == null);
@@ -1113,7 +1078,6 @@ test "sgrHasParam parses the parameter list exactly" {
     try std.testing.expect(sgrHasParam("\x1b[1;38;2;1;2;3m", "1"));
     try std.testing.expect(sgrHasParam("\x1b[3;48;5;240m", "48"));
     try std.testing.expect(sgrHasParam("\x1b[3;48;5;240m", "3"));
-    // No prefix or substring confusion, and RGB triples are not attributes.
     try std.testing.expect(!sgrHasParam("\x1b[3;38;2;1;2;3m", "1"));
     try std.testing.expect(!sgrHasParam("\x1b[38;2;1;2;3m", "3"));
     try std.testing.expect(!sgrHasParam("\x1b[38;5;245m", "3"));
@@ -1146,8 +1110,6 @@ test "theme source copies the configured name and pin for live re-resolution" {
     try std.testing.expect(sourceName() == null);
     try std.testing.expect(!variantPinned());
 
-    // The donor buffer may be freed right after setSource; the source state
-    // must not dangle (startup state is deinited before the event loop).
     const donated = try std.testing.allocator.dupe(u8, "cursor-dark");
     setSource(donated, false);
     std.testing.allocator.free(donated);
@@ -1185,7 +1147,6 @@ test "parse maps the link color and split syntax scopes" {
     try std.testing.expectEqualStrings("\x1b[38;2;210;168;255m", vscode.syntax.function_style);
     try std.testing.expectEqualStrings("\x1b[38;2;255;166;87m", vscode.syntax.variable_style);
     try std.testing.expectEqualStrings("\x1b[38;2;255;123;114m", vscode.syntax.operator_style);
-    // Keyword keeps its own scope, not keyword.operator's.
     try std.testing.expectEqualStrings("\x1b[38;2;130;210;206m", vscode.syntax.keyword_style);
 
     const native = try parse(alloc, "{ \"colors\": { \"link\": \"#58A6FF\" }, \"syntax\": { \"function\": \"#D2A8FF\", \"variable\": \"#FFA657\", \"operator\": \"#FF7B72\" } }", .{ .truecolor = true });
@@ -1194,7 +1155,6 @@ test "parse maps the link color and split syntax scopes" {
     try std.testing.expectEqualStrings("\x1b[38;2;255;166;87m", native.syntax.variable_style);
     try std.testing.expectEqualStrings("\x1b[38;2;255;123;114m", native.syntax.operator_style);
 
-    // A VS Code theme without textLink keeps the builtin link color.
     const no_link = try parse(alloc, "{ \"type\": \"dark\", \"colors\": {} }", .{ .truecolor = true });
     try std.testing.expectEqualStrings(fx_dark.link_style, no_link.link_style);
 }
@@ -1202,8 +1162,6 @@ test "parse maps the link color and split syntax scopes" {
 test "builtin themes pin the new slot bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;75m", fx_dark.link_style);
     try std.testing.expectEqualStrings("\x1b[38;5;25m", fx_light.link_style);
-    // The split slots default to the keyword color so default rendering is
-    // byte-identical to before the split.
     for ([_][]const u8{ fx_dark.syntax.function_style, fx_dark.syntax.variable_style, fx_dark.syntax.operator_style }) |style| {
         try std.testing.expectEqualStrings(fx_dark.syntax.keyword_style, style);
     }

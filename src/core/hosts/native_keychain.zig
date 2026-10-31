@@ -288,10 +288,6 @@ const store_value_script =
     \\exit [lindex $result 3]
 ;
 
-// `security add-generic-password -w` uses a 128-byte interactive buffer. MCP's
-// aggregate credential store is larger, so use the native Security API through
-// the stable system osascript host. Account and service are non-secret argv;
-// credential bytes travel only through stdin/stdout.
 const mcp_keychain_script =
     \\ObjC.import("Security");
     \\ObjC.import("Foundation");
@@ -357,7 +353,6 @@ pub fn storeInteractiveArgv(account_buf: *AccountBuffer) Error![8][]const u8 {
 pub fn storeInteractive() Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
 
-    // Let macOS prompt for the secret; do not put it in argv.
     var account_buf: AccountBuffer = undefined;
     const argv = try storeInteractiveArgv(&account_buf);
     var child = std.process.spawn(io_mod.getIo(), .{

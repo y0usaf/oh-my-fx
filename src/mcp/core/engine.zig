@@ -133,7 +133,6 @@ pub const Gate = struct {
             .need => {
                 out.action = "need";
                 switch (s.phase) {
-                    // The model's Need isn't enabled here: nothing changes.
                     .ready => return ignoreWith(out, .list),
                     .failed => return ignoreWith(out, .refuse_need),
                     else => if (s.need) return ignore(out),
@@ -266,7 +265,6 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
         .to = "",
         .data = &.{
             .{ .name = "ignored", .value = .{ .boolean = out.ignored } },
-            // TLC's integers are 32-bit; calls stay far below.
             .{ .name = "n", .value = .{ .int = @min(out.n, 1 << 30) } },
             .{ .name = "allowed", .value = .{ .boolean = event == .asked and event.asked.allowed } },
             .{ .name = "keep", .value = .{ .boolean = event == .drop and event.drop.keep } },
@@ -280,8 +278,6 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
         },
     });
 }
-
-// ---- tests ----
 
 const testing = std.testing;
 
@@ -299,11 +295,10 @@ const World = struct {
                 const n = for (s.calls) |c| {
                     if (c.used and c.handle == h) break c.n;
                 } else unreachable;
-                try testing.expect(w.allowed[n]); // PermissionBeforeCall
+                try testing.expect(w.allowed[n]);
                 try testing.expectEqual(Phase.ready, s.phase);
                 w.went_out[n] = true;
             },
-            // LazyConnect: something needed it when it started.
             .connect => {
                 const mid = out.mid.?;
                 try testing.expect(mid.phase == .idle and (mid.need or mid.waiting > 0));
@@ -315,28 +310,21 @@ const World = struct {
             else => {},
         };
         try testing.expect(s.attempts <= s.config.max_attempts);
-        // BoundedReconnect
         if (s.phase == .failed) try testing.expectEqual(s.config.max_attempts, s.attempts);
-        // StatusConsistent
         const p = s.project(0);
         if (p.sent > 0) try testing.expectEqual(Phase.ready, s.phase);
         if (s.phase == .failed or s.phase == .ready) try testing.expect(!s.need and p.waiting == 0);
-        // Where the model has no choice, the core must act: Connect is enabled.
         try testing.expect(!(s.phase == .idle and s.demand() and s.attempts < s.config.max_attempts));
-        // Ignored steps change nothing.
         if (out.ignored and out.mid == null) try testing.expectEqualDeep(before.project(0), s.project(0));
         switch (event) {
-            // Ready: a pending tool list need goes to the server.
             .up => if (before.phase == .connecting and before.need) {
                 var listed = false;
                 for (out.effects()) |effect| listed = listed or effect == .list;
                 try testing.expect(listed);
             },
-            // Answer needs a call in flight; Cancel one that waits.
             .answered, .cancel => |h| for (before.calls) |c| if (c.used and c.handle == h and c.sent == (event == .cancel)) {
                 try testing.expect(out.ignored);
             },
-            // A host drop starts the tries over.
             .drop => try testing.expect(s.attempts <= 1),
             else => {},
         }
@@ -361,7 +349,6 @@ const alphabet = [_]Event{
 fn walk(s: Gate, w: World, depth: usize) !void {
     if (depth == 0) return;
     for (alphabet) |event| {
-        // A handle is asked at most once while it is held, as the engine does.
         if (event == .asked and find2(&s, event.asked.call)) continue;
         var next = s;
         var nw = w;
@@ -456,7 +443,6 @@ test "failures back off, then the server gives up and ends what waits" {
     try testing.expectEqual(Phase.failed, s.phase);
     out = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
     try testing.expectEqualSlices(Effect, &.{.{ .end = .{ .call = 2, .end = .failed } }}, out.effects());
-    // Reconnect starts over.
     _ = try run(&s, .{ .asked = .{ .call = 3, .allowed = false } });
     out = try run(&s, .{ .drop = .{ .keep = true } });
     try testing.expectEqualSlices(Effect, &.{.teardown}, out.effects());

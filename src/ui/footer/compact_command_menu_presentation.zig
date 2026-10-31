@@ -455,7 +455,6 @@ test "compact status line menu renders toggled items without choose copy" {
         },
     } };
 
-    // Every catalog choice must be reachable as a rendered row.
     const rows = desiredRowCount(projection, 80);
     try std.testing.expectEqual(
         @as(u16, @intCast(settings_row_offset + settings_catalog.statuslineChoiceCount())),

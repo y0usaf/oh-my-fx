@@ -129,7 +129,6 @@ pub fn encode(
     const payload_len = payloadBytes(json.written().len, blob_section_bytes);
     if (payload_len > payload_limit) return error.CheckpointTooLarge;
 
-    // Every length below is bounded by payload_limit, so each fits in a u32.
     const out = try alloc.alloc(u8, header_bytes + payload_len);
     var cursor: usize = header_bytes;
     writeSection(out, &cursor, json.written());
@@ -185,7 +184,6 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
     var reader: PayloadReader = .{ .bytes = payload };
     const json = reader.section() orelse return error.CorruptCheckpoint;
     const blob_count = reader.length() orelse return error.CorruptCheckpoint;
-    // Every blob needs at least its length prefix.
     if (blob_count > reader.remaining() / length_bytes) return error.CorruptCheckpoint;
     const blobs = try alloc.alloc([]const u8, blob_count);
     defer alloc.free(blobs);
@@ -311,7 +309,6 @@ test "kernel checkpoint carries the saving agent's libfx, tools and model" {
     try std.testing.expectEqualStrings("provider/model", decoded.meta.model);
     try std.testing.expectEqualStrings("world", decoded.history[0].assistant.assistant);
 
-    // A checkpoint saved without it, as older ones were, decodes with none.
     const bare = try encode(alloc, &history, .{}, .{});
     defer alloc.free(bare);
     try std.testing.expect(std.mem.find(u8, bare, "\"meta\"") == null);
@@ -328,7 +325,6 @@ test "kernel checkpoint refuses meta that is not short text" {
         "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"" ++ text_utils.repeat("m", max_meta_field_bytes + 1) ++ "\"}}",
     };
     for (cases) |json| try std.testing.expectError(error.InvalidCheckpoint, decodeJson(alloc, json, null));
-    // Fields it does not know are left alone.
     var decoded = try decodeJson(alloc, "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"m\",\"later\":1}}", null);
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("m", decoded.meta.model);
@@ -469,7 +465,6 @@ test "kernel checkpoint stores inline image bytes raw beside the JSON" {
     defer alloc.free(bytes);
 
     try std.testing.expectEqual(version, std.mem.readInt(u16, bytes[4..6], .little));
-    // The only blob is the image itself, unencoded, at the end of the payload.
     try std.testing.expect(std.mem.endsWith(u8, bytes, png));
     try std.testing.expect(std.mem.find(u8, bytes, "\"inline_blob\":0") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"inline_data\"") == null);

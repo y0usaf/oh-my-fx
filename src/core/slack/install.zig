@@ -37,7 +37,6 @@ const Installation = struct {
     refresh_expires_at_ms: ?i64,
 };
 
-// The caller supplies an arena; the returned snapshot borrows its allocations.
 pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, opener: host.UrlOpener) !output.SlackSnapshot {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SlackInstallationUnsupported;
     const origin = io.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";

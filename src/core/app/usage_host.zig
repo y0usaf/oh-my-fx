@@ -51,7 +51,6 @@ pub fn missingReason(auth: *const auth_runtime.Runtime) usage.Unavailable {
     const source = auth.credentialSource() orelse return .no_gateway_sign_in;
     return switch (source) {
         .fx_login, .stored_key, .ai_gateway_api_key => .no_gateway_sign_in,
-        // Codex and Grok: the token expired; the next message renews it.
         .chatgpt_subscription, .grok_subscription => .refresh_needed,
         else => .unsupported_provider,
     };

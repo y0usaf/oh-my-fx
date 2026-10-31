@@ -17,10 +17,7 @@ if (backend === "wasm" && !supportsJspi()) {
 }
 
 const encoded = new TextEncoder();
-// A real 1x1 PNG, plus a helper that builds a PNG-sniffable payload with an
-// exact base64 length for limit probing (the kernel sniffs magic bytes only).
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
-// A different real 1x1 PNG, used as resizeImage output.
 const resizedPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
 function pngWithEncodedLength(encodedLength) {
   assert.equal(encodedLength % 4, 0);
@@ -36,7 +33,6 @@ const catalog = {
   ],
 };
 
-// Header fixtures exercise type and dimension admission without pixel decoding.
 function imageHeader(mimeType, width, height = 1) {
   if (mimeType === "image/png") {
     const bytes = Buffer.from(pngData, "base64");
@@ -123,8 +119,6 @@ function fileParts(body) {
     .filter((part) => part.type === "file");
 }
 
-// An image block reaches an image-capable model as a v4 file part, alongside
-// the text and its placeholder.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -147,8 +141,6 @@ function fileParts(body) {
   await agent.close();
 }
 
-// Blob and File use their own media types and share the base64 wire format
-// and the kernel's byte-sniffing path on both backends.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: { id: "sdk/vision-model" } });
@@ -164,9 +156,6 @@ function fileParts(body) {
   await agent.close();
 }
 
-// Every input form reaches the core as raw bytes beside the ACP frame. The
-// session/prompt frame carries only an attachment reference, and the model
-// request carries the image once, as base64.
 for (const [label, toData] of [
   ["base64", () => pngData],
   ["Uint8Array", (bytes) => new Uint8Array(bytes)],
@@ -196,8 +185,6 @@ for (const [label, toData] of [
   await agent.close();
 }
 
-// Caller-owned bytes are captured when prompt() returns, on the synchronous
-// path and on the asynchronous resizeImage path alike.
 for (const resizeImage of [undefined, (image) => image]) {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model", ...(resizeImage ? { resizeImage } : {}) });
@@ -210,8 +197,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// resizeImage takes and returns raw bytes. Its output replaces the image, may
-// change the media type, and the byte limits apply to it instead of the input.
 {
   const gateway = mockGateway();
   const calls = [];
@@ -242,8 +227,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A failing or invalid resizeImage rejects only that turn, before the prompt
-// is sent, and the agent stays usable.
 {
   const gateway = mockGateway();
   let mode;
@@ -258,7 +241,6 @@ for (const resizeImage of [undefined, (image) => image]) {
     },
   });
   const image = [{ type: "image", data: pngData, mimeType: "image/png" }];
-  // Hook output within the image budgets still counts toward the frame bound.
   mode = "fill";
   await assert.rejects(
     agent.prompt([...image, ...image]).result,
@@ -283,8 +265,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await assert.rejects(createAgent(mockGateway(), { resizeImage: "nope" }), /resizeImage must be a function/);
 }
 
-// A resizeImage that reuses one output buffer for every image still sends
-// each image with the bytes the hook returned for it.
 {
   const gateway = mockGateway();
   const scratch = new Uint8Array(4096);
@@ -304,7 +284,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A pure-image prompt is valid; the placeholder keeps the turn non-empty.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -314,8 +293,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A model without advertised image input never receives the request; the turn
-// fails with the explicit notice instead of crashing or sending the image.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/plain-model" });
@@ -325,8 +302,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A model missing from the catalog cannot confirm image support: same
-// explicit failure, still no image bytes on the wire.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/unlisted-model" });
@@ -336,9 +311,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A proxy that refuses the catalog request leaves image support unknown, so
-// an image-capable model refuses images. With `modelCatalog`, the same model
-// takes the image and the catalog is never requested.
 {
   const model = "sdk/proxied-vision-model";
   const refusing = mockGateway();
@@ -366,8 +338,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await assert.rejects(createAgent(mockGateway(), { modelCatalog: "catalog" }), /modelCatalog must be/);
 }
 
-// Checkpoint/restore round-trips prompt images inside the checkpoint bound:
-// the restored agent re-sends the same bytes on the next turn.
 {
   const gateway = mockGateway();
   const first = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -377,7 +347,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   ]);
   assert.equal(initial.stopReason, "end_turn");
   const checkpoint = await first.checkpoint();
-  // More concurrent checkpoints than the native outbound table holds all succeed.
   const concurrent = await Promise.all(Array.from({ length: 16 }, () => first.checkpoint()));
   for (const bytes of concurrent) assert.deepEqual(Buffer.from(bytes), Buffer.from(checkpoint));
   await first.close();
@@ -393,7 +362,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
   await restored.close();
 
-  // Oversized and empty restore checkpoints fail with the same errors on both backends.
   await assert.rejects(
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
     (error) => error.message === "libfx checkpoint is too large",
@@ -404,8 +372,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   );
 }
 
-// An idle checkpoint is sent before a later prompt, while one queued behind it
-// follows the direct-call rule once that prompt is active.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -418,7 +384,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await assert.rejects(queued, /cannot checkpoint while a prompt is active/);
   for await (const _ of turn) {}
   assert.equal((await turn.result).stopReason, "end_turn");
-  // The rejected call released its place, so the next call is idle again.
   const afterRejected = agent.checkpoint();
   const third = agent.prompt("third");
   assert.ok((await afterRejected).byteLength > 0);
@@ -426,8 +391,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A checkpoint requested from an event handler while another checkpoint's
-// request is being sent waits for it instead of running beside it.
 {
   const gateway = mockGateway();
   const nested = [];
@@ -451,8 +414,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// SDK-side limits reject synchronously with typed errors naming the bound,
-// before any runtime or network work.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -517,7 +478,6 @@ for (const resizeImage of [undefined, (image) => image]) {
     () => agent.prompt(Array.from({ length: 2 }, () => ({ type: "image", data: budgetBlob }))),
     (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
   );
-  // Raw bytes follow the same raw-byte budgets as Blob and base64 input.
   assert.throws(
     () => agent.prompt([{ type: "image", data: new Uint8Array(4 * 1024 * 1024), mimeType: "image/png" }]),
     (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message),
@@ -552,10 +512,6 @@ for (const resizeImage of [undefined, (image) => image]) {
     (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
   );
 
-  // The model request carries images base64 encoded, so text and encoded
-  // images share the 8 MiB frame bound on both backends. Exactly 8 MiB of
-  // encoded image data passes the image budgets but not that bound once text
-  // and the envelope are added, as base64 or as raw bytes.
   const quarter = pngWithEncodedLength(4 * 1024 * 1024);
   for (const data of [quarter, Buffer.from(quarter, "base64")]) {
     assert.throws(
@@ -584,8 +540,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   );
   assert.equal(readMixed, false);
 
-  // Two Blobs that fill the image budget exactly also fill the frame bound
-  // once encoded, so they fail before any Blob read.
   const boundaryBlob = new Blob([Buffer.alloc(3 * 1024 * 1024)], { type: "image/png" });
   assert.throws(
     () => agent.prompt([
@@ -607,10 +561,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// The SDK decodes base64 itself, so non-canonical base64 throws before the
-// turn starts. Kernel-side content validation stays authoritative: a sniffed
-// media type that contradicts the declaration fails the turn with a typed error
-// rather than reaching the model.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -635,7 +585,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// A Blob read failure rejects only that turn and does not send a partial frame.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -654,8 +603,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// Steering during a Blob read waits for the prompt to reach the core on both
-// backends instead of racing ahead of the initial session/prompt.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -675,8 +622,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// Cancel or close while Blob.arrayBuffer() is pending: settle promptly, do not
-// send a late prompt, and leave the agent available for the next turn.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -710,8 +655,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.equal(gateway.state.chatBodies.length, 0);
 }
 
-// A Blob can abort the signal synchronously from arrayBuffer(). The turn must
-// still settle even when the read promise never resolves.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -740,8 +683,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   await agent.close();
 }
 
-// Closing from arrayBuffer() must find an initialized turn result and release
-// the runtime rather than rejecting before it can close stdin.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -768,8 +709,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.equal(gateway.state.chatBodies.length, 0);
 }
 
-// A core exit before or just after Blob bytes arrive rejects the turn and
-// iterator without submitting a prompt or reporting user cancellation.
 for (const timing of ["during-read", "after-read"]) {
   let finishRuntime;
   let finishRead;
@@ -825,8 +764,6 @@ for (const timing of ["during-read", "after-read"]) {
   await agent.close();
 }
 
-// Queued steering must fail if the prompt write throws or the core exits as
-// it accepts the write; neither case may deliver guidance to a dead turn.
 for (const failure of ["write", "exit"]) {
   let finishRuntime;
   let onLine;
@@ -872,7 +809,6 @@ for (const failure of ["write", "exit"]) {
   await agent.close();
 }
 
-// Pre-prompt steering has the same count and byte limits as the core queue.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -892,7 +828,6 @@ for (const failure of ["write", "exit"]) {
   await agent.close();
 }
 
-// A pre-aborted Blob prompt must reject steering immediately.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -906,8 +841,6 @@ for (const failure of ["write", "exit"]) {
   await agent.close();
 }
 
-// Cancellation from the send event must not let a late prompt through after
-// its session/cancel notification.
 {
   const gateway = mockGateway();
   let turn;
@@ -934,8 +867,6 @@ function assertRecovery(body, sourceRefs, files = []) {
   for (const sourceRef of sourceRefs) assert.ok(feedback.includes(sourceRef), `recovery feedback lost ${sourceRef}`);
 }
 
-// Eligible originals, including Blob input and the 8000-pixel boundary, retain
-// their bytes. A source reference must not trigger automatic conversion.
 const mediaTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 for (const [index, mimeType] of mediaTypes.entries()) {
   const bytes = imageHeader(mimeType, 8000);
@@ -999,9 +930,6 @@ for (const resize of [false, true]) {
   await agent.close();
 }
 
-// History, not just the current prompt, determines the pixel limit. Crossing
-// twenty images with three seven-image turns withholds all originals at 2000px
-// without losing source bytes or refs during later turns and checkpoint restore.
 {
   const data = imageHeader("image/jpeg", 3420, 2224).toString("base64");
   const images = Array.from({ length: 21 }, (_, index) => ({ type: "image", data, mimeType: "image/jpeg", sourceRef: `host:history-${String(index + 1).padStart(2, "0")}` }));
@@ -1054,8 +982,6 @@ for (const resize of [false, true]) {
   assertRetainedBytes(await restored21.checkpoint());
   await restored21.close();
 
-  // Below the count boundary, checkpoint restore still re-sends every original
-  // unchanged rather than retaining only refs or a prepared derivative.
   const restored14 = await createAgent(gateway, { model: "sdk/vision-model", checkpoint: checkpoint14 });
   assert.equal((await runPrompt(restored14, "inspect the fourteen originals")).stopReason, "end_turn");
   assert.deepEqual(fileParts(gateway.state.chatBodies[5]), Array.from({ length: 14 }, () => expectedFile));
@@ -1063,8 +989,6 @@ for (const resize of [false, true]) {
   await restored14.close();
 }
 
-// Oversized originals in every supported format are withheld with a recoverable
-// source reference, even when no host tool exists. No synthetic resizer appears.
 for (const [index, mimeType] of mediaTypes.entries()) {
   const sourceRef = `host:oversized-${index}`;
   const gateway = mockGateway();
@@ -1076,8 +1000,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   await agent.close();
 }
 
-// A reference-only prompt stays reference-only on the wire. Per-image overflow
-// drops referenced data before reading a Blob, including misleading size getters.
 {
   let reads = 0;
   class UnreadOversizedBlob extends Blob {
@@ -1108,8 +1030,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   assert.equal(reads, 0);
 }
 
-// Aggregate image budgets and the complete ACP envelope both fall back to refs.
-// A mixed prompt preserves the unreferenced image, not an arbitrarily wider limit.
 {
   let reads = 0;
   class UnreadBlob extends Blob {
@@ -1146,8 +1066,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   assert.equal(reads, 0);
 }
 
-// Refs count toward the existing eight-image bound; 512 UTF-8 bytes of valid
-// metadata (including surrogate pairs and a BOM) are preserved exactly.
 {
   let wire;
   const gateway = mockGateway();
@@ -1163,8 +1081,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   await agent.close();
 }
 
-// Checkpoints retain both reference-only and dimension-withheld originals. A
-// restored host receives the same refs without any SDK-owned source store.
 {
   const refs = ["host:checkpoint-ref", "host:checkpoint-original"];
   const gateway = mockGateway();
@@ -1182,8 +1098,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   await restored.close();
 }
 
-// Existing host execute() tools recover a referenced original. The host, not
-// libfx, creates the smaller bytes. Tool refs also survive checkpoint/restore.
 {
   const sourceRef = "host:tool-original";
   const prepared = imageHeader("image/png", 2000).toString("base64");
@@ -1224,8 +1138,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   await restored.close();
 }
 
-// Rich host results share the existing data/count/frame limits. Referenced
-// overflow falls back to metadata; no-ref and malformed results remain errors.
 {
   const image = (data, sourceRef) => ({ type: "image", mimeType: "image/png", ...(data === undefined ? {} : { data }), ...(sourceRef === undefined ? {} : { sourceRef }) });
   const large = pngWithEncodedLength(5 * 1024 * 1024 + 4);
@@ -1261,8 +1173,6 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   }
 }
 
-// Rich JSON may fit its own result bound but overflow after ACP string escaping.
-// At that last boundary, references survive instead of becoming a generic error.
 for (const referenced of [true, false]) {
   const images = [{ type: "image", data: pngWithEncodedLength(4096), mimeType: "image/png", ...(referenced ? { sourceRef: "host:outer-frame" } : {}) }];
   const text = "x".repeat(8 * 1024 * 1024 - encoded.encode(JSON.stringify({ text: "", images })).length - 32);
@@ -1309,8 +1219,6 @@ for (const referenced of [true, false]) {
   await agent.close();
 }
 
-// A failed recovery tool remains an observable tool error; the withheld source
-// never leaks as an image file and no hidden fallback executor is substituted.
 {
   const sourceRef = "host:failed-recovery";
   const gateway = mockGateway((body, step) => {
@@ -1328,8 +1236,6 @@ for (const referenced of [true, false]) {
   await agent.close();
 }
 
-// Cancellation reaches the host recovery signal, ignores a late rich result,
-// and leaves the agent usable without a follow-up model request for that turn.
 {
   const sourceRef = "host:cancel-recovery";
   let started;

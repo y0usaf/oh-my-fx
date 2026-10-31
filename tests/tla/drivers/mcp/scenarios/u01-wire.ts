@@ -1,8 +1,3 @@
-// U01 wire format, step 6. The real decoder, run by tests/tla/drivers/mcp/labs/wire_lab.zig,
-// against every JSON-RPC example in the MCP specification pages
-// (fixtures/spec-examples.json), plus hand-written cases for ids, malformed input, and oversized
-// messages. U01 has no model, so these cases check exact output instead of
-// traces.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -141,7 +136,6 @@ function wireScenario(name: string, description: string, cases: () => Case[], mi
 }
 
 export const scenarios: Scenario[] = [
-  // The frozen snapshot holds 36 such examples (four more use "..." and aren't JSON).
   wireScenario("u01-spec-examples", "Every JSON-RPC example in the spec snapshot decodes as JSON.parse reads it", specExamples, 36),
   wireScenario("u01-ids", "String and number ids: which ones match the client's, and which are rejected", () => idCases, idCases.length),
   wireScenario("u01-malformed", "Malformed, ambiguous, and too-deep messages fail with the exact error", () => malformedCases, malformedCases.length),

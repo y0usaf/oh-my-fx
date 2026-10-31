@@ -1,20 +1,3 @@
-// Replays LeanUsageDrive behaviors from TLC against the real fx binary.
-//
-//   bun tests/tla/drivers/usage/lean/drive.ts [--traces N] [--depth D] [--seed S] [file...]
-//
-// TLC simulates N random behaviors of tests/tla/usage/LeanUsageDrive.tla (or the given
-// trace files are replayed). Each behavior runs two fx TUIs (p1, p2) in tmux
-// that share one HOME, so one ~/.fx/usage-cache. Identity a and b are two
-// AI Gateway API keys; each process has its own fake gateway that holds every
-// /v1/report request until the behavior says the fetch completes or fails.
-// The usage clock seam (FX_E2E_USAGE_CLOCK_FILE) maps model time to real time:
-// tick n is 23:40 UTC + 5n minutes, so the 60 s floor is one tick, the
-// 15-minute timer three, and UTC midnight falls between ticks 3 and 4.
-//
-// After every step the driver checks the real system against the next model
-// state: which processes started a fetch and whether it read the finished
-// days, what each identity's cache file holds, and what "today" each open
-// dashboard shows. The first difference ends that behavior.
 
 import { createHash } from "node:crypto";
 import {
@@ -69,9 +52,6 @@ async function until<T>(probe: () => T | undefined | false | Promise<T | undefin
   }
 }
 
-// ---------------------------------------------------------------------------
-// The model side
-
 const rec = (v: Value) => v as Record<string, Value>;
 const fetchOf = (s: State, p: Proc): Fetch | null => {
   const f = rec(s.inflight)[p];
@@ -104,9 +84,6 @@ function actionBetween(s: State, t: State): Action {
   }
   throw new Error("no LeanUsageDrive action explains this step");
 }
-
-// ---------------------------------------------------------------------------
-// The real side
 
 function cachePath(home: string, ident: string): string {
   const hash = createHash("sha256").update(`fx-usage-cache-v1\0api_key\0${KEYS[ident]}\0`).digest("hex");
@@ -209,9 +186,6 @@ class Process {
   }
 }
 
-// ---------------------------------------------------------------------------
-// One behavior
-
 async function replay(states: State[]): Promise<{ steps: number }> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-drive-")));
   const home = join(root, "home");
@@ -262,7 +236,6 @@ async function perform(action: Action, s: State, t: State, procs: Record<Proc, P
       await session.sendText("/usage");
       const shown = await until(async () => (await session.capturePane()).includes("usage: API key"));
       if (!shown) throw new Divergence(`${action.p}: /usage did not open`);
-      // Reopening while a fetch is in flight starts nothing new.
       const f = fetchOf(s, action.p) === null ? fetchOf(t, action.p) : null;
       if (f) await proc.claimStart(f);
       return;
@@ -278,7 +251,6 @@ async function perform(action: Action, s: State, t: State, procs: Record<Proc, P
       await proc.claimStart(fetchOf(t, action.p)!);
       return;
     case "Timer":
-      // fx starts it on its own once the clock moved; the request may already be held.
       await proc.claimStart(fetchOf(t, action.p)!);
       return;
     case "Complete": {
@@ -293,8 +265,6 @@ async function perform(action: Action, s: State, t: State, procs: Record<Proc, P
         const first = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1);
         if (utcDay(first) !== utcDay(ms)) await proc.answerNext("month", utcDate(first), utcDate(ms - DAY_MS), 2000);
       }
-      // The worker merges into the cache file and then frees the process for
-      // its next fetch; wait for the merge the model predicts.
       const want = rec(rec(t.cache)[f.ident]) as unknown as CacheRec;
       await until(() => sameCache(readCache(home, f.ident), want));
       return;
@@ -314,9 +284,6 @@ const sameCache = (real: CacheRec, want: CacheRec) =>
 
 async function settleAndCheck(t: State, procs: Record<Proc, Process>, home: string): Promise<void> {
   await sleep(SETTLE_MS);
-  // No fetch the model does not start. fx fires every due timer at once,
-  // while the model takes them one step at a time: a process whose timer is
-  // due may already have sent its first request.
   for (const p of PROCS) {
     const allowed = timerDue(t, p) ? 1 : 0;
     if (procs[p].held.length > allowed) {
@@ -324,7 +291,6 @@ async function settleAndCheck(t: State, procs: Record<Proc, Process>, home: stri
       throw new Divergence(`${p}: fx sent a request the model does not make`, { ranges });
     }
   }
-  // The shared cache file, per identity.
   for (const ident of Object.keys(KEYS)) {
     const want = rec(rec(t.cache)[ident]) as unknown as CacheRec;
     const real = readCache(home, ident);
@@ -332,7 +298,6 @@ async function settleAndCheck(t: State, procs: Record<Proc, Process>, home: stri
       throw new Divergence(`cache for ${ident} differs from the model`, { want, real });
     }
   }
-  // What each open dashboard shows as today (ShowsOwnIdentity, TodayIsToday).
   for (const p of PROCS) {
     if (rec(t.open)[p] !== true) continue;
     const shown = rec(rec(t.shown)[p]);
@@ -345,9 +310,6 @@ async function settleAndCheck(t: State, procs: Record<Proc, Process>, home: stri
     if (!ok) throw new Divergence(`${p}: dashboard shows today ${JSON.stringify(last)}, model shows ${JSON.stringify(want)}`);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Main
 
 function args() {
   const out = { traces: 20, depth: 30, seed: Date.now() % 100_000, files: [] as string[] };

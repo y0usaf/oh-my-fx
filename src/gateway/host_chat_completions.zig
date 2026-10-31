@@ -62,7 +62,6 @@ fn buildRequest(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Req
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
     if (host_stream.deadlineExpired(request.deadline)) return error.Timeout;
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    // The engine never holds this provider's key; the host adds it.
     if (request.credential.credentialSource() != .host_managed) {
         return stream_provider.failResult(error.ConfiguredProviderCredentialRequired);
     }
@@ -171,7 +170,6 @@ test "host chat completions serves only its own provider and lists the declared 
     var context = try Context.init(alloc, fake.transport(), test_provider);
     defer context.deinit(alloc);
 
-    // The engine parses its own copy of the same settings.
     var same = try definitions.Registry.parse_json(alloc, test_provider);
     defer same.deinit(alloc);
     const served = bundle(&context, &same.definitions[0]);

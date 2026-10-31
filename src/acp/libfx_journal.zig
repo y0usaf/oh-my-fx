@@ -270,8 +270,6 @@ pub const Journal = struct {
             .turn_id = self.next_turn_id.slice(),
             .delta = delta,
         } }, self.barrier_next_progress);
-        // The next progress extends this one. Without a copy of its hashes it
-        // carries everything, which is always correct.
         if (self.last_progress) |*last| last.hashes.deinit(session_alloc);
         self.last_progress = null;
         if (hashes.dupe(session_alloc)) |owned| {
@@ -314,17 +312,13 @@ pub const Journal = struct {
         try params.writer.writeByte('}');
         try self.writer.writeNotification(alloc, "libfx/journal_append", params.written());
         self.cursor = next;
-        // Matches the fold: intents and compaction leave the open turn
-        // standing.
         switch (event) {
             .turn_progress => self.progress_open = true,
             .turn_committed, .turn_progress_cleared => {
                 self.progress_open = false;
                 self.last_turn_id = self.open_turn_id;
                 self.open_turn_id = .{};
-                // A turn's steers end with it.
                 self.steers_waiting = 0;
-                // The next turn's first progress carries all of it.
                 if (self.last_progress) |*last| last.stale = true;
             },
             .input_accepted => |input| switch (input.kind) {
@@ -675,7 +669,6 @@ test "inputs taken for a request that never went out are not placed by the next 
     defer progress.deinit(alloc);
 
     try session.notePlaced(alloc, &.{"steer-1"});
-    // Its turn ended before the next progress; the next turn starts.
     try session.endUnplaced(alloc, alloc, "session");
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "steer-1") == null);
@@ -696,7 +689,6 @@ test "a progress places the follow-up its turn runs" {
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expectEqual(@as(usize, 0), session.follow_ups_waiting);
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"inputs\":[\"follow-1\"]") != null);
-    // Nothing is left to settle when the turn ends.
     try session.endUnplaced(alloc, alloc, "session");
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "input_withdrawn") == null);
 }
@@ -737,7 +729,6 @@ test "a turn's id reaches its first progress only, and is the last turn's once t
     try std.testing.expect(session.open_turn_id.slice() == null);
     try std.testing.expectEqualStrings("turn-1", session.last_turn_id.slice().?);
 
-    // A turn the host did not name ends with no last id.
     session.nameNextTurn(null);
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try session.clearProgress(alloc, "session");
@@ -756,7 +747,6 @@ test "a response whose calls never reached the journal is asked for again" {
     try std.testing.expectEqual(session_codec.RecoveryToolState.none, lost.tool_state);
     try std.testing.expectEqualStrings("", lost.assistant_source);
 
-    // Calls the journal recorded are answered instead.
     var recorded = progress;
     recorded.tool_state = .uncertain;
     recorded.assistant_source = @constCast("Let me look that up.");
@@ -764,7 +754,6 @@ test "a response whose calls never reached the journal is asked for again" {
     try std.testing.expectEqual(session_codec.RecoveryToolState.uncertain, recorded.tool_state);
     try std.testing.expectEqualStrings("Let me look that up.", recorded.assistant_source);
 
-    // A response cut off before any call keeps its text to continue from.
     var partial = progress;
     partial.assistant_source = @constCast("The answer is");
     forgetUnrecordedCalls(&partial, 0);
@@ -810,7 +799,6 @@ test "a progress after its turn's first carries only what is new, and the next t
     var progress = try testProgress(alloc);
     defer progress.deinit(alloc);
 
-    // A turn's first progress is one fx waits for; the host hears so.
     session.barrier_next_progress = true;
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     session.barrier_next_progress = false;
@@ -824,7 +812,6 @@ test "a progress after its turn's first carries only what is new, and the next t
     try std.testing.expect(std.mem.find(u8, second, "\"user\"") == null);
     try std.testing.expect(std.mem.find(u8, second, "\"barrier\"") == null);
 
-    // A call's result goes out as it finishes, with nothing waiting for it.
     try session.recordToolResult(alloc, "session", .{ .id = "call-1", .name = "lookup", .failed = false, .output = "done" });
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"tool_result\"") != null);
 
@@ -852,7 +839,6 @@ test "a resumed turn runs again the calls the host asks for and leaves the rest 
     try std.testing.expectEqual(@as(usize, 2), reran);
     try std.testing.expectEqual(@as(usize, 2), ran.items.len);
     const results = answered.execution.tool_steps[0].tool_results;
-    // Every call keeps its place, so results reach the model in its order.
     try std.testing.expectEqualStrings("call-1", results[0].tool_call_id);
     try std.testing.expectEqualStrings("ran again as call-1", results[0].output);
     try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
@@ -880,6 +866,5 @@ test "a resume cancelled during a rerun keeps that call and the later ones answe
     try std.testing.expectEqualStrings("ran again as call-1", results[0].output);
     try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[1].output);
     try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[2].output);
-    // A step index past the turn's steps runs nothing.
     try std.testing.expectEqual(@as(usize, 0), try rerunCalls(alloc, &answered, 5, TestRerunner{ .ids = &ids, .ran = &ran }, null));
 }

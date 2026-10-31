@@ -1401,7 +1401,6 @@ test "planner blanks repository filters and falls back to review when safe git r
     for ([_][]const u8{ "git status", "git diff --stat", "git log --oneline -n 5", "git status --short | wc -l" }) |command| {
         try expectApprovalWithGit(command, false, .linux, .unsafe_git, refused);
     }
-    // Subcommands that are never auto-run keep their own reason.
     try expectApprovalWithGit("git push origin HEAD", false, .linux, .command_owned_input, refused);
     try expectApprovalWithGit("git status --ignored", false, .linux, .unsupported_argument, test_git);
 }

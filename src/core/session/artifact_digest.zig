@@ -127,13 +127,11 @@ test "a v2 handle names its blob by the whole digest and authenticates it" {
     try std.testing.expectEqualStrings(&hex, blobHash(handle).?);
     try std.testing.expect(hasContentDigest(handle, ".bin"));
     try std.testing.expect(handleMatchesContentDigest(handle, ".bin", digest));
-    // No extension, and a kind prefix with its own dashes.
     const image = try blobHandle(alloc, "image-result-", digest, "");
     defer alloc.free(image);
     try std.testing.expectEqualStrings(&hex, blobHash(image).?);
     Sha256.hash("xaved output", &digest, .{});
     try std.testing.expect(!handleMatchesContentDigest(handle, ".bin", digest));
-    // Anything else names no blob.
     for ([_][]const u8{ "result-x.txt", "nodash", "result-" ++ text_utils.repeat("A", 64) ++ ".txt", "result-" ++ text_utils.repeat("a", 63) ++ ".txt" }) |other| {
         try std.testing.expectEqual(@as(?[]const u8, null), blobHash(other));
     }

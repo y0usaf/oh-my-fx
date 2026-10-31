@@ -50,8 +50,6 @@ def steps_for(events):
     for pid in order:
         depth = 0
         mine = [e for e in events if e[0] == pid]
-        # ACP opens its store before tracing starts: its first line is
-        # then a later step, and the process started just before it.
         if mine[0][1] != "StoreOpen":
             steps.append(("Start", "none", "none"))
             depth = 1

@@ -1135,14 +1135,12 @@ test "question prompt submit advances through a multi-entry batch" {
     };
     try prompt.syncFrom(std.testing.allocator, &entries);
 
-    // Submitting entry 0 (selection A1) commits the borrowed label and advances.
     switch (try prompt.apply(std.testing.allocator, .submit)) {
         .decision => |idx| try std.testing.expectEqual(@as(u8, 0), idx),
         else => return error.TestExpectedDecision,
     }
     try std.testing.expectEqual(@as(u8, 1), prompt.current_index);
 
-    // Submitting B2 as the last entry completes the batch.
     prompt.moveChoice(1);
     try std.testing.expectEqualStrings("B2", prompt.selectedLabel().?);
     try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(std.testing.allocator, .submit));
@@ -1305,7 +1303,7 @@ test "moveChoice off freeform preserves buffer for re-entry" {
     try std.testing.expectEqual(@as(u8, 2), currentChoiceIndex(&prompt));
     try std.testing.expectEqualStrings("hi", prompt.entries.items[0].freeform_buffer.items);
 
-    prompt.moveChoice(1); // back to freeform
+    prompt.moveChoice(1);
     try std.testing.expectEqual(@as(u8, 3), currentChoiceIndex(&prompt));
     try std.testing.expect(prompt.isFreeformSelected());
     try std.testing.expectEqualStrings("hi", prompt.entries.items[0].freeform_buffer.items);
@@ -1411,7 +1409,7 @@ test "freeformCursorLeft and Right move cursor inside buffer" {
     prompt.freeformCursorRight();
     prompt.freeformCursorRight();
     prompt.freeformCursorRight();
-    prompt.freeformCursorRight(); // clamps at end
+    prompt.freeformCursorRight();
     try std.testing.expectEqual(@as(usize, 5), prompt.entries.items[0].freeform_cursor);
 }
 
@@ -1664,7 +1662,6 @@ test "compact submission keeps input distinct from actions and choice prompts cl
     try prompt.syncFrom(alloc, &.{entry});
     try std.testing.expect(prompt.isFreeformSelected());
     for ("Decline") |byte| _ = try prompt.apply(alloc, .{ .insert_ascii = byte });
-    // Refresh must preserve the draft and its submission contract.
     try prompt.syncFrom(alloc, &.{entry});
     try std.testing.expectEqual(.all_decided, try prompt.apply(alloc, .submit));
     try std.testing.expectEqualStrings("{\"value\":\"Decline\"}", prompt.entries.items[0].answer.?);

@@ -557,7 +557,6 @@ test "identical failure escalation counts exact repeats within one turn" {
         .name = "edit_file",
         .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"  trajectory?: Trajectory;\\n}\",\"new_string\":\"}\"}",
     };
-    // A new call id with identical arguments is the same action.
     const edit_retry: ToolCall = .{
         .id = "edit-2",
         .name = "edit_file",
@@ -571,17 +570,12 @@ test "identical failure escalation counts exact repeats within one turn" {
     var state: IdenticalFailureEscalationState = .{};
     defer state.deinit(alloc);
 
-    // The first failure never escalates.
     try std.testing.expectEqual(@as(u32, 1), try state.observe(alloc, edit_call, true));
-    // The second and third identical failures escalate with a running count.
     try std.testing.expectEqual(@as(u32, 2), try state.observe(alloc, edit_retry, true));
     try std.testing.expectEqual(@as(u32, 3), try state.observe(alloc, edit_call, true));
-    // Changed arguments are an independent action.
     try std.testing.expectEqual(@as(u32, 1), try state.observe(alloc, changed_args, true));
-    // Successes never escalate and never reset an existing count.
     try std.testing.expectEqual(@as(u32, 0), try state.observe(alloc, edit_call, false));
     try std.testing.expectEqual(@as(u32, 4), try state.observe(alloc, edit_call, true));
-    // Provider-supplied results are not fx-executed and never count.
     const provider_call: ToolCall = .{
         .id = "edit-4",
         .name = "edit_file",
@@ -590,7 +584,6 @@ test "identical failure escalation counts exact repeats within one turn" {
     };
     try std.testing.expectEqual(@as(u32, 0), try state.observe(alloc, provider_call, true));
 
-    // A fresh state (the next turn) starts from zero: no cross-turn leak.
     var next_turn: IdenticalFailureEscalationState = .{};
     defer next_turn.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), try next_turn.observe(alloc, edit_call, true));

@@ -368,8 +368,6 @@ pub const FileIndex = struct {
             self.loading_generation != null or
             self.stop_requested.load(.seq_cst)) return false;
 
-        // The persisted cache is consumed at most once per scope: the first
-        // generation paints from disk, then a real scan replaces it.
         const roots_digest = rootsDigest(self.roots);
         const allow_cache = if (self.cache_attempted_digest) |attempted|
             !std.mem.eql(u8, &attempted, &roots_digest)
@@ -449,8 +447,6 @@ pub const FileIndex = struct {
                 _ = self.startLoad(alloc);
             }
         }
-        // A cache-painted generation is a preview only: one real scan follows
-        // it and replaces it, unless a pending scope already started that load.
         if (adopted_from_cache and
             !self.stop_requested.load(.seq_cst) and
             self.thread == null)
@@ -837,9 +833,6 @@ fn loadGeneration(
     };
     defer refreshed.deinit(alloc);
 
-    // Persist before the fill so even a canceled publish leaves a warm
-    // snapshot. A scope with an unavailable root is not saved, so its next
-    // load scans again.
     if (snapshot_path) |path| {
         if (refreshed.scans.len > 0 and refreshed.trees.len == roots.len) {
             indexer.saveSnapshot(arena, path, refreshed.trees) catch |err| {
@@ -1345,10 +1338,6 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
     while (candidate_index < total) : (candidate_index += 1) {
         const path_mask = generation.char_masks[candidate_index];
         const base_start = generation.basename_starts[candidate_index] - generation.offsets[candidate_index];
-        // Once the worst kept result has the best score a non-exact match can
-        // reach, only an exact match or a shorter path can still enter, so
-        // longer paths are not scored. Once every kept result is exact, only
-        // exact matches can enter.
         const length_limit: ?usize = if (filled < top_cap) null else limit: {
             const worst = ranked[worst_slot];
             if (worst.score.exact_fit) break :limit 0;
@@ -1357,14 +1346,10 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
             }
             break :limit null;
         };
-        // Skip the placements that can no longer enter the kept results; the
-        // results stay those of scoring every path.
         const needed: Needed = if (filled < top_cap) .{} else needed: {
             const worst = ranked[worst_slot].score;
             break :needed .{
-                // A placement ending in a folder ranks below every name match.
                 .folder = !(worst.exact_fit or worst.name_fit),
-                // A placement starting in a folder scores at most `max_crossing`.
                 .crossing = !(worst.exact_fit or (worst.name_fit and worst.quality > max_crossing)),
             };
         };
@@ -1402,11 +1387,6 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
     return filled;
 }
 
-// Best-alignment scoring with fzf's v2 path-scheme score. A placement's score
-// is defined by `scoreAlignment`; `alignBest` returns the placement with the
-// highest score and, among those, the earliest first position. The dynamic
-// program is exact because its state carries the run bonus that fzf's
-// consecutive rule depends on, normalized to one of four values.
 const max_align_cells: usize = 4096;
 const run_slot_count: usize = 4;
 const run_slot_bonus = [run_slot_count]i32{ 4, 7, 8, 9 };
@@ -1544,8 +1524,6 @@ fn alignBest(
     std.debug.assert(end_min >= range_start);
 
     if (m == 1 and text.len - end_min <= max_align_cells) {
-        // The earliest occurrence with the highest bonus, in one scan: the
-        // window fits the cell budget, and no bonus beats the one after `/`.
         var best_position: ?usize = null;
         var best_bonus: i32 = 0;
         var j = end_min;
@@ -1582,20 +1560,16 @@ fn alignBest(
     }
     if (scratch.backward[m - 1] < end_min) return null;
     if (scratch.forward[m - 1] < end_min) {
-        // Still after forward[m - 2], which lies before the old forward[m - 1].
         var last = end_min;
         while (text[last] != query[m - 1]) last += 1;
         scratch.forward[m - 1] = @intCast(last);
     }
 
-    // Both greedy scans agree only when a single placement exists.
     if (std.mem.eql(u16, scratch.forward[0..m], scratch.backward[0..m])) {
         @memcpy(scratch.positions[0..m], scratch.forward[0..m]);
         return scoreAlignment(path, byte_offsets, range_start, scratch.positions[0..m]);
     }
 
-    // Row r may only place query[r] in forward[r]..backward[r]. The cell budget
-    // is defined on those window widths.
     var cells: usize = 0;
     for (scratch.forward[0..m], scratch.backward[0..m]) |first, last| cells += @as(usize, last) - first + 1;
     if (cells > max_align_cells) {
@@ -1603,7 +1577,6 @@ fn alignBest(
         return scoreAlignment(path, byte_offsets, range_start, scratch.positions[0..m]);
     }
 
-    // Sparse rows: one cell per position where query[r] matches inside its window.
     var entries: usize = 0;
     for (0..m) |row| {
         scratch.row_offsets[row] = @intCast(entries);
@@ -1639,7 +1612,6 @@ fn alignBest(
                 scratch.starts[cell + slot] = @intCast(j);
                 continue;
             }
-            // Fold in every predecessor at least two positions back.
             while (next_gap < prev_end and @as(usize, scratch.columns[next_gap]) + 2 <= j) : (next_gap += 1) {
                 const prev_cell = next_gap * run_slot_count;
                 const shift: i32 = scratch.columns[next_gap];
@@ -1727,7 +1699,6 @@ fn alignBest(
 const name_bonus: i32 = 4;
 
 comptime {
-    // `maxCrossingQuality` assumes no character earns more than this bonus.
     for ([_]i32{ bonus_boundary, bonus_non_word, bonus_camel_123, bonus_consecutive, bonus_boundary_white }) |bonus| {
         std.debug.assert(bonus <= bonus_boundary_delimiter);
     }
@@ -1799,12 +1770,9 @@ fn choosePlacement(
             .end_min = base_start,
         };
     }
-    // Without a placement in the name, a path that does not hold the letters
-    // in order has no other placement either; one scan settles it.
     if (best == null and query.len > 1 and !isSubsequence(T, text, query)) return null;
     const crossing_can_win = if (best) |inside| inside.alignment.quality < maxCrossingQuality(T, query) else true;
     if (needed.crossing and base_start > 0 and query.len > 1 and crossing_can_win) {
-        // text[base_start - 1] is the `/` before the name.
         const folder_start = if (std.mem.findScalarLast(T, text[0 .. base_start - 1], '/')) |slash| slash + 1 else 0;
         if (alignBest(T, text, path, byte_offsets, folder_start, base_start, query, scratch)) |crossing| {
             if (best == null or crossing.quality > best.?.alignment.quality) {
@@ -1858,7 +1826,6 @@ fn scoreAsciiMatchWith(
     if (query.len == 0 or path.len == 0) return null;
     const base_start: usize = basename_start;
     const exact_fit = exactFit(u8, path_lower, path_lower[base_start..], query);
-    // An exact match always enters, so it is always scored in full.
     const placement = choosePlacement(u8, path_lower, path, null, base_start, query, scratch, if (exact_fit) .{} else needed) orelse return null;
     return scoreOf(exact_fit, placement);
 }
@@ -1931,7 +1898,6 @@ fn reconstructMatchSpans(
     const scalars = path_scratch.scalars[0..decoded.scalar_count];
     const byte_offsets = path_scratch.byte_offsets[0 .. decoded.scalar_count + 1];
     const placement = choosePlacement(u21, scalars, path, byte_offsets, decoded.basename_scalar_start, query, align_scratch, .{}) orelse return null;
-    // Rerun the chosen search: a later search in the choice reuses the positions.
     _ = alignBest(u21, scalars, path, byte_offsets, placement.range_start, placement.end_min, query, align_scratch) orelse return null;
     for (align_scratch.positions[0..query.len], matched_offsets[0..query.len]) |position, *offset| {
         offset.* = byte_offsets[position];
@@ -2132,7 +2098,6 @@ test "countAndSize applies the same filters as the fill pass" {
     const long_path = text_utils.repeat("a", max_path_len + 1);
     const raw = "ok.zig\n" ++ long_path ++ "\n\nother.md\n";
     const totals = countAndSize(.{ .file_raw = raw });
-    // "ok.zig" + "" (empty) + long_path (too long) + "other.md" -> 2 kept.
     try std.testing.expectEqual(@as(u32, 2), totals.n);
     try std.testing.expectEqual(@as(u32, "ok.zig".len + "other.md".len), totals.bytes);
 }
@@ -2284,7 +2249,6 @@ test "added-root candidates drop the same paths as primary-root ones" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const primary = [_]indexer.Entry{.{ .path = "main.zig", .kind = .file }};
-    // Only a damaged snapshot holds such paths; a scan never produces them.
     const added = [_]indexer.Entry{
         .{ .path = ".git/config", .kind = .file },
         .{ .path = "a/../../outside", .kind = .file },
@@ -2575,7 +2539,6 @@ test "a match across the file's folder and its name ranks above letters scattere
 }
 
 test "a name match beats a match of the same shape through the folder" {
-    // Without name_bonus, `ab/cd` scores two points above `ab-cd`.
     try expectFirstSearchPath("src/ab/cd.ts\nsrc/x/ab-cd.ts\n", "abcd", "src/x/ab-cd.ts");
 }
 
@@ -2591,8 +2554,6 @@ test "a match may start in the file's own folder but not further up" {
     var search: TestSearchBuffer(4) = .{};
     const results = try search.run(&index, "abcd");
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    // `ab/x/cd.ts` scores higher, but only by crossing from its grandparent,
-    // so it ranks as a folder match below a scattered name match.
     try std.testing.expectEqualStrings("zz/x-a-b-c-d.ts", results[0].path);
 }
 
@@ -2703,7 +2664,6 @@ test "best alignment equals a brute-force search over a small alphabet" {
                             q /= query_alphabet.len;
                         }
                         const brute = bruteForceAlignment(text[0..text_len], lower[0..text_len], range_start, end_min, query[0..query_len]);
-                        // The pruning bound holds for every placement that crosses into the name.
                         if (brute.crossing_peak) |peak| try std.testing.expect(peak <= maxCrossingQuality(u8, query[0..query_len]));
                         const expected = brute.best;
                         const actual = alignBest(u8, lower[0..text_len], text[0..text_len], null, range_start, end_min, query[0..query_len], scratch);
@@ -2767,7 +2727,6 @@ fn expectPrunedRankingMatchesFullScoring(raw: []const u8, query: []const u8) ![]
     }.less);
     try std.testing.expectEqual(@min(scored.items.len, max_search_results), results.len);
     for (results, scored.items[0..results.len]) |result, expected| try std.testing.expectEqualStrings(expected.path, result.path);
-    // The first result's path lives in `raw`, which the caller owns.
     const first = scored.items[0].path;
     return first;
 }
@@ -2787,9 +2746,6 @@ test "pruned ranking keeps short queries over crowded names" {
     const alloc = std.testing.allocator;
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(alloc);
-    // More than 64 names at the top score for `s` and `st`, at many path
-    // lengths and with equal-length ties, then shorter and exact paths that
-    // arrive after the kept results are full.
     for (0..90) |i| try raw.print(alloc, "pkg/{d}/st{d}.zig\n", .{ i % 7, i });
     for (0..40) |i| try raw.print(alloc, "deep/nested/folder/{d}/stage{d}.md\n", .{ i, i });
     for (0..30) |i| try raw.print(alloc, "a/sx{d}.ts\nb/ts{d}.ts\n", .{ i, i });
@@ -2812,8 +2768,6 @@ test "pruned ranking keeps folder-and-name matches" {
     const alloc = std.testing.allocator;
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(alloc);
-    // Name matches of every strength, matches through the own folder, matches
-    // that only end in a folder, and perfect names that end the crossing search.
     for (0..40) |i| try raw.print(alloc, "pkg/{d}/vercel-error{d}.ts\n", .{ i, i });
     for (0..30) |i| try raw.print(alloc, "docs/{d}/vercel-json/clean{d}.mdx\n", .{ i, i });
     for (0..30) |i| try raw.print(alloc, "vercel/cle/x{d}/z.md\n", .{i});
@@ -2821,7 +2775,6 @@ test "pruned ranking keeps folder-and-name matches" {
     for (0..70) |i| try raw.print(alloc, "lib/{d}/vercle{d}.ts\n", .{ i, i });
     try raw.appendSlice(alloc, "apps/vercle.ts\n");
     try std.testing.expectEqualStrings("apps/vercle.ts", try expectPrunedRankingMatchesFullScoring(raw.items, "vercle"));
-    // Without the perfect names the crossing search is never skipped by rank.
     const cut = std.mem.find(u8, raw.items, "lib/0/").?;
     _ = try expectPrunedRankingMatchesFullScoring(raw.items[0..cut], "vercle");
 }
@@ -3277,8 +3230,6 @@ test "search rejects queries longer than max_path_len" {
 
 test "persisted file index paints a stale preview and the real scan replaces it" {
     const alloc = std.testing.allocator;
-    // The tree must live outside this repository: repo-contained temp dirs
-    // become git-authoritative, and a git failure would replace the walk.
     var random_suffix: [8]u8 = undefined;
     io_mod.getIo().random(&random_suffix);
     const base = try alloc.print("/tmp/fx-fileidx-{s}", .{std.fmt.bytesToHex(random_suffix, .lower)});
@@ -3338,7 +3289,6 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     const scope = workspace_access.AccessScope.primaryOnly(root);
     const roots = [_][]const u8{root};
 
-    // First launch: real scan, no cache yet.
     var first = FileIndex{};
     defer first.deinit(alloc);
     first.ensureScopeEpoch(alloc, scope, 1);
@@ -3358,14 +3308,11 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     defer cached.deinit();
     try std.testing.expect(cached.trees[0].entries.len > 0);
 
-    // The tree changes between launches.
     {
         var file = try work_dir.createFile(zio, "added.zig", .{ .truncate = true });
         file.close(zio);
     }
 
-    // Second launch: the cache paints one preview generation, then the real
-    // scan replaces it with the added file.
     var second = FileIndex{};
     defer second.deinit(alloc);
     second.ensureScopeEpoch(alloc, scope, 2);

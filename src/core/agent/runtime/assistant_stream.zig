@@ -327,9 +327,6 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
     }
     publishTurnPhase(stream_ctx, .running);
     switch (preflight) {
-        // Published last: the flush above can push the response's trailing
-        // newline, and any text landing after the notice reopens the response
-        // row.
         .ineligible => {},
         .eligible => |metadata| stream_ctx.provisional_statuses.publish(
             stream_ctx.hooks,
@@ -1426,9 +1423,6 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer environ.deinit();
     try environ.put(ansi_span_fixture_env, "1");
 
-    // The fixture reaches the shell tool, which imports the `test_paths`
-    // module that `zig build test` generates, so the nested compile needs the
-    // same module.
     const test_paths = @import("test_paths");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1570,8 +1564,6 @@ test "streamed tool start flushes presentation before separator and lifecycle" {
             try std.testing.expectEqual(StreamTraceEntry{ .progress = 1 }, capture.trace.items[4]);
         } else {
             try std.testing.expectEqual(@as(usize, 0), capture.lifecycle_events.items.len);
-            // The working phase lands after the separator: text arriving after
-            // it would hand the activity row back to the response.
             try std.testing.expectEqual(@as(usize, 3), capture.trace.items.len);
             try std.testing.expectEqual(StreamTraceEntry{ .text = 0 }, capture.trace.items[0]);
             try std.testing.expectEqual(StreamTraceEntry{ .text = 1 }, capture.trace.items[1]);

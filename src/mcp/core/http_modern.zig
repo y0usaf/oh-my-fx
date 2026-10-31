@@ -244,10 +244,8 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
     if (event == .relisted) w.relisting = false;
     for (out.effects()) |effect| switch (effect) {
         .post => {
-            // ReissueNewId holds by construction: each post is a new request.
             w.posts += 1;
             w.posted = true;
-            // NoCallResent: a call is posted once, plus one retry after -32020.
             if (x.kind == .call) try testing.expect(w.posts <= 1 + w.relists);
             try testing.expect(w.posts <= x.config.max_attempts + w.relists);
         },
@@ -262,17 +260,13 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
             w.closed = true;
         },
         .deliver => |d| {
-            // AtMostOneOutcome.
             w.delivered += 1;
             try testing.expect(w.delivered <= 1);
-            // MaybeRanOnlyForLostCalls.
             if (d.maybe_ran) try testing.expect(d.outcome == .lost and x.kind == .call);
-            // CancelByClose: a cancel closes the stream first.
             if (d.outcome == .cancelled) try testing.expect(w.closed);
             if (event == .cancel) w.cancelled = true;
         },
     };
-    // Where the model has no choice, the core must act.
     if (event == .stream_broken and before.phase == .posted and x.kind == .call) try testing.expectEqual(Phase.lost, x.phase);
     if (event == .cancel) try testing.expect(x.phase == .cancelled);
     if (event == .relisted and !event.relisted) try testing.expectEqual(Phase.done, x.phase);
@@ -306,8 +300,6 @@ test "every request ends once the server answers or breaks (EveryRequestEnds)" {
         var x: Exchange = .init(.{ .max_attempts = 3 }, if (random.boolean()) .call else .idempotent);
         var w: World = .{};
         for (0..random.uintLessThan(usize, 12)) |_| try apply(&x, &w, moves[random.uintLessThan(usize, moves.len)]);
-        // The environment keeps answering what is pending: an attempt breaks,
-        // gets -32020, or gets its result; a re-list ends.
         for (0..16) |_| {
             if (x.done()) break;
             const posted = [_]Event{ .stream_broken, .{ .answer = .mismatch }, .{ .answer = .result } };

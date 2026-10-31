@@ -381,7 +381,6 @@ test "capability resolver refreshes expired snapshots at the owner boundary and 
     try resolver.refreshIfDue(alloc, provider, input);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     resolver.last_attempt_ms -= 60_000;
-    // Worker capability reads keep the established snapshot until its owner refreshes.
     _ = try resolver.resolve(alloc, provider, input, "provider/model", .{});
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try resolver.refreshIfDue(alloc, provider, input);

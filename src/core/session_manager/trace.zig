@@ -150,7 +150,7 @@ fn readDisk(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) !Disk
     var lines = std.mem.splitScalar(u8, data, '\n');
     var complete: u64 = 0;
     while (lines.next()) |line| {
-        if (lines.index == null) break; // the part after the last newline
+        if (lines.index == null) break;
         complete += 1;
         const seq: i64 = if (schema.parseHeader(line)) |h|
             std.math.cast(i64, h.seq) orelse -1
@@ -180,9 +180,6 @@ test "the disk abstraction counts a torn tail and parses seqs" {
     try std.testing.expect(!disk.tail_done);
     try std.testing.expectEqualSlices(i64, &.{ 1, -1 }, disk.seqs);
 }
-
-// ---------------------------------------------------------------------------
-// TurnLifecycle, for any number of sessions and across processes
 
 const session_mod = @import("session.zig");
 const log_mod = @import("log.zig");
@@ -247,7 +244,7 @@ pub const TurnTraces = struct {
         const bytes = Io.Dir.cwd().readFileAlloc(t.io, path, t.gpa, .limited(16 << 20)) catch |err| switch (err) {
             error.FileNotFound => {
                 t.gpa.free(path);
-                return; // the worker died before this session's first event
+                return;
             },
             else => return err,
         };
@@ -270,7 +267,6 @@ pub const TurnTraces = struct {
             .status = status,
             .fresh = fresh,
         });
-        // Crash applies only to an open session (the spec's guard).
         if (std.mem.eql(u8, status, "open")) t.crash(id);
     }
 

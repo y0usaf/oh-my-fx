@@ -154,7 +154,6 @@ fn percentOf(tokens: usize, percent: usize) usize {
 fn usableInputTokens(capabilities: model_capabilities.Capabilities) ?usize {
     const context_window = capabilities.context_window orelse return null;
     const context_tokens: usize = @intCast(context_window);
-    // Reserve exactly what the request asks for; that limit is always below the window.
     const output_tokens: usize = model_capabilities.requestOutputTokens(capabilities) orelse return context_tokens;
     return context_tokens - output_tokens;
 }
@@ -337,8 +336,6 @@ fn split(
         selectRecentContext(combined.items, kept_tokens, input_capacity, route, max_kept_turns);
     var cut = recent.cut;
     if (active) |turn| {
-        // The unfinished turn lives outside `history`; compacting all of it
-        // means cutting after its last completed exchange.
         const active_index = history_range.rawHistoryTurnCount(history);
         if (cut.turns > active_index) cut = .{
             .turns = active_index,
@@ -382,11 +379,8 @@ test "retained context budgets provider replay on completed exchanges" {
         .assistant = @constCast(""),
         .execution = .{ .tool_steps = &steps },
     } }};
-    // Counted for the model that wrote it, the replay makes the newest step
-    // larger than the kept budget, so all of it is compacted.
     const same_model: model_provider.ProviderSelection = .{ .provider = .gateway, .model = "fixture/model" };
     try testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, selectRecentContext(&history, 5_990, 119_808, same_model, max_kept_turns).cut);
-    // Another model never receives it, so the steps are small and two stay.
     const other_model: model_provider.ProviderSelection = .{ .provider = .gateway, .model = "fixture/other" };
     const kept = selectRecentContext(&history, 5_990, 119_808, other_model, max_kept_turns);
     try testing.expectEqual(@as(usize, 1), kept.cut.tool_steps);
@@ -422,11 +416,7 @@ test "retained context keeps or compacts a parallel tool exchange whole without 
         .{ .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") } },
         .{ .assistant = .{ .user = .{ .text = @constCast("current request") }, .assistant = @constCast(""), .execution = .{ .tool_steps = @constCast(&steps) } } },
     };
-    // Room for both results keeps the current turn; the oldest turn is
-    // always compacted.
     try testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, selectRecentContext(&history, 100_000, null, selection, max_kept_turns).cut);
-    // Too little room for both compacts the exchange whole, never one result
-    // of it, and so does a model that could not take it.
     try testing.expectEqual(Recent{ .cut = .{ .turns = 2 } }, selectRecentContext(&history, 5000, null, selection, max_kept_turns));
     try testing.expectEqual(Recent{ .cut = .{ .turns = 2 } }, selectRecentContext(&history, 100_000, 10_000, selection, max_kept_turns));
     try testing.expectEqualStrings(body, results[0].output);
@@ -436,7 +426,6 @@ test "retained context keeps or compacts a parallel tool exchange whole without 
 test "retained context keeps at most the requested number of turns" {
     var history: [6]HistoryTurn = undefined;
     for (&history) |*turn| turn.* = .{ .assistant = .{ .user = .{ .text = @constCast("question") }, .assistant = @constCast("answer") } };
-    // The oldest turn is always compacted.
     try testing.expectEqual(@as(usize, 1), selectRecentContext(&history, 100_000, null, selection, 6).cut.turns);
     try testing.expectEqual(@as(usize, 2), selectRecentContext(&history, 100_000, null, selection, 4).cut.turns);
 }
@@ -453,7 +442,6 @@ test "automatic compaction starts at the configured share of usable input" {
 test "the compacted text may use half the compaction point, less the fixed part and the kept turns" {
     const size: Size = .{ .compact_at_tokens = 100_000, .usable_tokens = 125_000, .fixed_tokens = 10_000 };
     try testing.expectEqual(@as(usize, 35_000), size.compactedTokens(5_000));
-    // A fixed part that fills the half leaves a quarter of it.
     const crowded: Size = .{ .compact_at_tokens = 100_000, .usable_tokens = 125_000, .fixed_tokens = 60_000 };
     try testing.expectEqual(@as(usize, 12_500), crowded.compactedTokens(0));
     const unknown: Size = .{ .compact_at_tokens = null, .usable_tokens = null };
@@ -461,21 +449,13 @@ test "the compacted text may use half the compaction point, less the fixed part 
 }
 
 test "the kept turns get a share of a fifth of the usable input, less the fixed part" {
-    // 1,000,000 usable, compacting at 80%: the whole request may then use
-    // 200,000, of which 12,000 is fixed.
     const large = Size{ .compact_at_tokens = 800_000, .usable_tokens = 1_000_000, .fixed_tokens = 12_000 };
     try testing.expectEqual(@as(usize, 200_000), large.afterTokens());
     try testing.expectEqual(@as(usize, 188_000), large.conversationTokens());
-    // A low compaction point keeps the room at half of it, so compaction
-    // always frees room.
     try testing.expectEqual(@as(usize, 50_000), (Size{ .compact_at_tokens = 100_000, .usable_tokens = 1_000_000 }).afterTokens());
-    // An unmeasured fixed part is taken as half the room, and a fixed part
-    // that fills the room still leaves a quarter of it.
     try testing.expectEqual(@as(usize, 100_000), (Size{ .compact_at_tokens = 800_000, .usable_tokens = 1_000_000 }).conversationTokens());
     try testing.expectEqual(@as(usize, 50_000), (Size{ .compact_at_tokens = 800_000, .usable_tokens = 1_000_000, .fixed_tokens = 190_000 }).conversationTokens());
     try testing.expectEqual(std.math.maxInt(usize), (Size{ .compact_at_tokens = null, .usable_tokens = null }).conversationTokens());
-    // When the provider counts a third more tokens than fx estimates, the
-    // compactor's estimated room shrinks to match.
     var counted_more = large;
     counted_more.correction = .{ .estimated = 30_000, .measured = 40_000 };
     try testing.expectEqual(@as(usize, 141_000), counted_more.conversationTokens());
@@ -555,8 +535,6 @@ test "what stays after the cut includes the rest of an unfinished turn" {
     };
     const window = try split(arena_state.allocator(), &.{}, turn, 800, 4_000, selection);
     try testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, window.cut);
-    // The unfinished turn is not in the history, so nothing of it is retained
-    // there, but its newest call stays in the conversation.
     try testing.expectEqual(@as(usize, 0), window.retained_history.len);
     try testing.expectEqual(@as(usize, 1), window.kept.len);
     const kept_steps = window.kept[0].assistant.execution.tool_steps;
@@ -569,26 +547,21 @@ test "nothing is compacted unless it is due or required" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const history = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("hi") }, .assistant = @constCast("hello") } }};
-    // One small turn fits the kept budget: nothing to compact.
     try testing.expect(try choose(arena, &history, null, .{ .compact_at_tokens = 100_000, .usable_tokens = 120_000 }, selection, .{}) == null);
-    // A request the model cannot take forces everything into the summary.
     const forced = (try choose(arena, &history, null, .{ .compact_at_tokens = 100_000, .usable_tokens = 120_000, .request_tokens = 130_000 }, selection, .{})).?;
     try testing.expectEqual(@as(usize, 0), forced.kept_tokens);
     try testing.expectEqual(@as(usize, 1), forced.older.len);
-    // With nothing left to compact, the request cannot be sent.
     try testing.expectError(error.ContextCapacityExceeded, choose(arena, &.{}, null, .{ .compact_at_tokens = 100_000, .usable_tokens = 120_000, .overflow = true, .request_tokens = 130_000 }, selection, .{}));
 }
 
 test "a summary request may use the usable input, less after an overflow" {
     try testing.expectEqual(std.math.maxInt(usize), (Size{ .compact_at_tokens = null, .usable_tokens = null }).summaryRequestTokens());
     try testing.expectEqual(@as(usize, 120_000), (Size{ .compact_at_tokens = 96_000, .usable_tokens = 120_000, .request_tokens = 110_000 }).summaryRequestTokens());
-    // The provider rejected an estimated 100,000 tokens.
     try testing.expectEqual(@as(usize, 75_000), (Size{ .compact_at_tokens = 96_000, .usable_tokens = 120_000, .request_tokens = 100_000, .overflow = true }).summaryRequestTokens());
 }
 
 test "a request after the conversation gets what the conversation leaves" {
     try testing.expectEqual(@as(?usize, 10_000), (Size{ .compact_at_tokens = 96_000, .usable_tokens = 120_000, .request_tokens = 110_000 }).roomAfterConversation());
-    // In fx's estimate when the provider counts a third more.
     try testing.expectEqual(@as(?usize, 7_500), (Size{ .compact_at_tokens = 96_000, .usable_tokens = 120_000, .request_tokens = 110_000, .correction = .{ .estimated = 30_000, .measured = 40_000 } }).roomAfterConversation());
     try testing.expectEqual(@as(?usize, null), (Size{ .compact_at_tokens = 96_000, .usable_tokens = 120_000 }).roomAfterConversation());
     try testing.expectEqual(@as(?usize, null), (Size{ .compact_at_tokens = 96_000, .usable_tokens = 120_000, .request_tokens = 120_000 }).roomAfterConversation());

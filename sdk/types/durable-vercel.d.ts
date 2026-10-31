@@ -1,5 +1,3 @@
-// `libfx/durable-vercel` (durable/vercel.mjs): sessions in Vercel's World,
-// the store and queue behind Vercel Workflow, which libfx bundles.
 import type { Durability } from "./libfx.cjs";
 
 export type { Durability } from "./libfx.cjs";

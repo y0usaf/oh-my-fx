@@ -1,14 +1,3 @@
-// Bun driver for the MCP-v2 engine models in tests/tla/mcp/.
-//
-// Builds the binaries the selected scenarios need, runs each scenario with an
-// isolated HOME and MCPV2_TRACE, checks every expected trace through the
-// bridge, and keeps all evidence under <out>/<unit>/<case>/, where <out> is a
-// fresh folder under FX_TLA_OUT or the system temp folder.
-//
-// Usage: bun tests/tla/drivers/mcp/driver.ts [--unit S05] [--case name] [--repeat N] [--next] [--list]
-//
-// The binaries are labs built from labs/ against this checkout's src/mcp/.
-// Exit: 0 every case passed, 1 a case failed, 2 usage or tooling error.
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -176,8 +165,6 @@ async function main(): Promise<number> {
     for (const s of scenarios) console.log(`${s.unit} ${s.name.padEnd(36)} ${s.description}`);
     return 0;
   }
-  // engine_lab is written for the next MCP-v2 version and does not build
-  // against this checkout's src/mcp/ yet. Its scenarios run only with --next.
   const nextOnly = (s: Scenario) => s.needs.includes("engine_lab");
   if (!args.includes("--next")) {
     const later = scenarios.filter(nextOnly);
@@ -192,7 +179,6 @@ async function main(): Promise<number> {
   const id = runId();
   const out = outDir("mcp");
   const needs = [...new Set(scenarios.flatMap((s) => s.needs))].sort();
-  // mkdtemp, not a name from the run id: the driver runs what it builds here.
   const binDir = mkdtempSync(join(tmpdir(), `mcpv2-bin-${id}-`));
   const built = build(needs, binDir);
   const environment = { runId: id, treeSha256: treeHash(), binaries: built, bun: Bun.version, args };

@@ -169,8 +169,6 @@ pub const TerminalState = struct {
 
     pub fn queryCursorPosition(self: TerminalState) !CursorPosition {
         if (comptime builtin.target.os.tag == .wasi) {
-            // JavaScript hosts provide a fresh terminal surface rather than an
-            // existing shell viewport, so there are no launch rows to preserve.
             return .{ .row = 1, .col = 1 };
         }
         var stdout_file = std.Io.File.stdout();
@@ -305,11 +303,6 @@ fn tmuxScreenIsClear(alloc: Allocator, pane: []const u8) !bool {
 }
 
 fn runTmuxHistoryClear(alloc: Allocator, pane: []const u8) !void {
-    // clear-history also dismisses tmux pane modes. In particular, choose-tree
-    // zooms a split pane and triggers our resize reset while the chooser is open.
-    // Decide inside tmux, not with a separate client-side mode query. -C runs
-    // tmux commands, not a shell; only tmux's own pane_id enters command text.
-    // Keep the explicit target: nested commands need not inherit run-shell's -t.
     const argv = [_][]const u8{
         "tmux",                                          "run-shell", "-C", "-t", pane,
         "#{?pane_in_mode,,clear-history -t #{pane_id}}",
@@ -726,10 +719,6 @@ test "reconstructive paint re-emits a full transcript in order" {
 }
 
 test {
-    // Pull adjacent UI test files into the test binary. Declaring
-    // imports inside a test block keeps them out of release builds
-    // (`zig build`) but still lets `zig build test` discover and run
-    // their test blocks.
     _ = @import("render_engine/terminal_diff.zig");
     _ = @import("../core/terminal/engine.zig");
     _ = @import("resize_tests.zig");

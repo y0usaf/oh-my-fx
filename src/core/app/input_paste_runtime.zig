@@ -371,7 +371,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
         pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
 
-            // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
                 if (!modelPickerBorrowsComposer(app)) {
                     try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);

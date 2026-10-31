@@ -50,15 +50,10 @@ def startup_file(kind, marker, delay):
 
 def write_home(home, marker, delay):
     (home / ".fx").mkdir(parents=True, mode=0o700)
-    # Background title generation would consume one fixture response and shift
-    # the call accounting, so the fixture profile keeps titles off.
     (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0, "session_titles": False}))
     for index in range(PATH_EDITS):
         (home / f"bench-path/d{index:02d}").mkdir(parents=True)
     (home / marker).mkdir()
-    # zsh -l -i reads .zshrc once per start. bash --login reads only
-    # .bash_profile, which sources .bashrc, and an interactive non-login bash
-    # reads .bashrc directly, so the counter lives in .bashrc.
     (home / ".zshrc").write_text(startup_file("zsh", marker, delay))
     (home / ".bashrc").write_text(startup_file("bash", marker, delay))
     (home / ".bash_profile").write_text('. "$HOME/.bashrc"\n')
@@ -132,8 +127,6 @@ def main():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        # Headers and body go out in separate writes. With Nagle on, the body
-        # waits for the client's delayed ACK, about 40 ms per reply on Linux.
         disable_nagle_algorithm = True
 
         def log_message(self, *_):
@@ -173,7 +166,6 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FX_", "OPENAI_", "GROK_", "XAI_", "AI_GATEWAY_", "VERCEL_"))}
-    # These would redirect or add startup files outside the isolated HOME.
     for key in ("ZDOTDIR", "BASH_ENV", "ENV"):
         env.pop(key, None)
     base_url = f"http://127.0.0.1:{server.server_port}"

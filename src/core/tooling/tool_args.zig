@@ -2,8 +2,6 @@ const std = @import("std");
 
 pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std.json.ObjectMap {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, args_json, .{});
-    // The returned object map is backed by the parse allocation; callers should
-    // use an arena or allocator lifetime that outlives all borrowed values.
     if (parsed.value != .object) return error.InvalidToolArguments;
     return parsed.value.object;
 }

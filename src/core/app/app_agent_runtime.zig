@@ -844,8 +844,6 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
-            // The request arena retains the change notice, which outlives this
-            // function inside `messages`; only the snapshot names are released.
             defer report.snapshot.deinit(arena);
             const section = try mcp_model_catalog.render(arena, report.snapshot);
             if (section.text.len > 0) {
@@ -1083,7 +1081,6 @@ pub fn Runtime(comptime App: type) type {
             if (failure_provenance) |out| out.* = null;
             const operation_id = job.operation_id orelse app.worker.beginCompactionActivity(.manual, job.turn_id);
             app.worker.runCompactionActivity(operation_id, .preparation);
-            // Covers early cancellation before compaction starts; acknowledged settlement wins.
             defer if (app.worker.isCancelRequested()) {
                 app.worker.settleCompactionActivity(operation_id, .{ .outcome = .cancelled });
             };
@@ -2935,7 +2932,6 @@ test "manual compaction worker call commits a checkpoint without a continuation"
         .history = try alloc.alloc(types.HistoryTurn, 2),
     };
     defer worker_runtime.freeContextCompactionTask(alloc, job);
-    // A tool call leaves work to summarize, so the model is asked.
     const calls = [_]types.ToolCall{.{ .id = "read-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
     const results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("read-1"),
@@ -3019,8 +3015,6 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     app.worker.finishProcessing();
     try std.testing.expectEqualDeep(completed_activity, app.worker.compactionActivitySnapshot());
 
-    // The oldest turn is compacted: its user message is kept word for word,
-    // and the newest turn stays unchanged after the checkpoint.
     const checkpoint = events.items[0].context_compaction.summary;
     try std.testing.expectEqual(@as(usize, 1), checkpoint.removed_turn_count);
     const model_text = (try session_runtime.formatCompactedContinuationMessage(alloc, checkpoint.summary));
@@ -3509,9 +3503,6 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     };
     const completed = try app.describeToolActionCompleted(arena, run_call);
 
-    // The label and untokenized command text keep the muted tool-text base,
-    // while the command verb and quoted string pick up syntax palette colors
-    // and return to the base after their closes.
     try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
     try std.testing.expect(std.mem.find(
         u8,
@@ -3524,8 +3515,6 @@ test "app agent runtime highlights shell command rows over the tool text base" {
         "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
     ) != null);
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
-    // The pipe and the command after it take the keyword color, the flag the
-    // number color; plain bytes are intact beneath the styling.
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);

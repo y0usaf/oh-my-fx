@@ -667,9 +667,6 @@ pub const Operations = struct {
     }
 
     pub fn mcpResponseFrameCap(max_tool_result_bytes: usize) usize {
-        // JSON-RPC and MCP content wrappers add bytes around the model-facing result.
-        // Keep the transport cap close to the configured result cap while allowing
-        // normal envelope overhead before the model-facing truncation pass runs.
         return @max(@import("../images/image_data.zig").max_result_frame_bytes, std.math.add(usize, max_tool_result_bytes, mcp_response_frame_overhead_bytes) catch std.math.maxInt(usize));
     }
 
@@ -689,8 +686,6 @@ pub const Operations = struct {
         tool_name: []const u8,
         failures_before: u64,
     ) !?tool_mcp_runtime.CallResult {
-        // A successful recovery replaces last_error under the exclusive
-        // catalog lock without taking status_lock.
         catalog_mutex.lockSharedUncancelable(io_mod.getIo());
         defer catalog_mutex.unlockShared(io_mod.getIo());
         server.status_lock.lockUncancelable(io_mod.getIo());
@@ -1236,8 +1231,6 @@ test "a failed recovery reports only the failure it recorded" {
     defer if (server.last_error) |value| alloc.free(value);
 
     server.setFailed(alloc, "MCP server exited with code 1 before completing startup");
-    // A recovery that stopped before relaunching, such as on a lock
-    // timeout, must not report the older failure.
     const before = server.failureSerial();
     try std.testing.expect((try Operations.restartFailedResult(arena, &catalog_mutex, &server, "mcp_fixture_echo", before)) == null);
 

@@ -772,8 +772,6 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
-        // Terminals end with this process. Ending them first also releases
-        // any subagent still waiting on one.
         self.terminal_client.closeOwnedTerminals();
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
@@ -810,7 +808,6 @@ const AskContext = struct {
             m.deinit();
             self.alloc.destroy(m);
         }
-        // `fx ask` exits next, so nothing waits for its servers.
         if (self.mcp_host != null) mcp_host.signalServersForExit();
         if (self.image_snapshot_temp_dir) |path| {
             image_attachments.cleanupSnapshotDir(path);
@@ -880,8 +877,6 @@ const AskContext = struct {
     }
 
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
-        // A v2 session captures into the process's temporary folder, then
-        // keeps the bytes inside the turn (D44).
         const sessions_dir = if (self.v2 != null) null else if (self.store) |*store| store.sessions_dir else null;
         const session_id = if (self.v2 != null) null else self.activeSessionId();
         return session_store.imageSnapshotStorageDir(
@@ -1072,7 +1067,6 @@ const AskContext = struct {
             .fast_mode = self.fast_mode,
             .ultrafast_mode = self.persisted_ultrafast_mode,
         };
-        // Converting a v1 session can be slow; stderr says why (D61).
         store.notice = .{ .context = self, .emit = conversionNotice };
         const v2 = if (self.requested_resume) |target|
             session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
@@ -1244,7 +1238,6 @@ const AskContext = struct {
             tc.mcp_snapshot_tool = mcpSnapshotTool;
             tc.mcp_call_feature = mcpCallFeature;
         }
-        // Either engine: on a terminal, a server's question is put to the user.
         if ((self.mcp_host != null or self.mcp != null) and self.mcp_elicitation_capabilities.any()) {
             tc.mcp_input_responder = .{
                 .context = @ptrCast(self),
@@ -1663,8 +1656,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer startup.deinit(alloc);
     applyAskThemeChoice(startup.theme);
     cfg.provider_set.definitions = startup.configured_providers.definitions;
-    // Bind gateway chat traffic to a per-process connection pool and warm one
-    // connection in the background while the rest of startup continues.
     var gateway_pool: ?*http_pool.HttpPool = null;
     defer if (gateway_pool) |pool| {
         if (pool.deinit() == .destroyed) alloc.destroy(pool);
@@ -1787,14 +1778,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
             ctx.model = owned_resumed_model.?;
         }
-        // Environment precedence survives resume without rewriting the saved
-        // profile preference. CLI flags below remain the final per-run layer.
         if (startup.ultrafast_process_override) |ultrafast| ctx.ultrafast_mode = ultrafast;
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
-    // Ask flags are per-run overrides: they win over startup and resumed
-    // session preferences but are never persisted into session preferences.
     if (options.model_override) |model| {
         ctx.model = model;
     }
@@ -1807,8 +1794,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     } else if (options.model_override != null and ctx.requested_resume == null and
         startup.fast_mode_source == .compiled_default)
     {
-        // Default fast mode applies to the compiled default model only; an
-        // explicit model override drops it unless --fast restores it.
         ctx.fast_mode = false;
     }
     if (options.ultrafast_override) |ultrafast| {
@@ -1817,7 +1802,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     } else if (options.model_override != null and ctx.requested_resume == null and
         startup.ultrafast_mode_source == .compiled_default)
     {
-        // Ultra mode must never follow an explicit model override by default.
         ctx.ultrafast_mode = false;
     }
     if (options.provider_order_override) |order| {
@@ -2035,8 +2019,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .unversioned_history_count = ctx.session.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
-        // process_queued_prompt is synchronous here; AskContext keeps the
-        // immutable snapshot allocations alive for the whole call.
         .context_snapshot = ctx.context_snapshot,
         .recovery_checkpoint = recovery_checkpoint,
     };
@@ -2137,8 +2119,6 @@ fn maybeStartAskTitleTask(
     prompt: []const u8,
     fresh_session: bool,
 ) ?*session_title_generation.Task {
-    // Unit tests share the real provider bundles; never spawn network side
-    // calls from a test process. Wiring is covered by e2e mock servers.
     if (comptime @import("builtin").is_test) return null;
     if (comptime @import("builtin").target.os.tag == .wasi) return null;
     if (!setting_enabled or !fresh_session) return null;
@@ -2235,7 +2215,6 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     const session_id = if (ctx.writable) |writable|
         try alloc.dupe(u8, writable.active_id)
     else if (ctx.v2) |v2|
-        // A v2 session exists once its first turn is written.
         try alloc.dupe(u8, if (v2.saved()) v2.id() else "")
     else
         try alloc.dupe(u8, "");
@@ -2257,7 +2236,6 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
-        // Sessions v2 keeps no recovery checkpoint yet.
         .recovery_durable = ctx.writable != null,
         .usage = ctx.session.agent.turn_usage,
     };
@@ -3265,7 +3243,6 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     if (ctx.v2) |v2| {
         try v2.prepareTurn(&prepared);
         v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
-            // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
             return err;
         };
@@ -3358,7 +3335,6 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
         return;
     };
-    // The log now refers to this prompt's images.
     ctx.prompt_snapshot_committed = true;
 }
 
@@ -3505,8 +3481,6 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             if (!ctx.output_mode.isTerminal()) {
                 try settlePendingToolProgress(ctx, value.id.call_id, value.outcome);
             }
-            // Report a fallback right after the command it affected; a later
-            // recapture in the same run would otherwise clear it unseen.
             writeShellSnapshotNotice(ctx);
         },
     }
@@ -3788,11 +3762,10 @@ fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runti
     const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (request.server) |server_name| {
         mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
-            error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
+            error.McpAuthenticationRequired => {},
             error.Cancelled, error.OutOfMemory, error.McpAccessDenied, error.McpAuthorityChanged => return err,
             else => {
                 if (!mcp.hasRecordedFailure(server_name)) return err;
-                // Search reports the recorded reason instead of the error name.
                 debug_trace.logf(
                     "mcp",
                     "deferred ask connection failed server={s} err={s}; search reports the recorded failure",
@@ -4409,9 +4382,6 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
             if (recovery.kind == .terminal_provider_error)
-                // A genuine lifecycle pause (action == .paused) is resumable; a
-                // terminal stop (no action) is not. JSON consumers need the
-                // distinction.
                 if (recovery.action == .paused) "paused" else "failed"
             else if (recovery.isRecovered()) "recovered" else "active",
             .{},

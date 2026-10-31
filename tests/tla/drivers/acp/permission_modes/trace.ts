@@ -1,6 +1,3 @@
-// TLC trace validation: turns one observed run into the generated
-// AcpPermissionModesObs module and asks TLC whether it is a behavior of
-// tests/tla/acp/AcpPermissionModes.tla (through tests/tla/acp/AcpPermissionModesTrace.tla).
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Observation } from "./harness";
@@ -57,7 +54,6 @@ export async function validate(observations: Observation[], dir: string, profile
     matched = observations.length;
   } else if (run.exitCode === 0 && /No error has been found/.test(run.output)) {
     verdict = "REJECTED";
-    // The trace's states are i = 1..k, so the search depth is how many steps matched.
     matched = run.distinctStates === 0 ? 0 : run.depth ?? 0;
   } else {
     verdict = "TOOL_ERROR";

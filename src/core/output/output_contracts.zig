@@ -82,7 +82,6 @@ pub const UsageSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        // The period stays in UTC days, the days AI Gateway reports by.
         try out.writer.print("Usage ({s}, UTC) from AI Gateway", .{v.period.label()});
         if (v.fetched_at_ms) |ms| try writeLocalClock(&out.writer, ", updated ", ms);
         try out.writer.writeByte('\n');
@@ -1642,7 +1641,6 @@ pub const SessionConvertSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         try out.writer.print("{{\"kind\":\"sessions_convert\",\"converted\":{d},\"busy\":{d},\"unreadable\":{d}", .{ self.converted, self.busy, self.unreadable });
-        // A skip fails the command; its error names the first one.
         if (self.skipped.len > 0) {
             try out.writer.writeAll(",\"error\":");
             try std.json.Stringify.value(self.skipped[0].code, .{}, &out.writer);
@@ -2663,7 +2661,6 @@ test "model list explains public-only and rejected-credential catalogs" {
         json,
     );
 
-    // An API key hides nothing, so the note must stay absent.
     const quiet_text = try shown.renderText(alloc);
     defer alloc.free(quiet_text);
     try std.testing.expect(std.mem.find(u8, quiet_text, "team-private") == null);
@@ -3657,7 +3654,6 @@ test "usage text and JSON render a Grok plan's allowance and credits" {
     );
 
     {
-        // West of UTC, the reset falls on the previous calendar day.
         local_time.test_zone = .{ .offset_s = -5 * std.time.s_per_hour, .name = "EST" };
         defer local_time.test_zone = .utc;
         const local_text = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .text);
@@ -3718,8 +3714,6 @@ test "usage text and JSON render a Codex plan's limits" {
     defer snapshot.deinit();
     const contract: UsageSnapshot = .{ .snapshot = &snapshot };
 
-    // With activity: tokens by period, records, habits, and shares by model
-    // and surface for the period asked for.
     var with_profile = snapshot;
     var limits = snapshot.codex_usage.?;
     limits.profile = .{
@@ -3830,7 +3824,6 @@ test "slack text reads the access expiry in the local zone" {
         .app_id = null,
         .team_id = null,
         .bot_user_id = null,
-        // 2026-10-15 00:00 UTC.
         .expires_at_ms = 20741 * std.time.ms_per_day,
         .refresh_expires_at_ms = null,
     };

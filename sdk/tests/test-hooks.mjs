@@ -64,8 +64,6 @@ async function drain(turn) {
   return { updates, result: await turn.result };
 }
 
-// Native semantic boundaries, not UI previews: exact model-to-tool IDs,
-// parallel execution and failures, accepted results, and separate new turns.
 {
   const events = [];
   const executed = [];
@@ -172,8 +170,6 @@ async function drain(turn) {
   }
 }
 
-// Metadata-only is the default. Rejected observer promises (including the
-// error handler's), throws, mutation, and never-settling work cannot change fx.
 {
   const seen = [];
   const errors = [];
@@ -208,7 +204,6 @@ async function drain(turn) {
   }
 }
 
-// Content is bounded on a UTF-8 boundary without shortening the model's input.
 {
   const events = [];
   const mock = gateway([answer()]);
@@ -235,7 +230,6 @@ async function drain(turn) {
   }
 }
 
-// Instructions cannot starve the latest model-visible user input.
 {
   const events = [];
   const engine = await createFxEngine({
@@ -257,8 +251,6 @@ async function drain(turn) {
   }
 }
 
-// A receipt follows accepted persistence, not a queued or rejected append.
-// Yield/resume keeps the logical turn ID, but not its worker execution ID.
 {
   const store = createMemoryPersistence();
   const events = [];
@@ -323,8 +315,6 @@ async function drain(turn) {
     assert.equal(eventsOf(events, "tool.start").length, 1);
     assert.equal(mock.bodies.length, 2);
 
-    // A crash lost everything after the tool intent. Explicit permission to
-    // rerun is new execution of the same logical call, before a new model step.
     const recorded = store.records.flatMap(
       (record) => JSON.parse(new TextDecoder().decode(record.data)).events,
     );
@@ -394,7 +384,6 @@ for (const wrapped of [false, true]) {
   }
 }
 
-// No receipt may precede the persistence owner's acknowledgement.
 {
   const events = [];
   const store = createMemoryPersistence();
@@ -432,8 +421,6 @@ for (const wrapped of [false, true]) {
   }
 }
 
-// Streaming cancellation produces one terminal model observation, no retry.
-// A handoff is marked separately so the host needn't fail the logical turn.
 for (const reason of [undefined, "handoff"]) {
   const events = [];
   let turn;
@@ -480,7 +467,6 @@ for (const reason of [undefined, "handoff"]) {
   }
 }
 
-// Hook transport and content capture are absent unless explicitly requested.
 {
   const diagnostics = [];
   const engine = await createFxEngine({
@@ -502,7 +488,6 @@ for (const reason of [undefined, "handoff"]) {
   }
 }
 
-// Durable agents forward the same observer into the engine that runs the turn.
 {
   const events = [];
   const hooks = new (class {
@@ -530,8 +515,6 @@ for (const reason of [undefined, "handoff"]) {
   }
 }
 
-// Input waits are real host effects; observer failures cannot change decisions,
-// answers, or thrown errors. Child engines carry their caller's tool identity.
 {
   const events = [];
   const mock = gateway([
@@ -627,8 +610,6 @@ for (const reason of [undefined, "handoff"]) {
   }
 }
 
-// MCP metadata is taken from the adapter's registered server and original tool,
-// never guessed from its sanitized model name. Remote correlation is opt-in.
 for (const propagateCorrelation of [false, true]) {
   const events = [];
   const remote = [];
@@ -690,8 +671,6 @@ for (const propagateCorrelation of [false, true]) {
   }
 }
 
-// A host-created child adds its outer parent only to its own root session.
-// Descendant events already carry their native parent relationship.
 {
   const events = [];
   const contexts = [];
@@ -842,8 +821,6 @@ for (const propagateCorrelation of [false, true]) {
   }
 }
 
-// Cancellation is an observation, not a replacement for the host's response.
-// A late answer cannot emit a second terminal event or change the returned value.
 {
   const events = [];
   const controller = new AbortController();

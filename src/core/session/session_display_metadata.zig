@@ -250,7 +250,6 @@ pub fn readSidecarOrFallback(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
 ) !DisplayMetadata {
-    // A special file, such as a FIFO, is never opened, so it cannot block.
     var file = io_mod.openExistingReadOnlyRegularFile(session_dir.dir, sidecar_file, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return missingFallback(alloc),
         error.DurablePathUnsafe, error.NotDir, error.SymLinkLoop, error.IsDir => return missingFallback(alloc),

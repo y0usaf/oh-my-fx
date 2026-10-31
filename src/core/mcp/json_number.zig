@@ -229,9 +229,6 @@ pub fn fromValue(
                 return error.InvalidNumber;
             break :blk try Number.parse(alloc, lexeme, limits);
         },
-        // A float has already lost its source lexeme and may have rounded before
-        // reaching the validator. Callers that parse JSON must retain numbers as
-        // number_string; integer remains exact for programmatic values.
         .float => return error.InvalidNumber,
         else => null,
     };

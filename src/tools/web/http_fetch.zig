@@ -688,7 +688,6 @@ fn readResponse(
 fn readSome(reader: *std.Io.Reader, scratch: []u8, options: FetchOptions) !usize {
     while (true) {
         try checkControl(options);
-        // Do not let a later TLS record failure mask plaintext already authenticated and buffered.
         const buffered = reader.buffered();
         if (buffered.len > 0) {
             const n = @min(buffered.len, scratch.len);
