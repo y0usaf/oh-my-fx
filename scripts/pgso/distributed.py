@@ -881,9 +881,6 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         paths,
     )
 
-    # Zig 0.17 can number anonymous symbols differently on another runner, so
-    # rebuilding the same commit is not byte-identical. Profile the seed's
-    # verified bitcode, which the training profiles were collected from.
     shutil.copy2(seed_paths.bitcode, paths.bitcode)
     _require_hash(paths.bitcode, identity.bitcode_sha256, "candidate bitcode")
     apply_profile(toolchain, paths, identity.bitcode_sha256)

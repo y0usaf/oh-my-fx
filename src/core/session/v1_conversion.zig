@@ -59,9 +59,6 @@ pub const Problem = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Finding v1 sessions
-
 const Kind = enum { absent, root, child };
 
 /// What v1 holds under `id`, as v1's listing tells it: nothing (no folder,
@@ -73,8 +70,6 @@ pub fn kindOf(store: *session_store.Store, alloc: Allocator, id: []const u8) !Ki
     defer dir.close();
     const marked: ?bool = switch (try readMetadata(alloc, &dir)) {
         .missing => return .absent,
-        // A legacy snapshot, which holds its whole history: v1's listing
-        // records no child bit for one either (`session_discovery.zig`).
         .too_large => null,
         .bytes => |bytes| blk: {
             defer alloc.free(bytes);
@@ -221,8 +216,6 @@ pub fn listRoots(alloc: Allocator, home: []const u8, active_id: ?[]const u8) !se
 
 fn openMemberDir(store: *session_store.Store, id: []const u8) !?io_mod.VerifiedDir {
     const sessions = &(store.canonical_root.sessions orelse return null);
-    // Read whatever its mode: an old release left v1's folders readable by
-    // others (D61).
     return io_mod.openRealDirIfPresent(sessions, id);
 }
 
@@ -238,9 +231,6 @@ pub fn hasFolder(home: []const u8, id: []const u8) !bool {
     };
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// Locking a family (TLA `CBegin`)
 
 pub const Locked = struct {
     id: []u8,
@@ -352,7 +342,6 @@ fn indexedChildren(a: Allocator, root: *io_mod.VerifiedDir, ids: *std.ArrayList(
         for (page.slots[0..slots]) |*slot| {
             if (!slot.occupied) continue;
             const id = slot.childId();
-            // Locked once: a second lock on the same folder would be busy.
             const known = for (ids.items) |known_id| {
                 if (std.mem.eql(u8, known_id, id)) break true;
             } else false;
@@ -405,9 +394,6 @@ pub fn tryLockLeftover(alloc: Allocator, store: *session_store.Store, id: []cons
         else => err,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Reading a member
 
 /// One step of a member's history, in the order v2 writes it.
 const Step = union(enum) {
@@ -491,7 +477,6 @@ pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, 
     };
     switch (metadata) {
         .missing => return problem.set("session.json is missing", .{}),
-        // A legacy snapshot: v1's older reader reads it whole.
         .too_large => try readOlderFormat(a, store, locked, &member, problem),
         .bytes => |bytes| {
             if (!(std.json.validate(a, bytes) catch false)) return problem.set("session.json is not valid JSON", .{});
@@ -562,7 +547,6 @@ fn readPermissions(a: Allocator, dir: *io_mod.VerifiedDir, problem: *Problem) !s
         error.OutOfMemory => return err,
         else => return problem.set("permissions.json can't be read ({s})", .{@errorName(err)}),
     };
-    // v1 migrates an older schema on its first writable open.
     if (state.version == session_permission_state.schema_version) return state;
     return session_permission_state.migrateV1ToV2(a, state) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -616,15 +600,12 @@ const FrameReader = struct {
         defer file.close(io);
         const log = blk: {
             const length = file.length(io) catch |err| return reader.problem.set("events.jsonl can't be read ({s})", .{@errorName(err)});
-            // One byte past the length, so the read sees the end.
             const limit = std.math.cast(usize, length +| 1) orelse return error.OutOfMemory;
             break :blk io_mod.readFileToEnd(reader.arena, &file, limit) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return reader.problem.set("events.jsonl can't be read ({s})", .{@errorName(err)}),
             };
         };
-        // A torn last line, with no newline, is left out: v1's reader stops
-        // before it, and its next writable open cuts it.
         var rest = log;
         while (std.mem.findScalar(u8, rest, '\n')) |newline| {
             reader.line += 1;
@@ -647,7 +628,6 @@ const FrameReader = struct {
         reader.last_ts = @max(reader.last_ts, ts);
         reader.apply(envelope.event, envelope.seq) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // `problem` already names the file, as for a prompt image.
             error.InvalidSessionFormat => return error.InvalidSessionFormat,
             else => return reader.problem.set("events.jsonl line {d} does not fit its turn ({s})", .{ reader.line, @errorName(err) }),
         };
@@ -684,7 +664,6 @@ const FrameReader = struct {
                 try reader.builder.appendSteering(value.text);
                 try reader.open.append(a, event);
             },
-            // The builder only checks the turn; its copy lives in the arena.
             .turn_completed => |value| {
                 try reader.requireOpen();
                 _ = try reader.builder.finishAssistant(value);
@@ -698,9 +677,6 @@ const FrameReader = struct {
             .context_checkpoint => |checkpoint| {
                 try reader.builder.finishStandalone();
                 reader.compactions += 1;
-                // v1's window: the turns that end at or before the coverage
-                // are summarized; the first turn with a frame after it stays
-                // (`session_log.zig` `ConversationReplayScan`).
                 var prior: usize = 0;
                 var keep_from: ?usize = null;
                 for (reader.turn_last_seq.items, 0..) |last, index| {
@@ -715,7 +691,6 @@ const FrameReader = struct {
                     .keep_from = keep_from,
                     .ts_ms = reader.last_ts,
                 } };
-                // Inside a turn it goes before that turn, which v2 keeps whole.
                 if (reader.open_user_seq != null) try reader.deferred.append(a, step) else try reader.steps.append(a, step);
             },
         }
@@ -756,7 +731,6 @@ const FrameReader = struct {
         }
         if (checkpoint) |value| {
             var kept = value;
-            // As v1's load joins a checkpoint to its open turn's work.
             if (kept.user.work_id == null) {
                 if (reader.open.items[0].user.work_id) |work_id| kept.user.work_id = try a.dupe(u8, work_id);
             }
@@ -788,15 +762,9 @@ fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, m
             else => return problem.set("permissions can't be migrated ({s})", .{@errorName(err)}),
         };
     }
-    // As v1's migration leaves it (`session_log.zig`
-    // `importLegacySnapshotStateWithOps`): a history-only checkpoint kept as
-    // an interrupted turn, the rest dropped; empty file evidence dropped;
-    // each result kept inline stored under v1's handle.
     if (!try state.archive_legacy_recovery(a) and state.recovery_checkpoint != null)
         debug_trace.logf("convert", "action=RecoveryDropped session={s} reason=older_format", .{locked.id});
     _ = try session_log.discardEmptyLegacyFileEvidence(a, state.history);
-    // Schema 3 keeps its history in its log, a legacy session in its
-    // snapshot.
     const history_file: []const u8 = if (locked.dir.dir.statFile(io_mod.getIo(), "authority.json", .{ .follow_symlinks = false })) |_| "events.jsonl" else |_| "session.json";
     var stored: std.ArrayList(Stored) = .empty;
     var steps: std.ArrayList(Step) = .empty;
@@ -920,9 +888,6 @@ fn snapshotLeaf(path: []const u8, id: []const u8) ?[]const u8 {
     return leaf;
 }
 
-// ---------------------------------------------------------------------------
-// Fingerprint (D60)
-
 /// Files that are not a session's content: locks, liveness and caches,
 /// which v1 rewrites without changing the session.
 const not_content = [_][]const u8{ lock_file, "owner.live", "recovery.asked", "commit.lock", "history-cache.bin" };
@@ -972,9 +937,6 @@ fn lessThan(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.lessThan(u8, x, y);
 }
 
-// ---------------------------------------------------------------------------
-// Removing a converted member's v1 state (TLA `CDelete`, `CClean`)
-
 /// Renames the locked member's folder into the trash, then deletes it
 /// there, while its lock is still held, so a v1 writer waiting on that lock
 /// finds an emptied folder and fails instead of writing into the trash.
@@ -988,8 +950,6 @@ pub fn removeFolder(store: *session_store.Store, id: []const u8, why: []const u8
         return false;
     };
     defer trash.close();
-    // A same-id entry left by an earlier removal; if it stays, the rename
-    // below fails and says so.
     trash.dir.deleteTree(io, id) catch |err|
         debug_trace.logf("convert", "action=TrashKept entry={s} err={s}", .{ id, @errorName(err) });
     std.Io.Dir.rename(sessions.dir, id, trash.dir, id, io) catch |err| {
@@ -1038,9 +998,6 @@ pub fn emptyTrash(alloc: Allocator, store: *session_store.Store) void {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-
 fn readFileIfPresent(a: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize) !?[]u8 {
     var file = dir.dir.openFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -1060,7 +1017,6 @@ test "an older turn the current event format cannot keep names its file, turn an
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var problem: Problem = .{};
-    // Schema 3 kept a prompt's bytes even when they were not UTF-8.
     const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("bad \xff byte") }, .assistant = @constCast("answer") } };
     try std.testing.expectError(error.InvalidSessionFormat, requireKeepable(arena.allocator(), turn, "events.jsonl", 3, &problem));
     try std.testing.expectEqualStrings("events.jsonl turn 3 has a prompt that is not valid UTF-8, which the current format can't keep", problem.text());

@@ -344,7 +344,6 @@ test(
       expect(authCheck.status).toBe("warn");
       expect(authCheck.detail).toContain("session expired");
 
-      // A read-only diagnostic must neither contact the issuer nor rewrite the session.
       expect(oauth.requests).toEqual([]);
       expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
       expect(status.stdout).not.toContain("expired-access-token");

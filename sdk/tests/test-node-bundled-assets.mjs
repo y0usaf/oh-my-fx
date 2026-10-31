@@ -11,7 +11,6 @@ const media = join(root, "static", "media");
 const originalBase = Object.getOwnPropertyDescriptor(globalThis, "__webpack_base_uri__");
 const originalPublicPath = Object.getOwnPropertyDescriptor(globalThis, "__webpack_public_path__");
 
-// Match webpack's RelativeUrlRuntimeModule, including its misleading prototype.
 function relativeUrl(href) {
   return Object.create(URL.prototype, {
     href: { value: href },

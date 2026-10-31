@@ -1,22 +1,4 @@
 #!/bin/sh
-# Model-checks DurableSession.tla with TLC, confirms each witness is
-# violated, and writes the state graphs ../drivers/drive.mjs walks against
-# the code.
-#
-# Needs Java 11+ and tla2tools.jar:
-#   brew install openjdk
-#   mkdir -p ~/.local/share/tla
-#   curl -fL -o ~/.local/share/tla/tla2tools.jar \
-#     https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
-#
-# Then drive the code along the graphs with the drivers in ../drivers/:
-#   bun ../drivers/drive.mjs send && bun ../drivers/drive.mjs lookup
-#   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
-#   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
-#   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
-#   bun ../drivers/drive-agents.mjs   # AgentRouting
-#   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
-#   bun ../drivers/drive-tenants.mjs   # TenantIsolation
 set -eu
 cd "$(dirname "$0")"
 
@@ -28,8 +10,6 @@ for candidate in "${JAVA_HOME:+$JAVA_HOME/bin/java}" /opt/homebrew/opt/openjdk/b
 done
 [ -n "$java" ] || { echo "no working Java runtime (set JAVA_HOME or brew install openjdk)" >&2; exit 2; }
 
-# A new private folder per run for logs and TLC state, so nothing planted in
-# the temp folder can redirect them. Logs print on failure, so it is removed.
 work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir -p graphs
@@ -43,21 +23,6 @@ for tool in send lookup write cutoff leased queue; do
     fi
     grep -E 'distinct states|depth of' "$work/$tool.log"
 done
-# Each witness must break the invariant named after it: it shows the model
-# reaches that state. NoSelfStop breaks TwoActiveNeedsFreeze: without the
-# self-stop, two workers are active at once with no freeze at all.
-# NoClaimFence breaks EffectsAtMostOnce: a claim that counts on a stale read
-# continues the turn from before a call with effects started, and runs it
-# again. NoCutoffBound breaks HandoffsBounded: without the bound, a call
-# that outlasts every delivery is cut off and run again forever.
-# LeasedTwoActive breaks NotTwoActive with Heartbeat: a renewed lease ends a
-# woken worker's run at its next renewal, not before, so two can still be
-# active at once until it lands.
-# LookupRunsAhead breaks EveryCallAfterIntent: a lookup starts before its
-# intent is in the chain. LookupNewId breaks IdsAtMostOne: a crash before
-# that intent lands has the model ask again, under a new execution id.
-# WriteRunsAhead breaks OneExecutionId: a write that ran ahead the same way
-# would run under two ids, which is why a write waits for its intent.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
@@ -70,9 +35,6 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
         echo "== witness $witness NOT reached" >&2; status=1
     fi
 done
-# DurableSteer.tla: where each message a user sends ends up. The ideal graph
-# has no faults, and the faults graph adds cancels, deadline handoffs and
-# client retries.
 for graph in ideal faults; do
     echo "== DurableSteer ($graph)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
@@ -82,11 +44,6 @@ for graph in ideal faults; do
     fi
     grep -E 'distinct states|depth of' "$work/steer-$graph.log"
 done
-# Each witness turns one rule off and must break the property it protects:
-# without Interrupt a steer waits on a streaming reply, without HandBack a
-# cancel loses a steer that never reached the model, without JoinBeforeStart
-# a steer sent before the first turn starts runs as a turn of its own, and
-# without Dedupe a retried steer reaches the model twice.
 for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
     NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce; do
     witness="${pair%%:*}" invariant="${pair#*:}"
@@ -98,12 +55,6 @@ for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
     fi
 done
 
-# AgentRouting.tla: which agent runs a session's turns when an app has
-# several. Its graph is what ../drivers/drive-agents.mjs walks, with process p2
-# lacking one agent; every sender stores its input before it queues it. Drains is checked under fairness, a simulation runs a larger
-# config, and each witness breaks RunsOnOwner: NoNames is routing without
-# names, as before them, and NoOwnerCheck a worker that runs any session it
-# is handed.
 for config in send; do
     echo "== AgentRouting ($config)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
@@ -136,14 +87,6 @@ for witness in NoNames NoOwnerCheck; do
     fi
 done
 
-# TenantIsolation.tla: tenants whose agents share one process, and an
-# attacker who can post to its route. Its graph, with every rule on, is what
-# ../drivers/drive-tenants.mjs walks; SentRuns is checked under fairness.
-# Each witness turns one rule off and must break what it protects:
-# TrustBody runs a forged delivery, ShareName runs one tenant's prompt on
-# another's agent, RouteByName strands a prompt on another store,
-# NoAdmission stores an oversized input, and Today, every rule off as libfx
-# was before them, runs a prompt in another tenant's store.
 echo "== TenantIsolation (route)"
 if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
     -metadir "$work/tenants-route" -dump dot,actionlabels graphs/tenants-route \

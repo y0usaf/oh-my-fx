@@ -88,9 +88,6 @@ pub fn plan(scope: report.Scope, cached_finished_day: ?i64, now_ms: i64) Plan {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 
 test "opening fetches unless the floor or a recent failure holds it" {
@@ -131,7 +128,7 @@ test "the timer fires every 15 minutes while open, never while closed" {
 }
 
 test "finished days are read once per UTC day" {
-    const now: i64 = 1_791_676_800_000 + 3 * std.time.ms_per_hour; // 2026-10-11 03:00 UTC
+    const now: i64 = 1_791_676_800_000 + 3 * std.time.ms_per_hour;
     const today = report.utcDay(now);
     const first = plan(.member, null, now);
     try testing.expect(first.finished and first.budget);

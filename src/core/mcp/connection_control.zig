@@ -105,7 +105,6 @@ test "startup span is fixed when the operation starts" {
     try std.testing.expectEqual(@as(?u32, 2_000), caller_deadline.withStartupSpan(almost, 30_000).startup_span_ms);
     const spent = std.Io.Clock.Timestamp{ .clock = .awake, .raw = .{ .nanoseconds = now.raw.nanoseconds + 3 * std.time.ns_per_s } };
     try std.testing.expectEqual(@as(?u32, 0), caller_deadline.withStartupSpan(spent, 30_000).startup_span_ms);
-    // A tool call's deadline can outlast the configured startup timeout.
     const long_deadline = Control{ .deadline = startupDeadline(now, 0, .fromSeconds(60)) };
     try std.testing.expectEqual(@as(?u32, 60_000), long_deadline.withStartupSpan(now, 30_000).startup_span_ms);
 

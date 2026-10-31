@@ -1055,7 +1055,6 @@ test "legacy image repair leaves history unchanged when text reconstruction runs
     second_text_owned = false;
     third_text_owned = false;
 
-    // Metadata and the first rebuilt turn succeed; the second rebuild fails.
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
     try std.testing.expectError(
         error.OutOfMemory,
@@ -1468,7 +1467,6 @@ pub fn repairPersistedToolArguments(
         const result = try persistedResultForMalformedCall(calls, results, call.*);
         const integrity = call.argument_integrity;
         if (integrity == .non_object_json) {
-            // Repair replay input without changing what the stored result says happened.
             if (call.provider_result != null or result.provider_native) {
                 call.provenance = .provider_executed;
                 call.argument_integrity = .valid;
@@ -1646,8 +1644,6 @@ fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, o
         from = at + key.len;
         const id_start = at + key.len - "shell-".len;
         var id_end = id_start + "shell-".len;
-        // Counter ids are digits; interactive terminal ids are base64url. Both
-        // share the charset checked by validHistoricalSessionId.
         while (id_end < text.len) : (id_end += 1) {
             const byte = text[id_end];
             if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') break;
@@ -3446,8 +3442,6 @@ test "interrupted tool diagnostics remain complete for compaction" {
                 } }};
                 var messages: std.ArrayList(core_types.ChatMessage) = .empty;
                 try appendHistoryChatMessagesImpl(alloc, &messages, &history, projection);
-                // Compaction saves this diagnostic as the tool's output; it must
-                // say the tool did not complete.
                 const result = messages.items[2];
                 try std.testing.expectEqual(.failure, result.tool_result_status.?);
                 try std.testing.expectEqualStrings("cancelled-call", result.tool_call_id.?);

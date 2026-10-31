@@ -1671,7 +1671,6 @@ test "legacy cancellation provenance reads old sessions and roundtrips optional 
             defer loaded.deinit(alloc);
             try std.testing.expectEqual(expected, loaded.history[0].interrupted.cancellation_origin);
             try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, loaded.history[0].interrupted.terminal_reason);
-            // This in-memory writer reports injected allocation failure as WriteFailed.
             const encoded = renderSessionJson(alloc, loaded.id, loaded.created_at_ms, loaded.updated_at_ms, loaded.conversation_language, loaded.workspace_root.?, loaded.history, .{}) catch |err|
                 return if (err == error.WriteFailed) error.OutOfMemory else err;
             defer alloc.free(encoded);

@@ -541,8 +541,6 @@ pub const SessionPicker = struct {
         self.selection_failure = null;
         const count = self.navigationItemCount();
         if (count == 0) return true;
-        // Clamp at both ends instead of wrapping: at the top the selection
-        // stays on the first session, at the bottom on the last row.
         const current: i32 = @intCast(self.selected % count);
         var next = current + delta;
         if (next < 0) next = 0;
@@ -696,8 +694,6 @@ fn installStaleDiskCatalog(
     const sessions = store.canonical_root.sessions orelse return;
     var loaded = try session_catalog_cache.Loaded.load(std.heap.c_allocator, sessions, null);
     defer loaded.deinit(std.heap.c_allocator);
-    // Without a persisted catalog there is nothing to paint early; keep the
-    // loading state until the background scan lands.
     if (loaded.parsed == null) return;
     var summaries = try loaded.cloneVisibleSummaries(std.heap.c_allocator, active_id);
     errdefer {
@@ -864,7 +860,6 @@ const SessionPickerLoad = struct {
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        // Main-loop-owned; worker failures may also set cancel_requested.
         abandoned: bool = false,
         home_dir: []u8,
         workspace_root: []u8,
@@ -1218,9 +1213,6 @@ const TitleGenerationLoad = struct {
 };
 
 fn resumePageLimitForRows(rows: u16) usize {
-    // Fill the resume screen: terminal rows minus the composer/divider/hint
-    // chrome (4), the menu header (1), the top gap (1), and a trailing
-    // "Load more" row (1). Floored so short terminals still page usefully.
     return @max(@as(usize, rows -| 7), session_store.default_resume_page_limit);
 }
 
@@ -1310,9 +1302,6 @@ const PendingCancelledCommand = struct {
 };
 
 pub const Persistence = struct {
-    // Serializes event-log mutations with worker usage callbacks. Usage takes
-    // its checkpoint mutex first, so callers must not checkpoint while held.
-    // UI compaction publication takes worker_mutex before this mutex.
     write_mutex: std.Io.Mutex = .init,
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
@@ -1430,7 +1419,6 @@ pub const Persistence = struct {
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
-        // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |*store| store.deinit(alloc);
         self.* = undefined;
     }
@@ -1494,13 +1482,10 @@ pub fn Runtime(comptime App: type) type {
                 attachment,
                 snapshot_dir,
             );
-            // A v2 session keeps the image inside the turn (D44).
             if (app.session_persistence.v2 != null) try image_attachments.inlineCapturedSnapshot(app.alloc, attachment);
         }
 
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
-            // A v2 session captures into the process's temporary folder,
-            // then keeps the bytes inside the turn (D44).
             const sessions_dir = if (app.session_persistence.v2 != null)
                 null
             else if (app.session_persistence.store) |*store|
@@ -1560,8 +1545,6 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.process_fast_override = fast_process_override;
             app.session_persistence.process_ultrafast_override = ultrafast_process_override;
             app.session_persistence.process_provider_override = provider_process_override;
-            // A provider override must pin the resolved model too, or a resume
-            // would restore the session's model from a different provider.
             if (provider_process_override != null and
                 app.session_persistence.process_model_override == null)
             {
@@ -1606,7 +1589,6 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            // One backend per process (D26): with v2 on, v1's store stays closed.
             if (session_adapter.enabled(app.session_persistence.sessions_v2)) {
                 app.session_persistence.v2_store = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
                     if (required) return err;
@@ -1631,7 +1613,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (app.session_persistence.v2) |v2| {
                 if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifactBlobs")) {
-                    // A v2 session's downloads are its blobs (D44, D49).
                     if (v2.childCapability()) |capability| {
                         app.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
                     } else |err| {
@@ -2023,7 +2004,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn retireLiveSessionCompaction(app: *App) void {
-            // Called after the worker is idle, before installing the next session.
             const observed = app.worker.compactionActivitySnapshot();
             if (observed.operation) |op| {
                 _ = app.worker.dismissCompactionActivity(op.id, observed.revision);
@@ -2121,12 +2101,9 @@ pub fn Runtime(comptime App: type) type {
                 const v2_target: session_adapter.Target = switch (target) {
                     .pick => return openSessionPicker(app),
                     .last => .last,
-                    // The manager records the session each host last opened.
                     .remembered => .last_opened,
                     .id => |session_id| .{ .id = session_id },
                 };
-                // A refusal's reason is the launch's exit message
-                // (`conversionRefusal`).
                 const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, v2_target, app.workspace_root, .app);
                 try installResumedV2Session(app, v2, notice);
                 errdefer closeWritableSession(app);
@@ -2136,7 +2113,6 @@ pub fn Runtime(comptime App: type) type {
             var remembered: ?[]u8 = null;
             defer if (remembered) |id| app.alloc.free(id);
             const resume_target: session_store.ResumeTarget = switch (target) {
-                // Nothing to load yet: the picker asks which session to open.
                 .pick => return openSessionPicker(app),
                 .last => .last,
                 .remembered => blk: {
@@ -2304,8 +2280,6 @@ pub fn Runtime(comptime App: type) type {
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
             if (app.session_persistence.v2_store) |*v2_store| {
-                // A session open in another fx shows as busy at once, as
-                // v1's picker does (D38).
                 const v2 = session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app) catch |err| {
                     noteConversionProblem(app, v2_store, err);
                     return err;
@@ -2518,8 +2492,6 @@ pub fn Runtime(comptime App: type) type {
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
 
-            // Decide before rendering: the checkpoint replay below must not
-            // promise an automatic continuation the gate is about to suppress.
             const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
                 if (state.recovery_checkpoint) |checkpoint|
                     recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app), recoveryAskedBefore(app))
@@ -2564,15 +2536,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
             }
-            // A paused recovery resumes on its own after a clean restart or
-            // resume. Harnesses without a real worker queue opt out via the
-            // decl check. A compaction_prepared checkpoint records completed
-            // source, not a turn waiting to run; the compaction flow owns it.
-            // A checkpoint left behind by an unclean exit is different: the
-            // interrupted turn may be what killed the process, so the user
-            // decides whether to retry it instead of fx re-spending the turn
-            // on its own, and that suppression stays sticky until the turn
-            // is resolved.
             if (comptime @hasDecl(App, "queueRecoveryCheckpoint")) {
                 if (state.recovery_checkpoint) |checkpoint| {
                     switch (recovery_decision.?) {
@@ -2726,7 +2689,6 @@ pub fn Runtime(comptime App: type) type {
             const matching = loader.matchingInitialGeneration(active_id);
             if (matching != previous_generation) loader.cancelGeneration(previous_generation);
             const cache = &app.session_persistence.session_picker_cache;
-            // v2 keeps no catalog file: its listing is the index itself.
             if (source == .v1 and !cache.matches(active_id)) {
                 installStaleDiskCatalog(source.v1, cache, active_id) catch |err| {
                     debug_trace.logf(
@@ -2915,9 +2877,6 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        // Prefetch the next page as the selection reaches the last loaded
-        // session (or the load-more slot), so scrolling down fills the list in
-        // without stopping to activate "Load more".
         fn maybePrefetchMoreSessions(app: *App) void {
             const picker = &app.session_persistence.session_picker;
             if (!picker.active or picker.load_state != .ready) return;
@@ -3158,8 +3117,6 @@ pub fn Runtime(comptime App: type) type {
                         loaded.boundary_wedged = false;
                         break :blk .{ .ready = try checkpoint.dupe(alloc) };
                     }
-                    // A wedged boundary (a stop path that never commits the
-                    // close) already paid the wait once; fail fast after that.
                     if (loaded.boundary_wedged) return error.InvalidRecoveryCheckpoint;
                     break :blk .wait;
                 };
@@ -3167,8 +3124,6 @@ pub fn Runtime(comptime App: type) type {
                     .ready => |value| return value,
                     .wait => {},
                 }
-                // A cancelled or shutting-down worker must not hold the send
-                // (or the worker-thread join at shutdown) for the full wait.
                 if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested")) {
                     if (app.worker.isCancelRequested()) {
                         debug_trace.logf("session", "event=fresh_prompt_boundary_aborted reason=cancel_requested", .{});
@@ -3385,8 +3340,6 @@ pub fn Runtime(comptime App: type) type {
             else
                 types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
                 return switch (mode) {
-                    // In-memory preparation failure (out of memory) cannot be
-                    // degraded: the in-memory commit needs the prepared copy.
                     .strict, .finished_prompt => err,
                     .visual_epoch => .uncommitted,
                 };
@@ -3474,8 +3427,6 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             if (persistence_failure) |err| {
-                // A finished turn kept in memory cannot be followed by another
-                // prompt while its unfinished copy is still in the journal.
                 recordShutdownFailure(app, err);
                 if (loaded.conversation_writer.turn_open and loaded.conversation_writer.failure == null) {
                     loaded.conversation_writer.failure = error.SessionCommitFailed;
@@ -3985,7 +3936,6 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
-                // A missing finished turn cannot be followed by another saved turn.
                 if (loaded.conversation_writer.failure == null) {
                     loaded.conversation_writer.failure = error.SessionCommitFailed;
                 }
@@ -4293,9 +4243,6 @@ pub fn Runtime(comptime App: type) type {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     }
-                    // Use the app's live workspace root: the replayed status
-                    // phrases are generated with that same root, so this keeps
-                    // both halves of the row consistent.
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
@@ -4701,8 +4648,6 @@ pub fn Runtime(comptime App: type) type {
                         return store.visitConversationHistory(app.alloc, loaded.active_id, &visitor);
                     }
                 }
-                // v2 shows every saved turn too, not only those since the
-                // newest compaction.
                 if (app.session_persistence.v2) |v2| {
                     const Visitor = struct {
                         app: *App,
@@ -4740,9 +4685,6 @@ pub fn Runtime(comptime App: type) type {
             display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
-            // Only a real title enters the cache: the fallback placeholder must
-            // not count as an existing title, or background title generation
-            // would consider the session already named and never run.
             if (display.present) try setCachedSessionTitle(app, display.title);
             switch (notice) {
                 .session => try sink.appendNotice(.{
@@ -4768,8 +4710,6 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = display.title,
                     });
-                    // A plain line, so the command copies as it is. Forks
-                    // exist only on v2, so the command always names it.
                     const line = try app.alloc.print("original session fx --sessions-v2 --resume {s}\n", .{source_id});
                     defer app.alloc.free(line);
                     try sink.appendRaw(line);
@@ -4802,17 +4742,11 @@ pub fn Runtime(comptime App: type) type {
                     checkpoint.assistant_source,
                 );
             }
-            // A compaction_prepared checkpoint records completed source owned by
-            // the compaction flow, not a turn waiting to run; it gets no recovery
-            // notice and no automatic continuation. Only a checkpoint the gate
-            // will actually auto-continue may promise one; a suppressed
-            // checkpoint gets the gate's own notice below.
             const recovery_notice_suppressed = if (recovery_decision) |decision|
                 decision != .auto_continue
             else
                 checkpoint.cause == .compaction_prepared;
             if (!recovery_notice_suppressed) {
-                // No attempt counts: there is no budget to count against.
                 const recovery_notice: []const u8 = if (checkpoint.tool_state == .uncertain)
                     "model response recovery paused and continues automatically; inspect the uncertain tool state if anything looks wrong"
                 else
@@ -5176,8 +5110,6 @@ pub fn Runtime(comptime App: type) type {
                 .completed
             else
                 .failed;
-            // tty runs are not captured commands but still own a live session
-            // with a launch command worth recording for later session rows.
             if (outcome == .completed and (is_command or std.mem.eql(u8, call.name, "shell"))) {
                 try recordHistoricalSessionLabel(app, labels, call, result);
             }
@@ -5203,9 +5135,6 @@ pub fn Runtime(comptime App: type) type {
                 ) or
                 try writeStoredCommandOutput(app, sink, result) or
                 try writeSavedCommandOutput(sink, result.output);
-            // Attach terminal detail after historical command chunks so typed
-            // process presentation joins the existing block instead of
-            // synthesizing a second, empty command-output block.
             if (wrote_command_output) {
                 try sink.attachHistoricalToolDetailAfterCommandOutput(
                     entry_id,
@@ -5375,8 +5304,6 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 
-            // Spilled snapshots stay on disk: the transcript renders the inline
-            // preview, and the full review is built only when it is opened.
             var deferred: ?diff.DeferredFullDiff = null;
             if (presentation.content_handle) |handle| {
                 if (presentation.lifecycle_id) |lifecycle_id| {
@@ -5712,8 +5639,6 @@ pub fn Runtime(comptime App: type) type {
                 };
                 break :blk .{ .session_id = session_id };
             } else null;
-            // WASM hosts keep sessions in the JavaScript host store, never in a
-            // native session directory, so only native builds discard here.
             const discard_empty = if (comptime host_target.is_wasm)
                 false
             else
@@ -5728,7 +5653,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !host_target.is_wasm) {
                 if (discard_empty) {
                     if (app.session_persistence.store) |store| {
-                        // Consumes `loaded` on every return; the store logs the disposition.
                         _ = store.discardPristineStartedSession(app.alloc, loaded);
                         app.session_persistence.writable = null;
                         return handoff;
@@ -6173,8 +6097,6 @@ pub fn Runtime(comptime App: type) type {
                 preferences,
             );
             if (app.session_persistence.process_provider_override) |override_provider| {
-                // --provider pins the provider for this resumed launch; the
-                // resolved model arrives through process_model_override below.
                 try provider_runtime.replaceSelection(app, override_provider, preferences.model);
             } else if (config_runtime.providerEnvOverride() != null) {
                 var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
@@ -6194,8 +6116,6 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            // Launch flags (fx --effort/--fast) win over the resumed session's
-            // stored preferences for this launch, without rewriting them.
             const effective_effort = app.session_persistence.process_effort_override orelse preferences.effort;
             const effective_fast_mode = app.session_persistence.process_fast_override orelse preferences.fast_mode;
             const effective_ultrafast_mode = resolveUltrafastMode(
@@ -6256,7 +6176,6 @@ pub fn Runtime(comptime App: type) type {
             store.rememberSessionId(app.alloc, id) catch |err| {
                 debug_trace.logf("session", "event=remember_session_failed id={s} err={s}", .{ id, @errorName(err) });
                 var failure = RememberFailure{ .id = undefined, .len = id.len, .err = err };
-                // Native loaded session IDs have already passed Store validation.
                 @memcpy(failure.id[0..id.len], id);
                 return failure;
             };
@@ -7568,7 +7487,6 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
     }
     const home = try TestHome.install(alloc, paths.home);
     defer home.deinit();
-    // fx keeps `.fx` private, and resuming a v2 session verifies that.
     const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ paths.home, ".fx" });
     defer alloc.free(fx_dir);
     if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
@@ -7718,7 +7636,6 @@ test "resume handoff suppresses missing and pristine writable sessions" {
 
     try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
     try std.testing.expect(app.session_persistence.writable == null);
-    // Nothing durable happened, so closing leaves no empty session behind.
     try std.testing.expectError(
         error.SessionNotFound,
         app.session_persistence.store.?.loadReadOnly(alloc, pristine_id),
@@ -7780,7 +7697,6 @@ test "upgrade resume handoff owns a validated pristine session" {
     defer handoff.deinit(alloc);
 
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
-    // The relaunch resumes this id, so closing must not discard it.
     var kept = try app.session_persistence.store.?.loadReadOnly(alloc, expected_id);
     defer kept.deinit(alloc);
     try std.testing.expectEqualStrings(expected_id, kept.id);
@@ -8080,7 +7996,6 @@ test "execution replay labels shell session interactions with their launch comma
         "● Completed shell python3 -u - <<'PY' import time PY\n",
         app.completed_tool_statuses.items[1],
     );
-    // A session with no recorded launch command keeps the raw-id presentation.
     try std.testing.expectEqualStrings(
         "● Completed shell\n",
         app.completed_tool_statuses.items[2],
@@ -8250,8 +8165,6 @@ test "execution replay records session labels for tty-launched sessions" {
 
     try Runtime(TestApp).replayHistory(&app, &history);
 
-    // A tty-launched session is recorded the same way, so the observe row
-    // renders the launch command instead of the raw session id.
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings(
         "● Completed shell npm run dev\n",
@@ -8344,7 +8257,6 @@ test "resume projection stores reflow metadata for session action rows" {
     }
     try std.testing.expect(observed_metadata);
 
-    // The unknown session keeps its raw-id presentation and stores nothing.
     for (projection.runtime.tool_details.items) |*detail| {
         const display = detail.command_display orelse continue;
         try std.testing.expect(std.mem.find(u8, display, "shell-9") == null);
@@ -8360,8 +8272,6 @@ test "resume projection restores session action rows with labels seeded from the
     defer source_runtime.deinit(alloc);
     var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
     defer projection.deinit();
-    // Resume always seeds the labels root from the app's live workspace root;
-    // the origin root only records where the session was created.
     var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
     defer labels.deinit(app.alloc);
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
@@ -8411,8 +8321,6 @@ test "resume projection restores session action rows with labels seeded from the
     try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = first_steps[0..] }, &labels);
     try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = second_steps[0..] }, &labels);
 
-    // The observe row resolves the recorded launch command through the live
-    // root instead of falling back to the raw session id.
     var observed_metadata = false;
     for (projection.runtime.tool_details.items) |*detail| {
         const action = detail.command_action_label orelse continue;
@@ -8435,10 +8343,6 @@ test "resume projection stores reflow metadata after the session moved workspace
     defer source_runtime.deinit(alloc);
     var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
     defer projection.deinit();
-    // Command reclip metadata resolves against the app's live root even when
-    // the sink labels root is empty: the replayed status phrases are
-    // generated with that same root, and withholding the metadata would
-    // freeze every absolute-path command row at the compact activity bound.
     var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "" };
     defer labels.deinit(app.alloc);
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
@@ -8473,8 +8377,6 @@ test "resume projection stores reflow metadata after the session moved workspace
     for (projection.runtime.tool_details.items) |*detail| {
         const display = detail.command_display orelse continue;
         if (std.mem.eql(u8, detail.command_action_label orelse "", "Ran")) {
-            // Abbreviated against the live root, full length, never the
-            // compact-bound frozen form.
             try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
             try std.testing.expect(display.len > 120);
             stored = true;
@@ -9522,8 +9424,6 @@ test "upgrade resume of a pristine session leaves the title cache empty for gene
         "",
     );
 
-    // The fallback placeholder must not be cached as a title: the session is
-    // still untitled, so its first prompt can start title generation.
     try std.testing.expectEqual(@as(usize, 0), app.session_title.items.len);
 }
 
@@ -11082,8 +10982,6 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    // A finished turn whose file evidence carries an empty path: the
-    // conversation validator rejects the write with InvalidConversationEvent.
     var evidence = [_]types.FileEvidence{.{
         .path = @constCast(""),
         .tool_call_id = @constCast("call_poison"),
@@ -11099,18 +10997,14 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
 
     try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = poisoned });
 
-    // The turn stays in memory and the process keeps running.
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
-    // The failure is latched for shutdown reporting.
     try std.testing.expectEqual(
         @as(?anyerror, error.InvalidConversationEvent),
         app.session_persistence.shutdown_failure,
     );
-    // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not save") != null);
 
-    // Nothing of the rejected turn reached the journal.
     {
         var loaded = try app.session_persistence.store.?.loadReadOnly(
             alloc,
@@ -11120,7 +11014,6 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
         try std.testing.expectEqual(@as(usize, 0), loaded.history.len);
     }
 
-    // A later clean turn still persists; the writer is not latched shut.
     const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");
     defer session_runtime.freeHistoryTurn(alloc, clean);
     try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = clean });
@@ -11616,8 +11509,6 @@ test "session picker cold open paints the persisted catalog before revalidation"
         var writable = try store.startWritableSession(alloc, durable);
         writable.deinit(alloc);
     }
-    // Publish the on-disk picker catalog, then drop the in-memory copy so the
-    // next open is cold, as in a freshly launched process.
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
@@ -11628,15 +11519,10 @@ test "session picker cold open paints the persisted catalog before revalidation"
 
     try Runtime(TestApp).openSessionPicker(&app);
     const picker = &app.session_persistence.session_picker;
-    // The stale disk rows paint immediately, newest first, and the background
-    // revalidation scan is still scheduled because the catalog is not fresh.
     try std.testing.expectEqual(.ready, picker.load_state);
     try std.testing.expectEqual(@as(usize, 2), picker.summaries.items.len);
     try std.testing.expectEqualStrings("new-saved", picker.summaries.items[0].id);
     try std.testing.expect(!app.session_persistence.session_picker_cache.isFresh());
-    // Revalidation scheduling is best-effort: thread spawn can fail under
-    // load, so the scheduling contract is covered by the not-fresh state and
-    // the loading-state tests rather than by observing the task handle here.
 }
 
 test "session catalog preload feeds the picker open without a second scan" {
@@ -11661,8 +11547,6 @@ test "session catalog preload feeds the picker open without a second scan" {
     } }};
     try writeSessionFixture(alloc, app.session_persistence.store.?, "preloaded-session", &history, 0);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    // The preload only runs for picker-known profiles: seed the persisted
-    // catalog once, as a previous picker open would.
     const store = app.session_persistence.store.?;
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
@@ -11681,8 +11565,6 @@ test "session catalog preload feeds the picker open without a second scan" {
     const loader = &app.session_persistence.session_picker_load;
     const preloaded = loader.task orelse return error.TestExpectedEqual;
 
-    // A picker opened mid-preload adopts the in-flight scan instead of
-    // scheduling a second one.
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expect(loader.task == preloaded);
     try std.testing.expectEqual(
@@ -11690,17 +11572,12 @@ test "session catalog preload feeds the picker open without a second scan" {
         app.session_persistence.session_picker.generation,
     );
 
-    // The picker may already read ready from the persisted catalog, so drain
-    // the loader rather than the load state: the preload is installed into the
-    // in-memory catalog only through the poll path.
     try waitForSessionPickerPrewarm(&app);
     const picker = &app.session_persistence.session_picker;
     try std.testing.expectEqual(.ready, picker.load_state);
     try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
     try std.testing.expectEqualStrings("preloaded-session", picker.summaries.items[0].id);
 
-    // Once the preload lands, a reopen within the freshness window paints from
-    // memory and schedules nothing.
     Runtime(TestApp).cancelSessionPicker(&app);
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expectEqual(.ready, picker.load_state);
@@ -11723,15 +11600,12 @@ test "session catalog preload is best-effort and never duplicates an in-flight s
 
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
-    // Without a session store there is nothing to scan; preload is a no-op.
     Runtime(TestApp).preloadSessionCatalog(&app);
     try std.testing.expect(app.session_persistence.session_picker_load.task == null);
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    // A profile that has never listed sessions has no catalog to warm; the
-    // preload stays off until one exists.
     Runtime(TestApp).preloadSessionCatalog(&app);
     try std.testing.expect(app.session_persistence.session_picker_load.task == null);
 
@@ -11853,11 +11727,9 @@ test "session picker navigation clamps at both ends instead of wrapping" {
         try picker.appendSummary(alloc, &summary);
     }
 
-    // At the top, moving up stays on the first item (no wrap to the last).
     try std.testing.expect(picker.moveVisibleItems(-1, 2));
     try std.testing.expectEqual(@as(usize, 0), picker.selected);
 
-    // At the bottom, moving down stays on the last item (no wrap to the first).
     picker.selected = 1;
     try std.testing.expect(picker.moveVisibleItems(1, 2));
     try std.testing.expectEqual(@as(usize, 1), picker.selected);
@@ -12318,13 +12190,11 @@ test "renameActiveSession persists the title only in session metadata" {
 
     try Runtime(TestApp).renameActiveSession(&app, "  deploy pipeline fix  ");
 
-    // Cached for the footer without re-reading the sidecar.
     try std.testing.expectEqualStrings(
         "deploy pipeline fix",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    // The tab shows the renamed title; the title itself lives in session.json.
     try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
 
     const loaded = &app.session_persistence.writable.?;
@@ -12375,7 +12245,6 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
 
-    // No history yet: nothing to derive.
     try Runtime(TestApp).ensureCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
 
@@ -12390,7 +12259,6 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    // A later turn must not move the frozen title.
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("a totally different second prompt") },
         .assistant = @constCast("ok"),
@@ -12402,7 +12270,6 @@ test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    // A fresh session clears it.
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
 }
@@ -12543,7 +12410,6 @@ test "session title generation never overwrites a user-set title" {
     Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
     try std.testing.expect(app.session_persistence.title_generation.task != null);
 
-    // The first turn commits and the user renames before the task lands.
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("refactor the renderer loop") },
         .assistant = @constCast("ok"),
@@ -12573,17 +12439,14 @@ test "session title generation gates on setting, history, and prompt text" {
     defer app.deinit();
     try initTitleTestSession(&app, alloc, paths.workspace);
 
-    // No usable text: nothing starts.
     Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "   ");
     try std.testing.expect(app.session_persistence.title_generation.task == null);
 
-    // Setting off: nothing starts.
     app.session_title_generation = false;
     Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
     try std.testing.expect(app.session_persistence.title_generation.task == null);
     app.session_title_generation = true;
 
-    // Existing history: nothing starts.
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("earlier prompt") },
         .assistant = @constCast("ok"),
@@ -12665,7 +12528,6 @@ test "title generation load retains spawn failures and apply-time drops" {
     try std.testing.expectEqualStrings("test/title-model", load.last.model());
     try std.testing.expectEqualStrings("sess-123", load.last.sessionId());
 
-    // Apply-time drops only rewrite a successful result.
     load.recordDropped(.session_changed, "");
     try std.testing.expectEqual(TitleGenerationLoad.Status.failed, load.last.status);
 
@@ -12921,7 +12783,6 @@ test "remembered continuation consumes selection without republishing and preser
     try std.testing.expectEqualStrings("remembered", app.session_persistence.writable.?.active_id);
     try std.testing.expectError(error.SessionBusy, store.resumeTargetForWrite(alloc, .{ .id = "remembered" }, paths.workspace, .{ .log = .{ .session_lock_deadline_ms = 0 } }));
     try store.rememberSessionId(alloc, "newer-selection");
-    // Reading a remembered target is not another publication; exact selection still is.
     const retained = (try store.readRememberedSessionId(alloc)).?;
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("newer-selection", retained);
@@ -12981,7 +12842,6 @@ test "recovery auto-continue asks after an unclean exit instead of restarting" {
     defer interrupted.deinit(alloc);
     try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false));
     try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false));
-    // Suppression stays sticky: a clean quit without a resolution still asks.
     try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true));
     try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true));
 
@@ -13008,7 +12868,6 @@ test "fresh prompt boundary waits out the cancel finalization window" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    // The cancel-finalization window: turn still open, checkpoint cleared.
     app.session_persistence.writable.?.conversation_writer.turn_open = true;
     const started_ms = io_mod.milliTimestamp();
     try std.testing.expectError(
@@ -13017,7 +12876,6 @@ test "fresh prompt boundary waits out the cancel finalization window" {
     );
     try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 150);
 
-    // A checkpointed open turn still resolves immediately.
     try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
         .turn_id = 1,
         .user = .{ .text = @constCast("saved pending request") },
@@ -13033,7 +12891,6 @@ test "fresh prompt boundary waits out the cancel finalization window" {
     var ready = (try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200)).?;
     ready.deinit(alloc);
 
-    // A close landing mid-wait resolves the boundary as no prior turn.
     try Runtime(TestApp).clearRecoveryCheckpoint(&app);
     const closer = try std.Thread.spawn(.{}, struct {
         fn run(app_ptr: *TestApp) void {
@@ -13069,7 +12926,6 @@ test "fresh prompt boundary fails fast after the first wedged timeout" {
         error.InvalidRecoveryCheckpoint,
         Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
     );
-    // The wedge is latched: later sends fail fast instead of re-waiting.
     const latched_ms = io_mod.milliTimestamp();
     try std.testing.expectError(
         error.InvalidRecoveryCheckpoint,
@@ -13077,10 +12933,8 @@ test "fresh prompt boundary fails fast after the first wedged timeout" {
     );
     try std.testing.expect(io_mod.milliTimestamp() - latched_ms < 150);
 
-    // The latch clears when the turn closes...
     app.session_persistence.writable.?.conversation_writer.turn_open = false;
     try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200) == null);
-    // ...and a later open turn earns a full wait again.
     app.session_persistence.writable.?.conversation_writer.turn_open = true;
     const reopened_ms = io_mod.milliTimestamp();
     try std.testing.expectError(

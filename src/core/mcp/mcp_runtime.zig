@@ -359,7 +359,6 @@ pub const McpRuntime = struct {
             self.discovery_thread = null;
             thread.join();
         }
-        // A discarded runtime never waits out per-server grace windows.
         for (self.servers.items) |server| self.destroyServer(server, shutdown_mode);
         self.servers.deinit(self.alloc);
         for (self.workspace_diagnostics.items) |*diagnostic| {
@@ -1500,7 +1499,6 @@ pub const McpRuntime = struct {
         }
         self.catalog_mutex.unlock(io_mod.getIo());
         defer {
-            // Workers have joined before the batch releases its publication barrier.
             for (jobs[0..index_count]) |server| server.startup_state.store(.complete, .release);
         }
 
@@ -2548,9 +2546,6 @@ pub const McpRuntime = struct {
             options,
             &images,
         ) catch |err| switch (err) {
-            // A server that never advertised resources or prompts has not
-            // failed; the feature is simply absent. Tell the model instead of
-            // surfacing a tool execution failure.
             error.McpResourcesUnsupported, error.McpPromptsUnsupported => try renderUnsupportedForModel(
                 alloc,
                 request.action,
@@ -3497,8 +3492,6 @@ fn connectServerCancellable(
     cancel_requested: *std.atomic.Value(bool),
     timeout_override: ?std.Io.Duration,
 ) !void {
-    // Fix the span from the same instant as the deadline so later work,
-    // such as loading stored credentials, cannot shave it.
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     const control = (connection_control.Control{
         .deadline = startupDeadline(now, server.config.startup_timeout_ms, timeout_override),
@@ -3912,14 +3905,10 @@ test "legacy URL completions require an established unique candidate before repl
     );
     defer direct.deinit();
 
-    // A valid-looking completion is still unknown until the corresponding
-    // request or URL-required response establishes its id.
     routeLegacyCompletionNotification(&runtime, source, direct.value);
     try std.testing.expectEqual(@as(usize, 0), runtime.completions.early_legacy_url_completions.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.completions.legacy_url_completion_candidates.items.len);
 
-    // HTTP response and notification streams can race. A bounded operation
-    // window retains the frame only until the exact response candidate arrives.
     const window_generation = try runtime.beginLegacyUrlCompletionWindow(
         source,
         runtime.completions.runtime_generation,
@@ -3964,8 +3953,6 @@ test "legacy URL completions require an established unique candidate before repl
         runtime.completions.legacy_url_completion_candidates.items[0].status,
     );
 
-    // Late duplicates cannot create replayable state, and the server-context
-    // uniqueness rule prevents the id from being issued again.
     routeLegacyCompletionNotification(&runtime, source, direct.value);
     try std.testing.expectEqual(@as(usize, 0), runtime.completions.early_legacy_url_completions.items.len);
     try std.testing.expectError(
@@ -4055,7 +4042,6 @@ test "legacy URL completions require an established unique candidate before repl
         .deadline_ms = std.math.maxInt(i64),
     }, "url-required"));
 
-    // Candidate tombstones are never evicted by transient early-frame pressure.
     var id_buffer: [64]u8 = undefined;
     var candidate_index: usize = runtime.completions.legacy_url_completion_candidates.items.len;
     while (candidate_index < max_legacy_url_completion_candidates) : (candidate_index += 1) {
@@ -5696,7 +5682,6 @@ test "server_transport.connectServer completes NDJSON handshake against a real s
 
 test "server_transport.connectServer keeps the restart when discovery stalled before the legacy launch exited" {
     const alloc = std.testing.allocator;
-    // Ignores the modern discovery probe, then exits on the legacy initialize.
     const shell_server =
         \\IFS= read -r line
         \\case "$line" in
@@ -5712,7 +5697,6 @@ test "server_transport.connectServer keeps the restart when discovery stalled be
     var used = tool_names.Registry.init(alloc);
     defer used.deinit();
 
-    // Not every launch ended on its own, so this is not the no-restart error.
     try std.testing.expectError(
         error.McpInitFailed,
         server_transport.connectServer(alloc, &server, .{}, &used, .{}),
@@ -6754,7 +6738,6 @@ test "caller cancellation interrupts blocked candidate connection" {
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expect(runtime.servers.items[0].last_error == null);
-    // Cancellation is not a startup failure and never spends a restart.
     try std.testing.expectEqual(@as(u8, 0), runtime.servers.items[0].restart_attempts);
 }
 
@@ -7138,7 +7121,6 @@ test "McpRuntime continues discovery after one server times out" {
 
     try std.testing.expect(!runtime.isDiscovering());
     try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state.load(.acquire));
-    // The private override, not startup_timeout_ms, set this limit.
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 2000 ms",
         runtime.servers.items[0].last_error.?,
@@ -8253,7 +8235,6 @@ test "scoped MCP authentication rendering excludes denied servers" {
     try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "DENIED_SECRET_ENV") != null);
 
-    // A scoped caller cannot learn why a denied server is down either.
     runtime.servers.items[1].setFailed(alloc, "MCP server exited with code 1 before completing startup");
     try std.testing.expect(try renderServerFailure(alloc, runtime.servers.items, &scoped, "denied") == null);
     const failure = (try renderServerFailure(alloc, runtime.servers.items, &root, "denied")).?;
@@ -8562,8 +8543,6 @@ test "tool call request compacts pretty-printed arguments into a single line" {
     const request = try buildToolCallRequest(alloc, 7, "raw/tool", pretty);
     defer alloc.free(request);
 
-    // The frame must not contain any raw newline; the escaped "\n" inside the
-    // string value must be preserved.
     try std.testing.expect(std.mem.find(u8, request, "\n") == null);
     try std.testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"raw/tool\",\"arguments\":{\"path\":\"/tmp/a\",\"note\":\"line one\\nline two\"}}}",

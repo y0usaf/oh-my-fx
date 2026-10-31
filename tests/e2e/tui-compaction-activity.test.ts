@@ -4,7 +4,6 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-// The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const {
   FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall,
@@ -15,8 +14,6 @@ const {
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
 const TAIL = "HISTORY_TAIL_16d3";
-// A fact entry, which the compacted conversation keeps whatever the turn
-// numbers.
 const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
@@ -44,7 +41,6 @@ async function until(predicate: () => boolean, label: string, timeout = 20_000) 
 }
 
 async function fixture(trigger: Trigger, outcome: Outcome = "success", longResume = false) {
-  // Ctrl+O includes the recording path; keep it free of forbidden notice words.
   const root = mkdtempSync(join(tmpdir(), "fx-activity-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -54,8 +50,6 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
     model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
   }));
-  // Failure attempts need an older exchange outside the retained suffix, but
-  // must leave the next ordinary request below the automatic pressure threshold.
   const seedTurns = trigger === "manual" && outcome !== "success" ? 3 : 1;
   const lines = seedTurns > 1 ? 400 : trigger === "ordinary" ? 2 : trigger === "auto" || longResume ? 18_000 : 1600;
   const seedReply = (turn: number) => `${turn === 1 ? HEAD : `HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(lines)}SEED_DONE_${turn}${turn === seedTurns ? `\n${TAIL}` : ""}`;
@@ -81,11 +75,8 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
         return Response.json({ error: { message: "Synthetic summary rejection for Bearer abcdef0123456789xyz" } }, { status: 400 });
       }
       if (phase === "attempt" && summaries === 1) return summaryHold.response;
-      // Each chunk/retry needs a fresh Response, not a consumed held body.
       return fakeGatewayFinalText(phase === "attempt" && outcome === "empty" ? "" : HANDOFF);
     }
-    // Each seed turn reads a note before replying, so compaction has work to
-    // summarize. That extra request is not counted as ordinary.
     const seedRead = `seed-read-${ordinary + 1}`;
     if (phase === "seed" && !raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
     ordinary++;
@@ -141,16 +132,12 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       delete terminalEnv.FX_TRACE_LOG;
       delete terminalEnv.FX_TRACE_SCOPES;
     }
-    // Do not inherit provider overrides, credentials, shell startup or dotenv state.
     const command = `/usr/bin/env -i ${Object.entries(terminalEnv).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;
     terminal = await TmuxSession.create({
       cmd: command, cwd: workspace, env: { HOME: home, FX_SOUND: "0" }, isolated: true,
       stderrPath: stderr, width: 90, height: 32, minimumHistoryLines: 25_000,
       startupWaitMs: 0,
     });
-    // A composer can be painted while resume history is still being restored.
-    // Wait for a stable frame, then acknowledge input without submitting a turn
-    // or retiring the retained resume transcript before the tested /compact.
     await terminal.waitForStableComposer(20_000);
     await terminal.sendLiteral("startup-input-handshake");
     await terminal.waitForText("startup-input-handshake", 5000);
@@ -161,10 +148,6 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   async function waitForResumeHandoff() {
     if (lines < 18_000) return;
     const tracePath = join(root, `terminal-${launchIndex}.trace`);
-    // Wait only after submission: the composer accepts input during restoration,
-    // but replies need the immutable history source to hand off to the live one.
-    // 18k rows / 64 per frame needs about 282 frames. Debug observations reached
-    // 77 ms median / 134 ms max per frame; 60s bounds the drain, not the reply.
     await until(() => readFileSync(tracePath, "utf8").includes("resume historical flow committed"),
       `resume history-source handoff in ${tracePath}`, 60_000);
   }
@@ -262,7 +245,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       let passed = false;
       try {
         const terminal = await f.launch();
-        // First interaction after a long resume; do not retire the resume source with a prompt.
         await terminal.sendText(trigger === "manual" ? "/compact" : "Continue the current turn.");
         await until(() => f.counts().summaries === 1, "first summary request");
         await assertLive(terminal);
@@ -283,8 +265,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (trigger === "manual") {
           await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
-          // The reply holds only facts, so fx asks once more for the notes
-          // of the turn that did work.
           expect(f.counts().summaries).toBe(2);
         } else {
           await until(() => f.counts().ordinary === f.seedTurns + (trigger === "overflow" ? 2 : 1), "ordinary request after compaction");
@@ -336,16 +316,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForText(ACTIVITY, 10_000);
         const steer = trigger === "manual" ? "STEER_DURING_COMPACT_7f2a" : "STEER_DURING_AUTOCOMPACT_3b9c";
         await terminal.sendText(steer);
-        // While the summary is held, the message must neither start its own
-        // turn nor cancel the compaction: no new gateway request arrives and
-        // the activity row stays visible. The resume backlog can delay fresh
-        // transcript cards, so only footer activity is asserted here.
         await Bun.sleep(1500);
         expect(f.counts()).toEqual({ summaries: 1, ordinary: f.seedTurns, overflowSent: false });
         await terminal.waitForText(ACTIVITY, 5000);
-        // Flip phases before releasing so every later ordinary request gets a
-        // fresh FOLLOWUP response; the steer turn can start within milliseconds
-        // of the checkpoint, before a later flip would land.
         f.phase("followup");
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
@@ -369,15 +342,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await terminal.waitForText(ACTIVITY, 10_000);
       const steer = "STEER_DURING_OVERFLOW_5c1d";
       await terminal.sendText(steer);
-      // While the summary is held, the message must neither start its own
-      // turn nor cancel the compaction.
       await Bun.sleep(1500);
       expect(f.counts()).toEqual({ summaries: 1, ordinary: f.seedTurns + 1, overflowSent: true });
       await terminal.waitForText(ACTIVITY, 5000);
       f.summaryHold.release(HANDOFF);
       await until(() => f.durable() > 0, "acknowledged checkpoint");
-      // The rebuilt continuation is held by ordinaryHold; the steering must
-      // already ride it, as same-turn guidance, before any reply arrives.
       await until(() => f.requestsContaining(steer).length > 0, "steering in the rebuilt request");
       const steered = f.requestsContaining(steer);
       expect(steered).toHaveLength(1);
@@ -411,7 +380,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && pane.includes(feedback) && hasEmptyComposer(pane), 15_000);
         expect(f.durable()).toBe(0);
         expect(f.counts().ordinary).toBe(f.seedTurns);
-        // A failed or empty summary is retried once on the fallback model.
         expect(f.counts().summaries).toBe(outcome === "cancel" ? 1 : 2);
         const afterFailure = f.counts();
         if (outcome === "cancel") f.summaryHold.dispose();
@@ -455,9 +423,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.sendInterruptEscapePair(10_000);
         if (trigger === "auto") {
           await terminal.waitForText("Compaction cancelled.", 10_000);
-          // An empty composer already exists while feedback is visible. Wait
-          // for Escape's visible acknowledgement, not a fixed sendKeys delay,
-          // so the slash in /quit cannot become part of a Meta key sequence.
           terminal.sendKeysImmediate(["Escape"]);
         } else {
           await terminal.waitForText("Cancelled", 10_000);
@@ -528,13 +493,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         return true;
       }, "trace report", 15_000);
 
-      // No FX_TRACE_LOG was configured, so the opt-in trace tail is absent while
-      // the always-on compaction section still carries the full story.
       expect(report).not.toContain("## Trace Tail");
       expect(report).toContain("## Context Compaction\n");
       expect(report).toMatch(/last=\d+ failed=[1-9]\d* \(always recorded; does not require FX_TRACE\)/);
       expect(report).toContain("event=summary_transport_failed");
-      // Provider error text is secret-masked before it reaches the report.
       expect(report).toContain("[redacted]");
       expect(report).not.toContain("abcdef0123456789xyz");
       expect(report).toContain("event=transaction_failed");
@@ -616,7 +578,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       writeFileSync(join(workspace, `probe-${n}.txt`), `STEER_PROBE_${n}_8d4 context pressure line\n`.repeat(250));
     }
     const task = "STEER_TASK_8d4: read the probe files and report progress.";
-    // Longer than the excerpt compaction used for generated notices.
     const steering = "STEER_RULE_8d4: prefix every progress line with S1>. " +
       "Keep all of this correction. ".repeat(80) + "STEER_END_8d4";
     const ordinaryBodies: string[] = [];
@@ -669,11 +630,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         .join("\n");
       const at = source.indexOf("STEER_RULE_8d4");
       expect(at).toBeGreaterThan(-1);
-      // Steering is the user's own message, labeled as added during the turn.
       const header = source.slice(source.lastIndexOf("[", at), at);
       expect(header).toBe("[User, added while the assistant worked]\n");
       expect(source).toContain(steering);
-      // The task stays the live request, so the summarizer sees it only as context.
       expect(source).toContain(`[Turn in progress]\n[User, this message stays in the conversation after the summary]\n${task}`);
 
       const sessionId = readdirSync(join(home, ".fx/sessions"))
@@ -685,7 +644,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         .map((line) => JSON.parse(line)).find((frame) => frame.event?.context_checkpoint)?.event.context_checkpoint.summary ?? "";
       expect(handoff.startsWith("fx-compactor-v1\n")).toBe(true);
       const state = JSON.parse(handoff.slice("fx-compactor-v1\n".length));
-      // Only the turn in progress was compacted; its steering is kept exactly.
       expect(state.turns).toEqual([]);
       expect(state.open.users).toEqual([steering]);
       expect(state.tool_count).toBeGreaterThan(0);
@@ -723,9 +681,6 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       mkdirSync(workspace);
       copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), image);
       copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), queuedImage);
-      // After an overflow the whole request, fx's own instructions included,
-      // must fit a fifth of the rejected one, so the newest reads are small
-      // enough to stay: the six newest steps are kept, the one before is not.
       for (let step = 2; step <= 24; step++) {
         writeFileSync(join(workspace, `probe-${step}.txt`),
           Array.from({ length: step >= 20 ? 2 : 80 }, (_, line) =>

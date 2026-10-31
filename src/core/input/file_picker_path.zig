@@ -77,8 +77,6 @@ pub fn parse_at(text: []const u8, start: usize) ?Token {
         if (end < text.len and text[end] == '\'') {
             end = token_end(text, path_start);
         } else {
-            // A quote embedded in a bare filename is data, including a prose
-            // quote that follows it. It must not swallow later @ occurrences.
             while (end < text.len and !is_separator(text[end])) : (end += 1) {
                 if (text[end] == '\\' and end + 1 < text.len) end += 1;
             }
@@ -187,7 +185,6 @@ pub fn query_at(text: []const u8, cursor: usize) ?Query {
         const prefix = text[token.path_start..cursor];
         if (!text_utils.isTerminalSafe(prefix)) return null;
         if (!token.quoted) {
-            // Bare completion has always replaced only the prefix at the caret.
             for (prefix) |byte| if (is_separator(byte)) return null;
         }
         return .{

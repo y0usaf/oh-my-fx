@@ -1,11 +1,3 @@
-// A stand-in browser for `mcpv2 auth --json` (U12). Runs the command and
-// passes its output through. When it prints {"authorize": url}, it requests
-// url without following the redirect, then goes to the redirect's address
-// itself, as a browser would: mcpv2's loopback listener. With --deny it goes
-// back with access_denied instead of the code, as a user who refuses.
-// Exits with the command's exit code.
-//
-// Usage: bun tests/tla/drivers/mcp/fakes/browser.ts [--deny] -- <argv...>
 
 const args = process.argv.slice(2);
 const deny = args[0] === "--deny";

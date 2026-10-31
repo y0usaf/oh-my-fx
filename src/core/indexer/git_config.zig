@@ -335,11 +335,7 @@ const Loader = struct {
 
     fn readFile(self: *Loader, path: []const u8, scope: Scope, depth: usize) Allocator.Error!void {
         if (depth > max_include_depth) return self.markUnavailable(path, "include_depth");
-        // git reads /dev/null as an empty file; it is commonly used to
-        // disable a config level.
         if (std.mem.eql(u8, path, "/dev/null")) return;
-        // System and user config, and what they include, are the user's own
-        // files, often links from a dotfile manager.
         const follow = scope == .system or scope == .global;
         try self.paths.append(self.arena, .{ .path = path, .follow_symlinks = follow });
         const outcome = if (follow)
@@ -563,7 +559,6 @@ pub fn ignoreSettings(arena: Allocator, loaded: Loaded, context: *const Context)
             break :blk try std.Io.Dir.path.join(arena, &.{ home, raw[2..] });
         }
         if (std.Io.Dir.path.isAbsolute(raw)) break :blk raw;
-        // git resolves a relative path from the worktree root, its cwd.
         const layout = context.layout orelse break :blk null;
         break :blk try std.Io.Dir.path.join(arena, &.{ layout.worktree_root, raw });
     } else if (context.xdg_config_home) |xdg|
@@ -686,7 +681,6 @@ test "config includes follow relative and home paths, skip missing files and sto
 
     const loaded = try loadAll(arena, &repo.context);
     const settings = try ignoreSettings(arena, loaded, &repo.context);
-    // The last value wins in file order, after spliced-in includes.
     try std.testing.expect(!settings.ignore_case);
     try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ repo.root, "home/from-b" }), settings.excludes_file.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.unavailable.len);
@@ -729,7 +723,6 @@ test "config includeIf evaluates gitdir, gitdir/i and onbranch, and never hascon
     try std.testing.expectEqualStrings("/play-excludes", play.excludes_file.?);
     try std.testing.expect(!play.ignore_case);
 
-    // Outside any repository no condition matches.
     var no_repo = matching.context;
     no_repo.layout = null;
     no_repo.git_dir_real = null;
@@ -759,7 +752,6 @@ test "user config links are followed and repository config links are not" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const repo = try testRepo(arena, &tmp, "repo", "main");
-    // A dotfile manager links the user's files into the home folder.
     try writeTestFile(tmp.dir, "dotfiles/gitconfig", "[include]\npath = ~/.gitconfig.local\n[core]\nexcludesfile = ~/.gitignore_global\n");
     try writeTestFile(tmp.dir, "dotfiles/local", "[core]\nignorecase = true\n");
     try writeTestFile(tmp.dir, "dotfiles/ignore", "*.env\n");
@@ -778,8 +770,6 @@ test "user config links are followed and repository config links are not" {
         try std.testing.expectEqual(std.mem.startsWith(u8, read.path, home_prefix), read.follow_symlinks);
     }
 
-    // The repository's own config never follows a link, and an excludes file
-    // it names is not the user's.
     try writeTestFile(tmp.dir, "repo/.git/config", "[include]\npath = linked.inc\n[core]\nexcludesfile = /repo-excludes\n");
     try tmp.dir.symLink(std.testing.io, "../../dotfiles/local", "repo/.git/linked.inc", .{});
     const repo_loaded = try loadAll(arena, &repo.context);
@@ -808,8 +798,6 @@ test "repository filter names come only from repository config and count every i
     try std.testing.expectEqualStrings("Hidden", names[1]);
     try std.testing.expectEqualStrings("wt", names[2]);
 
-    // In values mode the onbranch include does not match and config.worktree
-    // is read only when extensions.worktreeConfig is set.
     const values = try filterDriverNames(arena, try loadAll(arena, &repo.context));
     try std.testing.expectEqual(@as(usize, 2), values.len);
     try std.testing.expectEqualStrings("lfs", values[0]);

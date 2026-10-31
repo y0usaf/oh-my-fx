@@ -328,21 +328,10 @@ export type FakeGatewayOptions = {
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
   titleResponses?: FakeGatewayResponse[];
-  // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
-  // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
-  // usage-fakes.ts. Null falls through to the routes below.
   usage?: (url: URL, request: Request) => Response | null;
-  // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
-  // the gateway). Defaults to a clear Jev decision.
   evaluationResponse?: FakeGatewayResponse;
 };
 
-// Session title generation calls carry this instruction regardless of the
-// provider protocol. Fake servers route them to their own channel so they
-// never consume queued completion responses; the default is a finish-only
-// stream so the call completes without text deltas (which would pollute
-// SSE trace assertions) and without a usable title, leaving the locally
-// derived title in place for tests that do not opt in.
 export const TITLE_GENERATION_MARKER = "Generate a short title";
 
 export function fakeGatewayTitleDefault() {
@@ -353,9 +342,6 @@ export function fakeGatewayTitleDefault() {
   }]);
 }
 
-// Finish-only Responses-protocol stream for title generation side calls at
-// Codex/Grok fake servers: completes without text deltas and without usable
-// title content, leaving the locally derived session title in place.
 export function fakeResponsesTitleDefault() {
   return new Response(
     'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
@@ -404,8 +390,6 @@ function serveFakeGateway(
           body: await req.text(),
           headers: new Headers(req.headers),
         });
-        // Mirrors the real AI Gateway evaluation-model envelope: camelCase
-        // usage and confidence under providerMetadata.typesafe.
         const evaluationResponse = options.evaluationResponse ??
           Response.json({
             answers: {
@@ -475,10 +459,6 @@ export function startFakeGateway(
   }, options);
 }
 
-// Same server and classifier handling as startFakeGateway, but every
-// completion request is answered by the supplied callback instead of a
-// finite queue. For suites that replay one response indefinitely or switch
-// on their own state.
 export function startDynamicFakeGateway(
   response: (body: string) => Response | Promise<Response>,
   options: FakeGatewayOptions = {},
@@ -486,9 +466,6 @@ export function startDynamicFakeGateway(
   return serveFakeGateway(response, options);
 }
 
-// Serves a fake update channel whose "new" artifact is a wrapper script that
-// logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
-// tests can drive the handoff without shipping a second binary.
 export function startUpgradeServer(
   root: string,
   argvLogPath: string,
@@ -848,10 +825,6 @@ export class TmuxSession {
     await sleep(100);
   }
 
-  // Interrupt active work: the first Escape arms the interrupt gesture, and a
-  // confirming press within the one-second window cancels. The confirm press
-  // is retried once when a runner stall let the arm expire between presses
-  // (the hint reappearing means the second press re-armed instead of firing).
   async sendInterruptEscapePair(hintTimeoutMs = 15_000): Promise<void> {
     await this.sendKeys("Escape");
     await this.waitForText("esc again to interrupt", hintTimeoutMs);

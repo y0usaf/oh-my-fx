@@ -95,7 +95,6 @@ try {
             if (chunk.done) controller.close();
             else controller.enqueue(chunk.value);
           } catch (error) {
-            // Cleanup can settle after the next prompt has already become ready.
             await new Promise((resolveWait) => setTimeout(resolveWait, 25));
             controller.error(error);
           }

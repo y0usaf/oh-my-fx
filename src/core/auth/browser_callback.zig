@@ -759,7 +759,7 @@ test "browser callback permits the xAI CORS private-network preflight" {
         &listener,
         null,
         &cancel_flag,
-        "https://accounts.x.ai",
+        "https:
     )) orelse return error.CallbackNeverArrived;
     accepted.respond(.ok) catch |err| {
         accepted.deinit();

@@ -74,14 +74,12 @@ pub const Parser = struct {
             try p.data.appendSlice(gpa, value);
             p.has_data = true;
         } else if (std.mem.eql(u8, field, "id")) {
-            // The SSE standard ignores an id containing NUL.
             if (std.mem.findScalar(u8, value, 0) != null) return null;
             if (value.len > p.max_event) return error.EventTooLarge;
             p.last_id.clearRetainingCapacity();
             try p.last_id.appendSlice(gpa, value);
             p.set_id = true;
         } else if (std.mem.eql(u8, field, "retry")) {
-            // Only ASCII digits count; larger values saturate.
             if (value.len == 0) return null;
             var ms: u32 = 0;
             for (value) |c| {
@@ -134,10 +132,10 @@ test "reports ids and retry values, including a priming event" {
     defer p.deinit(testing.allocator);
     var events: std.ArrayList(Seen) = .empty;
     defer freeAll(&events);
-    try feed(&p, "id: e-1\nretry: 500\ndata: \n\n" ++ // priming: an id and empty data
-        "data: {\"x\":1}\n\n" ++ // no id: the last one stays, but this event didn't set it
-        "id: e-2\n\n" ++ // an id alone is still an event
-        "retry: 5x\nid: bad\x00\n\n" ++ // ignored: non-digit retry, an id with NUL
+    try feed(&p, "id: e-1\nretry: 500\ndata: \n\n" ++
+        "data: {\"x\":1}\n\n" ++
+        "id: e-2\n\n" ++
+        "retry: 5x\nid: bad\x00\n\n" ++
         "retry: 99999999999\n\n", &events);
     try testing.expectEqual(@as(usize, 4), events.items.len);
     try testing.expectEqualStrings("", events.items[0].data.?);

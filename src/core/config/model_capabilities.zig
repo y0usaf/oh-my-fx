@@ -128,8 +128,6 @@ pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilit
     return capabilities;
 }
 
-// A catalog output limit that fills the whole context window cannot bound a real request, and
-// omitting the limit lets some providers stop replies at a few thousand tokens.
 const full_window_output_tokens: u32 = 32_768;
 const full_window_output_divisor: u32 = 8;
 

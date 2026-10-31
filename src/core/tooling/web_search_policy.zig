@@ -35,7 +35,6 @@ pub fn hasAdmittedBackendPolicy(backends: []const BackendPolicy) bool {
 }
 
 pub fn selectBackend(policy: WebSearchPolicy, input: InputFeatures) ?BackendPolicy {
-    // Relaxed filter behavior needs a separate explicit opt-in contract.
     if (!policy.strict_filters and (input.has_allowed_domains or input.has_blocked_domains)) return null;
     for (policy.preferred_backends) |id| {
         const backend = backendPolicyForId(policy.backend_policies, id) orelse continue;
@@ -70,7 +69,6 @@ fn backendPolicyIsAdmitted(backend: BackendPolicy) bool {
 }
 
 fn strictFilterIsSupported(support: BackendFeatureMode) bool {
-    // Post-filtering is not admitted until the runtime implements it.
     return support == .pass_through;
 }
 

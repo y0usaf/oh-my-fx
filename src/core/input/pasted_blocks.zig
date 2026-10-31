@@ -35,7 +35,6 @@ pub fn countLines(bytes: []const u8) usize {
     for (bytes) |b| {
         if (b == '\n') lines += 1;
     }
-    // A trailing newline shouldn't inflate the count.
     if (bytes[bytes.len - 1] == '\n' and lines > 1) lines -= 1;
     return lines;
 }

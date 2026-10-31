@@ -30,7 +30,6 @@ pub fn reportUserSettingsCommit(
     patch: config_runtime.UserSettingsPatch,
     outcome: config_runtime.CommitOutcome,
     session_error: ?anyerror,
-    // False when the caller announces state; drops the redundant "saved" line.
     announce_commit: bool,
 ) !?config_runtime.ConfigSources {
     var detailed = loadDetailedSettingsForNotice(app) catch |err| {
@@ -77,7 +76,6 @@ pub fn reportUserSettingsCommit(
     }
     const text = try out.toOwnedSlice();
     defer app.alloc.free(text);
-    // Keep the line when any warning suffix was appended.
     if (announce_commit or !std.mem.eql(u8, text, benign_commit)) {
         try app.writeDomainNotice(.{ .topic = label, .tone = .neutral, .body = text }, true);
     }
@@ -1184,7 +1182,6 @@ pub fn Commands(comptime App: type) type {
             app: *App,
             patch: app_session_runtime.SessionPreferencePatch,
             label: []const u8,
-            // False when the caller announces state; failures still report.
             announce_commit: bool,
         ) !void {
             var result = if (comptime @hasDecl(App, "persistRuntimePreferences")) blk: {
@@ -1871,8 +1868,6 @@ const FakeApp = struct {
         return self.tool_registry;
     }
 
-    // Public so `@hasDecl` sees it from the session runtime, which is where
-    // the terminal title is now resolved.
     pub fn terminalTitle(self: *FakeApp) host.TerminalTitle {
         return .{
             .context = self,

@@ -117,7 +117,6 @@ pub const Auth = struct {
     /// The latest challenge's resource_metadata.
     challenge_url: ?[]u8 = null,
     announced: bool = false,
-    // The sign-in in progress.
     stage: Stage = .idle,
     redirect_uri: []const u8 = "",
     candidates: []const []const u8 = &.{},
@@ -168,8 +167,6 @@ pub const Auth = struct {
         return a.actions.items;
     }
 
-    // ---- Requests (the gate) ----
-
     /// The `Authorization` value for a post of token generation `token`: none
     /// for 0, or for a token since replaced.
     pub fn authorization(a: *const Auth, token: u32) ?[]const u8 {
@@ -202,15 +199,12 @@ pub const Auth = struct {
                         try a.stepGate(.{ .accepted = key });
                         return false;
                     }
-                    // A refresh brings no new scopes; this needs a sign-in.
                     try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
                     try a.stepGate(.{ .accepted = key });
                     try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     try a.announce(true);
                     return true;
                 }
-                // The challenge's scopes, or none, which leaves the
-                // resource metadata's.
                 try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
                 try a.stepGate(.{ .rejected = key });
             },
@@ -262,8 +256,6 @@ pub const Auth = struct {
         try a.stepGate(.{ .refreshed = how });
     }
 
-    // ---- Signing in (the flow) ----
-
     /// Starts a sign-in that will come back to `redirect_uri`, a loopback or
     /// HTTPS URL. The host hears `authorize` with the URL to open,
     /// then `signed_in` or `sign_in_failed`.
@@ -284,7 +276,6 @@ pub const Auth = struct {
         const fa = a.flow_arena.allocator();
         const r = oauth.parseResponse(fa, callback, a.redirect_uri) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // Not the redirect the flow asked for: it fails every check.
             else => oauth.Response{},
         };
         a.response_error = r.err_description orelse r.err;
@@ -409,7 +400,6 @@ pub const Auth = struct {
         while (a.candidate < a.candidates.len) {
             const url = a.candidates[a.candidate];
             a.candidate += 1;
-            // The authorization server's metadata only from hosts discovery may reach.
             if (stage == .server_metadata and !discovery.fetchable(url, a.server_url)) continue;
             a.stage = stage;
             a.flow_key = a.newKey();
@@ -450,7 +440,6 @@ pub const Auth = struct {
         a.io.random(&random);
         a.pkce = .init(random[0..32].*);
         a.state = oauth.state(random[32..64].*);
-        // Offline_access when the authorization server lists it.
         const offline = if (meta.scopes) |s| (wire.arrayHasString(s, "offline_access") catch false) else false;
         var url: std.Io.Writer.Allocating = .init(fa);
         try oauth.writeAuthorizationUrl(&url.writer, .{
@@ -510,7 +499,6 @@ pub const Auth = struct {
         if (key != a.flow_key) return key >= fetch_base;
         a.flow_key = 0;
         const fa = a.flow_arena.allocator();
-        // A registration outlives the sign-in; the rest lasts as long as it.
         const body = try (if (a.stage == .registration) a.keep.allocator() else fa).dupe(u8, answer);
         switch (a.stage) {
             .idle => {},
@@ -567,7 +555,6 @@ pub const Auth = struct {
             try a.actions.append(a.gpa, .save);
             return a.stepGate(.{ .refreshed = if (rotated) .rotated else .ok });
         } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
-        // invalid_grant: the refresh token is gone for good (RFC 6749 §5.2).
         try a.refreshEnded(if (status >= 400 and status < 500 and oauth.refusesGrant(body)) .refused else .failed);
     }
 
@@ -608,8 +595,6 @@ pub const Auth = struct {
             free(a.gpa, &a.refresh_token);
             a.refresh_token = r;
         }
-        // Refresh in the last 30 s, or the last half of a shorter-lived
-        // token, so a short one isn't refreshed before every request.
         const lifetime_ms: ?i64 = if (token.expires_in) |s| @as(i64, @intCast(@min(s, std.math.maxInt(i32)))) * 1000 else null;
         a.expires_at_ms = if (lifetime_ms) |ms| a.now() +| ms else null;
         a.skew_ms = if (lifetime_ms) |ms| @min(30_000, @divTrunc(ms, 2)) else 30_000;
@@ -676,13 +661,11 @@ test "a saved credential comes back whole: requests carry its token, and it save
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try testing.expect(!try a.save(&out.writer));
-    // Unreadable or incomplete: ignored.
     try a.restore("not json");
     try a.restore("{\"access\":\"at\"}");
     try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     const fields = ",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\",\"revocation_endpoint\":\"https://as/revoke\"," ++
         "\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}";
-    // A JSON escape in the token is read as what it stands for.
     try a.restore("{\"access\":\"at\\/1\",\"refresh\":\"rt\"" ++ fields);
     try testing.expectEqualStrings("Bearer at/1", a.authorization(a.gate.gen).?);
     try testing.expect(a.gate.refreshable);

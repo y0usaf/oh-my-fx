@@ -20,7 +20,6 @@ async function runCommand(argv: string[], options: CommandOptions): Promise<Comm
     failure ??= reason;
     if (stopped) return;
     stopped = true;
-    // The detached group remains ours until close, even if its leader exited.
     if (child.pid && child.pid > 1) {
       try { process.kill(-child.pid, "SIGKILL"); }
       catch (error) {

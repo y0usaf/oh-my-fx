@@ -259,7 +259,6 @@ const AcpContext = struct {
     fn sendNotice(self: *AcpContext, text: []const u8) !void {
         const plain = try stripAnsiAlloc(self.alloc, text);
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
-        // The tag is for the model; a notice's title stands alone.
         const title = std.mem.trimStart(u8, std.mem.cutPrefix(u8, plain, "[context]") orelse plain, " ");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -301,7 +300,6 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        // A v2 session keeps the record as a setting (D46).
         const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
             const writable = if (session.writable) |*value| value else break :blk .none;
             const capability = writable.childCapability() catch |err| {
@@ -797,8 +795,6 @@ fn stripAnsiAlloc(alloc: Allocator, text: []const u8) ![]const u8 {
             index += 1;
         }
     }
-    // A link left open by a chunk boundary still closes with its target so
-    // the emitted Markdown stays balanced.
     if (open_link_uri) |uri| try appendMarkdownLinkClose(alloc, &out, uri);
     return try out.toOwnedSlice(alloc);
 }
@@ -860,7 +856,6 @@ pub fn handlePrompt(
             prior_image_catalog = merged;
         }
     }
-    // A journaled session's open turn carries the images it was given.
     if (session.journal) |journal| {
         if (journal.pending_resume) |pending| {
             const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, pending.interruptedTurn());
@@ -878,16 +873,12 @@ pub fn handlePrompt(
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
-            // libfx kernel session: images stay in memory and ride the kernel
-            // checkpoint, so no filesystem snapshot backend is needed.
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
-            // A v2 session captures into a temporary folder, then keeps the
-            // bytes inside the turn (D44).
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
                 if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,
@@ -957,7 +948,6 @@ pub fn handlePrompt(
         try journal.endUnplaced(alloc, state.alloc, session.session_id);
     }
     if (prompt_input.continue_recovery and session.journal != null) {
-        // A journaled libfx session resumes the turn its journal left open.
         const journal = &session.journal.?;
         const pending = journal.pending_resume orelse return .{
             .rpc_error = .{
@@ -965,8 +955,6 @@ pub fn handlePrompt(
                 .message = "No interrupted turn to resume",
             },
         };
-        // Inputs the crashed turn accepted and never placed go to the model
-        // with the resume, and its first progress places them.
         const inputs = journal.takePendingInputs();
         defer journal_events.freePendingInputs(state.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs, journal.pending_resume_yielded);
@@ -980,9 +968,6 @@ pub fn handlePrompt(
             try journal.notePlaced(state.alloc, ids);
         }
         journal.dropPendingResume(state.alloc);
-        // Calls the crash left running that the host asked to run again do
-        // so before the turn continues, and their results replace the answer
-        // that they may have partly run.
         if (answered_step) |step| if (prompt_input.rerun_call_ids.len > 0) {
             if (ctx.observer) |observer| observer.beginTurn(recovery_checkpoint.?.user.text, true);
             _ = try libfx_journal.rerunCalls(alloc, &recovery_checkpoint.?, step, ResumeRerun{
@@ -1007,7 +992,6 @@ pub fn handlePrompt(
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
     } else if (session.journal) |*journal| {
-        // A new prompt instead of a resume ends the open turn as interrupted.
         if (journal.pending_resume) |pending| {
             try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
             journal.dropPendingResume(state.alloc);
@@ -1023,14 +1007,9 @@ pub fn handlePrompt(
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        // A host that stores inputs first already holds the prompt.
         journal.barrier_next_progress = !journal.inputs_durable;
         journal.startYieldClock(prompt_input.yield_at_ms);
-        // A new turn's first progress records the host's id for it; a
-        // resumed turn keeps the id it started with.
         journal.nameNextTurn(prompt_input.turn_id);
-        // A follow-up's turn places it in its first progress, a barrier. The
-        // web core records its acceptance only now.
         if (prompt_input.input_id) |input_id| {
             if (!prompt_input.input_accepted) try journal.append(alloc, session.session_id, .{ .input_accepted = .{
                 .id = input_id,
@@ -1041,8 +1020,6 @@ pub fn handlePrompt(
         }
     }
 
-    // A v2 prompt opens its turn on disk before the model is asked, so a full
-    // or read-only disk fails the prompt without a model call.
     if (session.v2) |v2| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1114,7 +1091,6 @@ pub fn handlePrompt(
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
 
-    // A turn whose completions report no tokens sends no `usage_update`.
     session.context_used.store(0, .release);
     const deps = agentRuntimeDeps(&ctx);
     const current_prompt_is_root_authority = if (session.writable) |writable|
@@ -1146,23 +1122,17 @@ pub fn handlePrompt(
         .outcome_allocator = alloc,
     }, agent_config, job) catch |err| {
         if (err == error.TurnYielded) {
-            // The journal keeps the turn open for a later resume; nothing
-            // ends it here.
             prompt_input.retainImageSnapshots();
             return .{ .stop_reason = .yielded };
         }
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
         } else if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) {
-            // A cancel that arrived while a journal barrier was pending ends
-            // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
-            // If the commit fails, the turn still ends below.
             commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
         } else {
-            // The turn's own failure is the one to report.
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
@@ -1175,7 +1145,6 @@ pub fn handlePrompt(
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
-    // A steer's interrupt the turn finished before reaching is not a cancel.
     if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
@@ -1195,8 +1164,6 @@ fn maybeStartAcpTitleTask(
     recovery: bool,
     observer: ?*observation.Observer,
 ) void {
-    // Unit tests share the real provider bundles; never spawn network side
-    // calls from a test process. Wiring is covered by e2e mock servers.
     if (comptime @import("builtin").is_test) return;
     if (comptime host_target.is_wasm) return;
     if (!state.session_titles or recovery) return;
@@ -1628,8 +1595,6 @@ fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
     }
     const decoded = try alloc.alloc(u8, decoded_len);
     errdefer alloc.free(decoded);
-    // The standard decoder rejects non-zero padding bits, so canonical
-    // validation needs no second encoded buffer.
     std.base64.standard.Decoder.decode(decoded, data_value.string) catch
         return error.InvalidPromptImage;
     return decoded;
@@ -1704,7 +1669,6 @@ fn parsePromptInputWithFirstImageId(
     else
         null;
     const rerun_value = acp_types.fxMetaField(parsed.value.object, "rerun");
-    // A JavaScript host gives a time it can hold as a number.
     const yield_at_ms: ?i64 = if (acp_types.fxMetaInteger(parsed.value.object, "yieldAt")) |ms|
         if (ms > 0 and ms <= max_host_time_ms) ms else null
     else
@@ -1918,8 +1882,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
         .take_steering_boundary = takeSteeringBoundary,
-        // The web core's host keeps its steering queue, so the core asks it
-        // while a reply streams whether a steer should cut it short.
         .cooperative_transport_pulse = if (comptime host_target.is_wasm) .{ .ctx = @ptrCast(ctx), .run = pulseHostSteering } else null,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -1997,11 +1959,8 @@ fn takeSteeringBoundary(
     const close_if_empty = kind == .finalizing;
     if (comptime host_target.is_wasm) {
         server.noteSteeringBoundary(ctx.state);
-        // The host closes its steering when the user cancels the turn, which
-        // wins over a steer's interrupt. A handoff ends the turn here.
         const host_steering = js_host_steering.state();
         if (host_steering == .open and host_steering.open.handoff) {
-            // As on native: a handoff's interrupt is spent and the turn ends.
             server.noteHostSteeringHandoff(ctx.state);
             if (kind != .cancelled) return .handoff;
             _ = server.takeSteeringInterrupt(ctx.state);
@@ -2011,7 +1970,6 @@ fn takeSteeringBoundary(
             server.takeSteeringInterrupt(ctx.state) != null;
         const taken = try js_host_steering.takeAll(arena);
         if (taken.len > 0) {
-            // As on native, an interrupt this boundary beat is spent here.
             if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
             try acceptHostSteering(ctx, taken);
             const texts = try arena.alloc([]u8, taken.len);
@@ -2028,26 +1986,15 @@ fn takeSteeringBoundary(
     const kernel = ctx.state.cfg.minimal_kernel;
     if (kind == .cancelled and !kernel) return .interrupt;
     if (kind == .cancelled) {
-        // A user cancel ends the turn, and so does a handoff's interrupt.
         const interrupt = server.takeSteeringInterrupt(ctx.state) orelse return .interrupt;
         if (interrupt == .handoff) return .interrupt;
     } else if (kernel and server.steeringHandoffPending(ctx.state)) {
-        // A steer that cannot join the turn runs next: the turn ends here, and
-        // its end hands back the steering it did not take.
         return .handoff;
     }
-    // ACP keeps accepting steering until the turn has fully returned: a
-    // pending subagent can continue a turn past its final boundary, and a
-    // steering prompt that arrives after input closes joins the worker from
-    // the connection reader, which must never wait on work that needs it.
     const drained = try server.takeSteering(ctx.state, arena, close_if_empty and kernel);
-    // A steer's interrupt continues the turn even when the steer was
-    // withdrawn meanwhile: the cut-off request goes out again.
     if (drained.texts.len == 0) return if (kind == .cancelled) .{ .continue_turn = &.{} } else .none;
     try noteJournalPlacement(ctx, drained.input_ids);
-    // A steer's interrupt that a later boundary beat is spent with its steer.
     if (kernel and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
-    // Steering shows where it joined the turn, a libfx steer by its input id.
     for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
         try publishSteeringReplay(ctx, text, request_id, input_id);
@@ -2633,8 +2580,6 @@ fn completeToolCallTransport(
     const output_text = blk: {
         const preview = toolUpdateContentText(result);
         if (!std.mem.eql(u8, call.name, "shell")) break :blk preview;
-        // The preview is clipped, so a snapshot fallback notice is shown on
-        // its own line beside the command it affected.
         var buffer: [512]u8 = undefined;
         const notice = tool_call_presentation.shellResultNotice(result.model_output, &buffer) orelse
             break :blk preview;
@@ -2809,13 +2754,6 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
     const registry = ctx.toolRegistry();
     const waits = for (progress.running_calls) |call| {
         const tool = registry.lookup(call.name) orelse continue;
-        // A call the provider runs has no effect here to guard. A call to an
-        // idempotent tool that does not write runs ahead of its intent: a
-        // crash before the intent lands only makes the model ask again, and
-        // running a lookup twice under a new execution id is harmless. Every
-        // other call waits, so a call with effects is never unrecorded, and
-        // an idempotent writer keeps the execution id its effect is keyed
-        // on: only a stored intent reruns a call under the same id.
         if (tool.provider_executed or (tool.host_idempotent and tool.host_concurrent)) continue;
         break true;
     } else false;
@@ -2930,8 +2868,6 @@ fn persistAcpHistoryTurn(
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
     if (session.journal) |*journal| {
-        // The running turn's own end hands back its unplaced steers; ending
-        // an earlier turn for a new prompt does not.
         if (hand_back_alloc) |backing| try handBackUnplacedSteersLocked(alloc, backing, session, journal);
         try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
     }
@@ -2945,7 +2881,6 @@ fn persistAcpHistoryTurn(
     if (session.v2) |v2| {
         try v2.prepareTurn(&prepared);
         v2.commitTurn(prepared, session.session_rt.languageSnapshot()) catch |err| {
-            // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
             return err;
         };
@@ -3077,9 +3012,6 @@ fn writeRecoveryCheckpoint(ctx: *AcpContext, checkpoint: session_codec.RecoveryC
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
-    // The durable checkpoint references the prompt's captured image bytes, so
-    // the prompt's deinit must not delete them. A failed turn never reaches
-    // the success-path retain, making this the only retain on that path.
     if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
 }
 
@@ -3114,8 +3046,6 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         defer session.session_write_mutex.unlock(io_mod.getIo());
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
         try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
-        // Only the progress right before a request can yield; a compaction
-        // or a paused retry finishes where it is.
         if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
             journal.yieldsAt(io_mod.milliTimestamp()))
         {
@@ -3127,7 +3057,6 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         break :barrier barrier;
     };
     if (barrier) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
-        // The turn commits from this progress as interrupted.
         if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
         return err;
     };
@@ -3158,8 +3087,6 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
-    // The turn ends here, cancelled or stopped: the steers it never placed
-    // are withdrawn while they still belong to it, before the clear ends it.
     try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
     try journal.clearProgress(ctx.alloc, session.session_id);
 }
@@ -3177,8 +3104,6 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
-        // A libfx steer cuts a streaming reply short, as in the fx CLI, but
-        // waits once the model streams a tool call's arguments.
         .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel) {
             server.noteSteeringPhase(ctx.state, update.step_id, switch (update.phase) {
                 .thinking, .generating => .reply,
@@ -3226,7 +3151,6 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .provisional => |provisional| {
-            // A tool call the model announced is no reply a steer cuts short.
             if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
@@ -3266,8 +3190,6 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return;
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
-    // ACP v1 Session Notices where the client shows them;
-    // otherwise a message, as ACP allows.
     if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
     try pushSystemNotice(raw_ctx, text);
 }
@@ -3515,8 +3437,6 @@ fn requestAcpElicitation(
         runtime.inputIdentityWitness(origin.server_name)
     else
         null;
-    // MCP-v2 ties an answer to the call that asked, and drops it once that
-    // call has ended, so its server counts as live here.
     const host_session = if (responder.acp.state.active_session) |*active| active.mcp_host != null else false;
     const transition = mcp_elicitation.decideTransition(
         transition_state,
@@ -3534,8 +3454,6 @@ fn requestAcpElicitation(
     if (input_request.mode == .url and action == .accept) {
         if (legacy_source_id != null) {
             const sink = server.legacyUrlCompletionSink(state);
-            // MCP-v2's host has no generations to check: the sink takes the
-            // consent itself.
             const accept_result = if (activeMcp(responder.acp)) |runtime|
                 runtime.acceptLegacyUrlCompletion(origin, url_id.?, sink) orelse return error.McpInputRequired
             else if (host_session)
@@ -4212,7 +4130,6 @@ test "parsePromptInput rejects unusable image attachment references" {
     const alloc = std.testing.allocator;
     const reference = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
 
-    // Standard ACP hosts have no attachment store.
     try std.testing.expectError(error.UnsupportedPromptImage, parsePromptInput(alloc, reference));
 
     var missing = TestAttachmentStore{ .id = 4, .bytes = "x" };

@@ -103,8 +103,6 @@ pub fn sourceStamp(path: []const u8, identity_only: bool, follow_symlinks: bool,
     };
     const mtime = clampNs(stat.mtime.nanoseconds);
     const ctime = clampNs(stat.ctime.nanoseconds);
-    // A `.git` file's contents choose the repository, so only a directory is
-    // stamped by identity alone.
     const identity = identity_only and stat.kind == .directory;
     return .{
         .path = path,
@@ -186,7 +184,6 @@ test "stamps reuse only times older than the scan start by the margin" {
     try std.testing.expect(!reusableTimes(start - std.time.ns_per_s, start - 3 * std.time.ns_per_s, start));
     try std.testing.expect(!reusableTimes(start - 3 * std.time.ns_per_s, start, start));
     try std.testing.expect(!reusableTimes(start + 1, start - 3 * std.time.ns_per_s, start));
-    // A missing source stays missing until it appears.
     const missing = sourceStamp("/nonexistent/fx-indexer-test", false, false, start);
     try std.testing.expect(!missing.exists and missing.reusable);
 }
@@ -207,7 +204,6 @@ test "a followed source stamps the file its link points at" {
     const unfollowed = sourceStamp(link, false, false, start);
     try std.testing.expect(followed.follow_symlinks and !unfollowed.follow_symlinks);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target", .data = "[core]\n\tignorecase = true\n" });
-    // An edit to the target is seen through the link, never by the link alone.
     try std.testing.expect(!sameSource(followed, sourceStamp(link, false, true, start)));
     try std.testing.expect(sameSource(unfollowed, sourceStamp(link, false, false, start)));
 }

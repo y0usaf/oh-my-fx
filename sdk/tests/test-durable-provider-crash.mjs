@@ -1,12 +1,4 @@
 #!/usr/bin/env node
-// A durable session on a provider the host authorizes (Codex on a ChatGPT plan,
-// Grok on a Grok plan, or a custom provider with an API key) survives a
-// SIGKILL. A child process runs a turn on a local() durability and is killed
-// during the model's reply or during a tool call; a fresh agent here resumes
-// the turn on the credentials its own credentials() supplies. No credential
-// reaches the saved session. No network.
-//
-//   node test-durable-provider-crash.mjs [native|wasm]
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
@@ -39,8 +31,6 @@ function codexJwt(label) {
 }
 
 const event = (value) => `data: ${JSON.stringify(value)}\n\n`;
-// The wire formats: how a text reply and a lookup call stream, and where a
-// request carries the conversation.
 const responsesProtocol = {
   history: (payload) => payload.input,
   sawToolOutput: (payload) => JSON.stringify(payload.input).includes("function_call_output"),
@@ -66,9 +56,6 @@ const chatProtocol = {
     "data: [DONE]\n\n",
 };
 
-// What differs between the providers: the wire format, the fake endpoints
-// besides the reply, the credentials, and the headers that carry session and
-// account, if any.
 const providers = {
   codex: {
     label: "Codex",
@@ -110,7 +97,6 @@ const providers = {
       return null;
     },
   },
-  // The session reaches credentials() from the agent, not from a header.
   custom: {
     label: "custom provider",
     provider: { name: "local", baseUrl: "https://models.example/v1", models: { "local-model": { supportsToolUse: true } } },
@@ -122,8 +108,6 @@ const providers = {
     serve: () => null,
   },
 };
-// The dying process and the resuming one hold different tokens, so a request
-// can show which process authorized it.
 const tokensFor = (spec) => ({ child: spec.token("child-process"), parent: spec.token("resuming-process") });
 
 /** A fake provider. `holdReply` streams the first event of a reply and then never finishes it. */
@@ -140,7 +124,6 @@ function fakeProvider(spec, { holdReply = false, onReply } = {}) {
       const payload = JSON.parse(body);
       const sawLookup = spec.protocol.sawToolOutput(payload);
       const wantsLookup = JSON.stringify(spec.protocol.history(payload)).includes("use lookup");
-      // A request that allows no tool calls gets text, as a real model gives.
       const reply = wantsLookup && !sawLookup && payload.tool_choice !== "none"
         ? spec.protocol.lookupCall
         : spec.protocol.textReply(sawLookup ? "found order-7" : wantsLookup ? "could not confirm order-7" : "hello again");
@@ -174,10 +157,8 @@ function agentOptions(dir, spec, { fetch, token, asked, lookupRuns, lookupStarte
       execute: async ({ key }, { sessionId }) => {
         lookupRuns?.push(sessionId);
         if (lookupStarted) {
-          // A call starts only after its intent is stored, so the crash
-          // comes the moment the tool runs.
           lookupStarted();
-          await new Promise(() => {}); // the process dies here
+          await new Promise(() => {});
         }
         return { content: `${key} shipped` };
       },
@@ -185,7 +166,6 @@ function agentOptions(dir, spec, { fetch, token, asked, lookupRuns, lookupStarte
   };
 }
 
-// The child: start a turn, report the session once the crash point is reached, wait to be killed.
 if (childAt !== -1) {
   const [dir, phase, provider] = args.slice(childAt + 1);
   const spec = providers[provider];
@@ -204,8 +184,6 @@ if (childAt !== -1) {
   await new Promise(() => {});
 }
 
-// True when the text, or base64 found in it decoded up to two levels deep,
-// contains any of the secrets. The local World stores entries as base64.
 function holdsSecret(text, secrets, depth = 2) {
   if (secrets.some((secret) => text.includes(secret))) return true;
   if (depth === 0) return false;
@@ -293,7 +271,6 @@ async function crashAndResume(provider, phase) {
       assert.equal(text, "found order-7");
     }
 
-    // The saved session holds no credentials from either process.
     const files = await filesUnder(dir);
     assert.ok(files.length > 0, "the session was saved");
     for (const path of files) {

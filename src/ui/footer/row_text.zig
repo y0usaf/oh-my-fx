@@ -14,7 +14,7 @@ pub fn composeDividerRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
     try row.appendSlice(alloc, ui_render.divider_style);
     var col: u16 = 0;
     while (col < width) : (col += 1) {
-        try row.appendSlice(alloc, "\xe2\x94\x80"); // ─ (U+2500)
+        try row.appendSlice(alloc, "\xe2\x94\x80");
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;

@@ -301,8 +301,6 @@ const CapabilityImpl = struct {
                 else => error.SessionChildStoreFailed,
             };
         }
-        // A v2 capability has no side folder: its bodies are blobs (D48),
-        // and its terminal state lives in its terminal folder (D45).
         const session_dir = if (self.session_dir) |*dir| dir else switch (kind) {
             .terminal_state, .terminal_proofs => try self.terminalDir(create_if_missing) orelse return null,
             else => return if (create_if_missing) error.SessionChildStoreFailed else null,
@@ -2184,7 +2182,6 @@ test "a v2 capability keeps terminal kinds in the terminal folder, made only by 
     var capability = try SessionChildCapability.initBlobs(alloc, memory.blobs(), terminal_path, .writable);
     defer capability.deinit();
 
-    // A read finds nothing and makes nothing.
     try std.testing.expectError(error.FileNotFound, capability.openFileReadOnly(alloc, .terminal_state, "record.json"));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "fx/terminal", .{ .follow_symlinks = false }));
 
@@ -2196,7 +2193,6 @@ test "a v2 capability keeps terminal kinds in the terminal folder, made only by 
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
     }
 
-    // A read-only clone reads it back; side-folder kinds stay absent.
     var reader = try capability.cloneReadOnly(alloc);
     defer reader.deinit();
     var file = try reader.openFileReadOnly(alloc, .terminal_state, "record.json");
@@ -2206,7 +2202,6 @@ test "a v2 capability keeps terminal kinds in the terminal folder, made only by 
     try std.testing.expectEqualStrings("{}", bytes);
     try std.testing.expectError(error.SessionChildStoreFailed, capability.atomicReplace(alloc, .background_records, "record.json", "{}"));
 
-    // A read-only capability never makes the folder.
     const other_path = try std.Io.Dir.path.join(alloc, &.{ fx_path, "terminal", "otherSession1" });
     defer alloc.free(other_path);
     var read_only = try SessionChildCapability.initBlobs(alloc, memory.blobs(), other_path, .read_only);

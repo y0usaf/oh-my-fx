@@ -1,8 +1,3 @@
-// U02 request lifecycle, step 6 at the core level: the real Zig core, driven
-// by tests/tla/drivers/mcp/labs/request_lab.zig with seeded random events (late, duplicate,
-// and unknown-id messages included), must produce traces that TLC accepts as
-// behaviors of spec/Request.tla. The planted-bug case is a known-bad control.
-// Transport-level u02 scenarios (over stdio) follow once U03 exists.
 
 import type { Scenario } from "../scenario";
 

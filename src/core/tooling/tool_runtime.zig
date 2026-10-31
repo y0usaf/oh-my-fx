@@ -361,9 +361,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
         };
     };
     switch (spec.executor_kind) {
-        // Preserve execution-time argument failures for MCP control tool calls.
         .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
-        // File mutation arguments are decoded once by shared permission preflight.
         .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
     }
@@ -507,10 +505,6 @@ fn classifyReturnedToolCallOutcome(
 ) diagnostics.ToolCallOutcome {
     if (result.status == .success) return .succeeded;
     if (result.command_result_json != null) return .command_failed;
-    // Only an explicit denial records a rejection. An authorized execution
-    // that failed — with or without a declared kind — is a tool failure, so
-    // a producer that forgets to declare a kind cannot silently masquerade
-    // as a rejection in diagnostics.
     return switch (result.failure_kind) {
         .denied => .rejected,
         .none, .preflight, .apply => .tool_failed,
@@ -594,8 +588,6 @@ test "executed file mutation failures classify as tool failures, not rejections"
         diagnostics.ToolCallOutcome.rejected,
         classifyReturnedToolCallOutcome(denied_failure),
     );
-    // A producer that does not declare a kind is still a tool failure; only
-    // explicit denials record rejections.
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.tool_failed,
         classifyReturnedToolCallOutcome(undeclared_failure),
@@ -4953,7 +4945,6 @@ test "executeToolCall searches large files in normal runtime" {
         .arguments_json = "{\"pattern\":\"needle\",\"path\":\"oversized\"}",
     });
 
-    // A 260 KiB file, its second line one long run, is searched in full.
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - oversized/huge.txt:1: needle hidden\n", result.model_output);
 
@@ -7806,8 +7797,6 @@ test "vision runtime preserves partial success and exact total outage notices" {
     const partial_json =
         "{\"images\":[" ++
         "{\"image_id\":1,\"status\":\"ok\",\"summary\":\"read\",\"visible_text\":[],\"details\":[]}]}";
-    // The malformed response is scripted twice because a structurally invalid
-    // successful response is retried once. The outage before it is not retried.
     const responses = [_]VisionGatewayResponse{
         .{ .content = partial_json },
         .{ .status = .service_unavailable },
@@ -7892,7 +7881,6 @@ test "vision runtime classifies an empty successful provider result as invalid" 
     );
     try std.testing.expect(result.interactive_notice == null);
     try std.testing.expect(result.system_notice == null);
-    // An empty successful response is structurally invalid, so it earns the single retry.
     try std.testing.expectEqual(@as(usize, 2), fixture.call_count);
 }
 

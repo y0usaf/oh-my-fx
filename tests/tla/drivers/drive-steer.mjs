@@ -1,25 +1,4 @@
 #!/usr/bin/env bun
-// Drives real libfx, with its Zig kernel loaded through the native addon or
-// WebAssembly, along paths of the TLC state graph of DurableSteer.tla, and
-// checks after every step that the code is in a state the model allows.
-//
-//   bun tests/tla/drivers/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
-//     [--backend native|wasm] [--durability local|world] [--verbose] [--hooks]
-//
-// `tests/tla/sdk/check.sh` model-checks the spec and writes its
-// graphs/steer-<graph>.dot. The
-// ideal graph has no faults; the faults graph adds cancels, deadline handoffs
-// and client retries.
-//
-// Each walk starts one agent on a fresh local() World directory. Every model
-// request streams only what the driver sends it, every tool call waits until
-// the driver ends it, and each queue delivery waits until the driver lets it
-// run, so the driver decides the interleaving. After each
-// step it reads back what the model was sent, in the newest request, which
-// carries the whole conversation: a message that started a turn on the
-// session's stream opens that turn, and every other message joins the turn
-// before it. With how each turn ended, from the stream, and what the model is
-// doing now, that is the state the driver compares with the model's.
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -47,24 +26,14 @@ const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out
 const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../../../sdk/tests/app-world.mjs") : {};
 const durableInternals = Symbol.for("libfx.durableInternals");
 const stepTimeoutMs = 8000;
-// How long the code must show the same state before the driver reads it.
 const quietMs = 250;
-// A running worker sees a new input when it next reads the log, which a
-// local() World has it do every 250 ms; the driver waits that out after
-// sending one before it reads the code.
 const inputMs = 400;
 
-// What each message says, so a request shows which messages it carries.
 const textOf = (m) => (m === "p" ? "prompt p" : `steer ${m}`);
 const messageIn = (text) => /\b(?:prompt (p)|steer (s\d+))\b/.exec(text)?.slice(1).find(Boolean) ?? null;
 const steering = (text) => text.startsWith("<user_steering>");
 
-// ---------------------------------------------------------------------------
-// The state graph TLC wrote.
-
 const sorted = (items) => [...items].sort();
-// What the driver compares: what the model was sent, how each turn ended,
-// and what the model is doing now.
 const view = (state) => {
   const turns = state.turns.filter((turn) => turn.state !== "waiting");
   const placed = new Set(turns.flatMap((turn) => turn.ctx));
@@ -75,9 +44,6 @@ const view = (state) => {
   });
 };
 const sameAct = (a, b) => a.name === b.name && a.m === b.m;
-
-// ---------------------------------------------------------------------------
-// The code under test.
 
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 const finish = (reason) => ({ type: "finish", finishReason: { unified: reason, raw: reason }, usage });
@@ -92,11 +58,6 @@ const until = async (check, ms = stepTimeoutMs) => {
   return true;
 };
 
-// The queue as the driver runs it. Each delivery waits until the driver lets
-// it run, as one does while the platform has not delivered it yet; every
-// input reaches the log when it is sent, before its delivery, so only when a
-// worker starts waits. A message the code asks to have delivered again later,
-// as a backstop, is not, so nothing runs that the driver did not start.
 function gatedDeliveries(durability, gate) {
   return {
     ...durability,
@@ -119,7 +80,6 @@ function gatedDeliveries(durability, gate) {
 
 async function harness() {
   const dir = await mkdtemp(join(tmpdir(), "libfx-steer-model-"));
-  // Every model request so far, and the open ones.
   const requests = [];
   const open = [];
   const calls = [];
@@ -130,7 +90,6 @@ async function harness() {
     const index = list.indexOf(entry);
     if (index >= 0) list.splice(index, 1);
   };
-  // Deliveries the driver has not let run yet.
   const gate = {
     held: [],
     open: false,
@@ -147,7 +106,6 @@ async function harness() {
     apiKey: "model-key",
     model: "model/test",
     async fetch(input, init) {
-      // The WebAssembly host passes a Request, the native one a URL and init.
       const request = input instanceof Request ? input : new Request(input, init);
       if (request.method === "GET") return Response.json({ object: "list", data: [{ id: "model/test", type: "language" }] });
       const prompt = JSON.parse(await request.text()).prompt;
@@ -178,7 +136,6 @@ async function harness() {
         remove(open, entry);
         try { controller.error(signal.reason ?? new Error("aborted")); } catch {}
       }, { once: true });
-      // The reply starts streaming text at once, as a model's does.
       entry.send([{ type: "text-delta", id: "reply", delta: "w " }]);
       return new Response(body, { headers: { "content-type": "text/event-stream" } });
     },
@@ -219,7 +176,6 @@ async function harness() {
   }
 
   async function read() {
-    // How each turn the stream shows ended, by the message that owns it.
     const lines = await streamLines();
     const ownerOf = new Map();
     const ended = new Map();
@@ -229,10 +185,6 @@ async function harness() {
     }
     const stateOf = new Map();
     for (const [messageId, owner] of ownerOf) if (owner) stateOf.set(owner, ended.get(messageId) ?? "running");
-    // The turns the model was sent, from the newest request: a message that
-    // started a turn on the stream opens it, and every other message joins
-    // the turn before it. A steer a resumed turn replays reaches the model as
-    // a plain message, so the stream, not the text, says who owns a turn.
     const turns = [];
     const counts = new Map();
     for (const text of requests.at(-1)?.users ?? []) {
@@ -250,7 +202,6 @@ async function harness() {
     });
   }
 
-  // The code has settled when it shows the same state for quietMs.
   async function observe() {
     let seen = await read();
     const started = Date.now();
@@ -270,7 +221,6 @@ async function harness() {
     return seen;
   }
 
-  // What the user sends: a message, the same steer again, or a cancel.
   async function performInput({ name, m }) {
     if (name === "Cancel") {
       await session.cancel();
@@ -281,12 +231,10 @@ async function harness() {
       sessionId = (await turn.accepted).sessionId;
       await until(() => gate.held.length > 0);
     } else {
-      // The steer's own id, which libfx before identities ignores.
       await session.steer(textOf(m), { messageId: m });
     }
   }
 
-  // One step of the model, done to the code.
   async function perform({ name, m }) {
     if (name === "Send" || name === "Retry" || name === "Cancel") {
       await performInput({ name, m });
@@ -320,7 +268,6 @@ async function harness() {
       calls[0].end();
       await until(() => open.length > 0);
     } else if (name === "Handoff") {
-      // The deadline: the worker stops, and the same message comes back.
       const before = requests.length;
       agent[durableInternals].stopAtDeadline(sessionId);
       await until(() => {
@@ -346,9 +293,6 @@ async function harness() {
 
   return { perform, observe, close };
 }
-
-// ---------------------------------------------------------------------------
-// Walks: seeded random paths that prefer edges no walk has covered yet.
 
 const random = () => {
   seed = (seed * 1103515245 + 12345) % 2147483648;

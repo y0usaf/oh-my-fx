@@ -6,18 +6,11 @@ const io_mod = @import("../shared/io.zig");
 
 const macos_player_path = "/usr/bin/afplay";
 
-// Sound defaults on only where a real audio player exists (macOS). Elsewhere
-// the fallback is the terminal bell, so notifications stay opt-in.
 pub const default_enabled: bool = builtin.target.os.tag == .macos;
 
-// One-shot notifications still construct Player directly. Keep these aliases
-// until that path moves behind its own provider boundary.
 pub const Cue = notification_contract.Cue;
 pub const Kind = notification_contract.Kind;
 
-// Chimes derived from cuelume's MIT-licensed recipes by Daniel Belyi, rendered
-// at 48kHz and encoded as AAC. `click` has no recipe to re-render from, so it
-// stays the original IMA4 CAF.
 fn embeddedChime(cue: Cue) []const u8 {
     return switch (cue) {
         .click => @embedFile("click.caf"),
@@ -36,7 +29,6 @@ var sound_path_mutex: std.Io.Mutex = .init;
 var materialized_paths: [std.enums.values(Cue).len]?[]const u8 = @splat(null);
 var sound_path_bufs: [std.enums.values(Cue).len][std.Io.Dir.max_path_bytes]u8 = undefined;
 
-// Materialize lazily to protect startup latency. Atomic replacement avoids following symlinks.
 fn ensureCueSoundPath(cue: Cue) ?[]const u8 {
     const idx = @backingInt(cue);
     sound_path_mutex.lockUncancelable(io_mod.getIo());
@@ -164,8 +156,6 @@ pub const Player = struct {
         }
     }
 
-    // Attention notifications always include a terminal BEL so multiplexers
-    // can mark the pane, even when macOS also plays the configured chime.
     pub fn playAttention(self: *Player, cue: Cue) void {
         self.emitBell();
         if (self.dependencies.platform == .macos) {

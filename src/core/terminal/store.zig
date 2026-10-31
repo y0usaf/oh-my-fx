@@ -1069,8 +1069,6 @@ pub const ProfileStore = struct {
         };
         defer names.deinit();
         for (names.names) |name| {
-            // Artifacts without a record may be a start that another running
-            // process has not finished writing, so they are left alone.
             const terminal_id = terminal_id_from_record_name(name) orelse continue;
             if (self.is_resident(terminal_id)) continue;
             var session = self.open_existing(owner_id, terminal_id) catch |err| {
@@ -1237,7 +1235,6 @@ pub const ProfileStore = struct {
                 }
             },
             .retain_final => {},
-            // An absent owner can never retain a live terminal.
             .retain_live, .unavailable, .isolate_corrupt => unreachable,
         }
         session.release_completed_handles();
@@ -1382,8 +1379,6 @@ fn owner_liveness(
             .unavailable => .unknown,
         };
     }
-    // A retired daemon's launcher watchdog ends the terminal when the daemon
-    // goes away, so a running terminal process means its daemon still runs.
     if (record.pid == null or record.process_token == null) return .unknown;
     return switch (process_evidence_for(alloc, process_provider, record)) {
         .matched => .running,
@@ -2160,9 +2155,6 @@ fn catalog_authorization(
     };
 }
 
-// Retained only to verify authority records written by versions that allowed
-// repeated monitor probes. The upgraded runtime never evaluates or creates
-// these grants.
 fn hash_monitor_notify(
     hash: *std.crypto.hash.sha2.Sha256,
     schedule: contracts.NotifySchedule,
@@ -2534,7 +2526,6 @@ pub const DurableSession = struct {
         defer profile.mutex.unlock(zio);
         try contracts.validate_session_id(input.session_id);
         try input.dimensions.validate();
-        // A new terminal makes a v2 owner's folder (D45).
         var state = try profile.open_capability(
             input.persistence.grant.principal.durable_session_id,
             false,
@@ -5925,8 +5916,6 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
     defer fixture.deinit();
     var root = io_mod.VerifiedDir{ .dir = try fixture.tmp.dir.openDir(std.testing.io, ".fx", .{ .iterate = true, .follow_symlinks = false }) };
     defer root.close();
-    // Made after the store opened: an older session's side folder (D27),
-    // and one that also has a v1 folder.
     var files = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.session_files_dir_name);
     defer files.close();
     for ([_][]const u8{ "v2-side-owner", "terminal-store-owner" }) |name| {
@@ -5934,7 +5923,6 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
         owner.close();
     }
 
-    // Only a new terminal makes a v2 owner's folder, in ~/.fx/terminal.
     try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("v2-new-owner", false, false));
     try std.testing.expectError(error.FileNotFound, root.dir.statFile(std.testing.io, profile_paths.terminal_dir_name, .{}));
     var made = try fixture.profile.open_capability("v2-new-owner", false, true);
@@ -5949,7 +5937,6 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
     side.deinit();
     try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("absent-owner", false, false));
 
-    // A folder in an earlier root makes the same id one owner, seen once.
     var both = try io_mod.openOrCreateVerifiedPrivateDir(&terminal_root, "v2-side-owner");
     both.close();
     var names: std.ArrayList([]u8) = .empty;
@@ -6456,8 +6443,6 @@ test "owner reconcile ends only terminals whose owner process is gone" {
     const running_owner = try formatOwnerIdentity(&running_buffer, text_utils.repeat("a", 32), 4242, token);
     var gone_buffer: [max_owner_identity_bytes]u8 = undefined;
     const gone_owner = try formatOwnerIdentity(&gone_buffer, text_utils.repeat("b", 32), 4243, token);
-    // The retired daemon wrote a bare instance id, so its records are judged
-    // by their terminal process.
     const legacy_owner = "0123456789abcdef0123456789abcdef";
 
     try create_owned_live_terminal(&fixture, "terminal-owner-running", running_owner, test_persistence(), "5000");
@@ -6490,10 +6475,8 @@ test "owner reconcile ends only terminals whose owner process is gone" {
     const owner_id = "terminal-store-owner";
     try std.testing.expectEqual(contracts.Lifecycle.lost, try recorded_lifecycle(&fixture, owner_id, "terminal-owner-gone"));
     try std.testing.expectEqual(contracts.Lifecycle.lost, try recorded_lifecycle(&fixture, owner_id, "terminal-legacy-gone"));
-    // A running owner's terminals are never ended, whatever process runs them.
     try std.testing.expectEqual(contracts.Lifecycle.running, try recorded_lifecycle(&fixture, owner_id, "terminal-owner-running"));
     try std.testing.expectEqual(contracts.Lifecycle.running, try recorded_lifecycle(&fixture, owner_id, "terminal-legacy-live"));
-    // Another owner session is never scanned, even with a gone owner.
     try std.testing.expectEqual(
         contracts.Lifecycle.running,
         try recorded_lifecycle(&fixture, "terminal-other-owner", "terminal-other-gone"),
@@ -8277,8 +8260,6 @@ test "recovery leaves partial start artifacts to the process writing them" {
         try std.testing.expectError(error.InjectedCrash, fixture.create(id));
         fixture.profile.options.fail_at = null;
         try fixture.reopen();
-        // Without a record there is no owner to prove gone: another running
-        // process may still be finishing this start.
         var recovered = try recover_profile_for_test(&fixture.profile, 10);
         defer recovered.deinit();
         try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);

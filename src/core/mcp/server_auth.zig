@@ -163,10 +163,7 @@ pub fn authenticatedPost(
     producing_identity: ?*catalog_freshness.Digest,
 ) !streamable_http.PostResponse {
     if (server.config.acp_server_id) |server_id| {
-        // Host-channel servers carry no HTTP headers or credentials.
         const carrier = server.message_carrier orelse return error.McpTransportUnavailable;
-        // Every exchange shares the identity of an empty header set, so paged
-        // catalogs from one registration always match.
         if (producing_identity) |identity| identity.* = try authIdentityForHeaders(request_alloc, &.{});
         return .{ .body = try carrier.exchange(request_alloc, .{
             .server_id = server_id,
@@ -529,8 +526,6 @@ fn replaceAuthCredentials(alloc: Allocator, server: *McpServer, credentials: *mc
     if (server.auth_credentials) |*old| old.deinit(alloc);
     server.auth_credentials = credentials.*;
     server.auth_credentials_present.store(true, .release);
-    // Usable credentials settle any challenge state left by a rejected
-    // refresh; the interactive auth path clears the pending challenge object.
     server.auth_challenge_present.store(false, .release);
     credentials.* = undefined;
 }

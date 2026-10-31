@@ -206,9 +206,6 @@ const PendingCardPaintContext = struct {
     }
 };
 
-// A mid-line flow endpoint always takes the canonical user-turn separator,
-// even at the content bottom: the frame scrolls to reserve the card rows, so
-// the preview starts on a fresh row instead of overwriting the endpoint.
 fn pendingCardLeadingAdvanceRows(cursor_col: u16) u16 {
     if (cursor_col == 1) return 0;
     return render_engine.transcript_blocks.blockSeparatorNewlineCount(
@@ -387,7 +384,6 @@ fn previewWithPendingCard(
     return next;
 }
 
-// Every steering slice in the result is owned for one render frame.
 fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
     var projection: SteeringProjection = .{};
     errdefer projection.deinit(app.alloc);
@@ -482,13 +478,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn applyThemeUpdate(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !void {
             if (!ui_render.themeNeedsUpdate(light, rgb)) return;
 
-            // Resolve the target first so the retint rewrites the old theme's
-            // escapes into the new theme's, custom pairs included.
             const prior_theme = shared_theme.current();
             var resolved_target: ?shared_theme.Theme = null;
             if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
-                // Custom themes re-resolve on live flips: sibling swap or
-                // builtin fallback, same rule as startup.
                 resolved_target = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
                     debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
                     break :blk null;
@@ -714,7 +706,6 @@ pub fn Runtime(comptime App: type) type {
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
-                // A launch credential still loading must not flash "run /login".
                 .has_api_key = app.auth.credentialSource() != null or
                     (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
@@ -1033,7 +1024,6 @@ pub fn Runtime(comptime App: type) type {
                     App.startPromptCredentialPrewarm(app);
                 }
             }
-            // MCP servers start once the first frame is on screen, never before.
             if (comptime @hasDecl(App, "startMcpHostServers")) {
                 if (snapshot.reasons.contains(.first_frame)) App.startMcpHostServers(app);
             }
@@ -1225,9 +1215,6 @@ pub fn Runtime(comptime App: type) type {
         fn renderFrameAttempt(app: *App, snapshot: render_request.AttemptSnapshot) !FrameAttemptResult {
             var checkpoint_storage = transcriptBuildCheckpoint(app);
             const checkpoint = if (checkpoint_storage) |*value| value else null;
-            // Frame-fresh producer fact for the finality floor: the trailing
-            // assistant entry stays non-final while the stream is open or
-            // the pacer still holds undelivered output.
             set_transcript_assistant_tail_writable(
                 &app.shell,
                 app.stream.active or app.pacer.hasPending(),
@@ -1395,7 +1382,6 @@ pub fn Runtime(comptime App: type) type {
                 else
                     activityStateFromPlacement(footer_frame.paint.activity);
                 if (pending_card != null and frame_activity == .thinking) {
-                    // The pending tail already includes the transcript cursor's blank row.
                     frame_activity.thinking.gap_above_activity = render_engine.transcript_blocks.blockGapRowsBetween(
                         .user_turn,
                         .assistant_turn,
@@ -1687,8 +1673,6 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
-            // A band too short for the preview below the flow endpoint defers it
-            // the same way: adoption writes the real card.
             const pending_preview_deferred = pending_submission_card and
                 prepared_transcript != null and pending_paint_ctx == null;
             if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
@@ -1846,8 +1830,6 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
-                // The committed pending UI permits adoption even when its preview
-                // would overwrite the flow endpoint. Adoption writes the real card.
                 .pending_prompt_presented = pending_submission_card and (pending_paint_ctx != null or pending_preview_deferred),
                 .file_picker_receipt = if (result.is_committed() and presentation_commits_transcript and
                     footer_measurement != null and footer_measurement.?.show_picker and
@@ -2225,9 +2207,6 @@ fn transcriptAreaBeforePendingTail(
     tail_rows: u16,
 ) render_engine.frame_layout.FrameRect {
     if (area.isEmpty() or tail_rows == 0) return area;
-    // A tail taller than the band still leaves the flow endpoint row. Without
-    // it the frame seals no transcript transition, and adoption would rebase
-    // onto rows that never reached scrollback.
     const canonical_rows = @max(area.height() -| tail_rows, 1);
     return .{ .top = area.top, .bottom = area.top + canonical_rows - 1 };
 }
@@ -2765,8 +2744,6 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     defer alloc.free(first);
     try feedRewritePublicationFrame(alloc, &physical, &history, first);
     for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
-    // The flow endpoint sits mid-line at the content bottom, as after any
-    // finished turn in a long session.
     try std.testing.expect(app.shell.cursor_col > 1);
     try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
 
@@ -2792,8 +2769,6 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
     const seeded = currentCompactSource(&app.shell) orelse return error.CommittedSourceNotCached;
     const slots_before = compactSourceCacheSlots(&app.shell);
-    // A cache hit refreshes the cursor from the shell, so clearing this
-    // column proves the frame read the commit's source instead of rebuilding.
     const poisoned_col = std.math.maxInt(@TypeOf(seeded.preview.cursor_col));
     seeded.preview.cursor_col = poisoned_col;
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
@@ -2864,7 +2839,6 @@ test "pending steering on a full screen paints below the summary and leaves no f
 }
 
 test "pending prompt taller than a near-empty transcript reaches scrollback through adoption" {
-    // The short terminal leaves the preview no row below the flow endpoint.
     for ([_]struct { rows: u16, preview_tail: usize }{
         .{ .rows = 24, .preview_tail = 1 },
         .{ .rows = 7, .preview_tail = 0 },
@@ -2947,8 +2921,6 @@ test "pending prompt preview preserves blank bottom rows and canonical leading s
         } } },
     };
     defer app.submission.pending.?.deinit(alloc);
-    // Rows at or near the content bottom keep the canonical separator; the
-    // frame scrolls to reserve it, so only unscrolled rows check the paint row.
     const cases = [_]struct { row: u16, col: u16, advance: u16, unscrolled: bool }{
         .{ .row = 20, .col = 1, .advance = 0, .unscrolled = true },
         .{ .row = 8, .col = 47, .advance = 2, .unscrolled = true },
@@ -3990,7 +3962,6 @@ test "file picker real frame receipt promotes only visible rows and preserves pr
     picker.file_completion.retry();
     completion.prepareFilePicker(&app);
     try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
-    // A catalog owns the frame while the completion stays staged.
     app.input_runtime.help_menu.active = true;
     completion.reconcileFilePicker(&app);
     const prepared_revision = completion.filePickerView(&app).receipt.?.revision;
@@ -5143,7 +5114,6 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try std.testing.expectEqual(.invalid, app.shell.transcriptCommitDiagnostic().state);
         var read_offset = try file.length(std.testing.io);
 
-        // Interrupt actual preparation, not the coordinator's synthetic receipt stub.
         app.terminal_input_runtime.terminal_action_decoder.stage = 2;
         app.shell.render_requests.request(.first_frame);
         try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
@@ -5154,7 +5124,6 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try std.testing.expect(app.shell.render_requests.hasPending());
         app.terminal_input_runtime.resetEscapeDecoder();
 
-        // A unit-test stdin can be closed; suppress that unrelated poll on retries.
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
         try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
         const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
@@ -5195,7 +5164,6 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
             const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
             defer alloc.free(next);
-            // Recovery continues the materialized suffix instead of replaying row zero.
             try std.testing.expect(std.mem.find(u8, next, "ORIGIN_ROW_000") == null);
             const suffix_start = std.mem.find(u8, next, "ORIGIN_ROW_") orelse return error.MissingResumeSuffix;
             var receipt_cursor_buf: [32]u8 = undefined;

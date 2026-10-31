@@ -99,7 +99,6 @@ assert.throws(
   (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
 );
 addon.writeCore(core, Buffer.alloc(0));
-// Attachments carry raw prompt images and checkpoints beside ACP frames.
 for (const id of [0, -1, 1.5, 2 ** 32, "1"]) {
   assert.throws(() => addon.writeCoreAttachment(core, id, Buffer.from("x")), {
     name: "TypeError",
@@ -170,7 +169,6 @@ const takeFetch = async () => {
   for (;;) {
     const fetchRequest = addon.takeCoreFetch(lifecycleCore);
     if (fetchRequest) {
-      // Metadata stays JSON; the body arrives as raw bytes beside it.
       const metadata = JSON.parse(fetchRequest.request.toString("utf8"));
       assert.equal(Object.hasOwn(metadata, "body"), false, "fetch metadata must not embed the body");
       assert.ok(Buffer.isBuffer(fetchRequest.body), "fetch body must be a Buffer");

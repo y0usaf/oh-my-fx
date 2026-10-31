@@ -149,8 +149,6 @@ pub const Catalog = struct {
             asking.finish(arena, .abandoned);
             return err;
         };
-        // The questions asked end with the call: an editor hears that a URL it
-        // opened was used (ACP `elicitation/complete`).
         asking.finish(arena, if (answer == .result) .completed else .abandoned);
         const result = render(arena, server, name, answer, max_tool_result_bytes) catch |err| {
             if (observed) |call| call.end(.failure, @errorName(err));
@@ -175,7 +173,6 @@ pub const Catalog = struct {
                 if (std.mem.eql(u8, s.name, name)) break;
             } else return .{ .model_output = try tool_search.renderServerNotFound(alloc) };
         }
-        // Every server starts at once, then each list is waited for.
         for (servers, 0..) |s, i| if (searched(request, s)) c.runtime.prepare(i) catch {};
         for (servers, 0..) |s, i| if (searched(request, s)) try c.refresh(i, cancel);
         if (try c.renderUnavailable(alloc, request)) |output| return .{ .model_output = output };
@@ -391,8 +388,6 @@ pub const Catalog = struct {
         }
         return .{ .servers = try out.toOwnedSlice(alloc) };
     }
-
-    // ---- lists ----
 
     fn searched(request: tool_mcp_runtime.SearchRequest, s: config.Server) bool {
         if (s.held != null) return false;
@@ -699,7 +694,6 @@ test "an MCP-v2 server's tools reach the model under fx's names" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Asking for a tool by its fx name starts its server and loads the list.
     try testing.expect(c.hasTool("mcp_fake_echo", .unrestricted));
     try testing.expect(!c.hasTool("mcp_fake_nope", .unrestricted));
     try testing.expect(!c.hasTool("mcp_fake_echo", .disabled));

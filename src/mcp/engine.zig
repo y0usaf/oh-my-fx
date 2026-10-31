@@ -317,14 +317,8 @@ pub const Engine = struct {
                 if (slot.backoff_due) |due| if (due <= e.now()) {
                     slot.backoff_due = null;
                     try e.step(slot, .backoff_over);
-                    // A subscription waiting to listen again is demand.
                     if (slot.server) |s| if (s.waiting()) try e.step(slot, .need);
                 };
-                // What the host should see goes out before that server is
-                // read again, so the slices in it stay valid. What the same
-                // read queued is taken with it, so the gate is current when
-                // the host acts: a process exit's lost calls and its `down`
-                // are one step, as in the model.
                 if (slot.server) |s| while (e.event_count == 0) {
                     try e.onServer(slot, try s.poll() orelse break);
                     while (s.pending()) |more| try e.onServer(slot, more);
@@ -358,9 +352,6 @@ pub const Engine = struct {
                     .session => "session",
                     .needs_auth => "needs_auth",
                 };
-                // One that needs a sign-in is dropped, as the host would,
-                // and what waits ends needs_auth; once signed in, the next
-                // need starts it again.
                 if (f == .needs_auth) return e.stepFor(slot, .{ .drop = .{ .keep = false } }, .needs_auth);
                 try e.step(slot, .down);
             },
@@ -374,8 +365,6 @@ pub const Engine = struct {
                 } else return;
                 const s = slot.server.?;
                 const x = &slot.calls.items[i];
-                // -32022 after detection switched versions; the call
-                // goes out once more, with the new one.
                 if (c.answer) |a| if (a == .failure and a.failure.code == wire.code.unsupported_protocol_version and !x.resent and s.protocolVersion() != null) {
                     x.resent = true;
                     x.sent = try s.call(x.name, x.arguments);
@@ -397,7 +386,7 @@ pub const Engine = struct {
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {
                 return e.emit(slot, .{ .input = .{ .call = x.handle, .requests = q.requests } });
             },
-            .timeout => unreachable, // `poll` never says it
+            .timeout => unreachable,
             else => e.emit(slot, .{ .server = event }),
         }
     }
@@ -548,7 +537,7 @@ pub const Engine = struct {
     }
 
     fn emit(e: *Engine, slot: *Slot, kind: @FieldType(Event, "kind")) void {
-        if (e.event_count == e.events.len) return; // the host stopped reading; the newest are dropped
+        if (e.event_count == e.events.len) return;
         e.events[e.event_count] = .{ .server = slot.config.name, .kind = kind };
         e.event_count += 1;
     }
@@ -602,8 +591,6 @@ fn same(a: Config, b: Config) bool {
 }
 
 test {
-    // Behavior is tested by the Bun driver through tools/labs/engine_lab.zig;
-    // this makes sure everything compiles.
     std.testing.refAllDecls(Engine);
 }
 
@@ -631,7 +618,6 @@ test "wake from another thread ends a waiting next early" {
     try std.testing.expectEqual(@as(?Event, null), try e.next(10_000));
     try std.testing.expect(e.now() - started < 5_000);
 
-    // A wake before `next` is not lost: the next wait returns at once.
     e.wake();
     try std.testing.expectEqual(@as(?Event, null), try e.next(10_000));
     try std.testing.expect(e.now() - started < 5_000);

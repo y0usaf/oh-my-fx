@@ -1,17 +1,3 @@
-// Scripted fake OAuth for tests/tla/drivers/mcp/fakes/http.ts (U09): protected resource
-// metadata for the MCP endpoint, and authorization servers at /as1, /as2, ...,
-// each with metadata, /authorize, /token, and /register. The MCP endpoint's
-// gate answers 401 with a challenge without a valid token, and 403
-// insufficient_scope when the token lacks a method's scopes.
-//
-// /authorize approves at once and redirects to the client's redirect_uri with
-// a code, the state, and iss as configured; nothing is ever sent to that URI.
-// The token endpoint checks the code, the PKCE verifier, the redirect URI, and
-// resource; refresh tokens rotate unless told not to. Tokens can be limited to
-// a number of uses, and after a number of tokens the resource metadata can
-// name the next server, whose server then rejects the old ones (migration).
-// Every auth request is logged as {dir: "auth", path, query, form, json,
-// authorization}.
 
 export interface AuthServer {
   /** Where its metadata is: RFC 8414's well-known URI, or OpenID's appended to its path. */

@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# fx-indexer keeps native workspace discovery in src/core/indexer behind one
-# front door, indexer.zig. Code outside imports only that file. The indexer
-# imports only the standard library, its own files, and fx's shared io.zig and
-# debug_trace.zig, and it never starts a process: it reads repository metadata
-# as data, so a repository's configuration can never make it run a program.
-# @-completion and the glob and grep tools list files only through it, so
-# their production code, everything above each file's first test, never
-# starts a process either.
 
 set -euo pipefail
 

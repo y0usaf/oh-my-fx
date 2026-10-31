@@ -55,8 +55,6 @@ pub fn writeModelRecoveryInfoUpdate(
         if (recovery.isRecovered())
             "recovered"
         else if (recovery.kind == .terminal_provider_error)
-            // Match the CLI JSON contract: a genuine lifecycle pause
-            // (action == .paused) is resumable; a terminal stop is not.
             if (recovery.action == .paused) "paused" else "failed"
         else
             "active",

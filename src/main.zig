@@ -109,7 +109,7 @@ const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
 const shell_resolver = @import("core/terminal/shell_resolver.zig");
-const rush_embed = @import("rush_app"); // trimmed: headless embed root (vendor/rush/src/embed.zig)
+const rush_embed = @import("rush_app");
 const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
@@ -702,7 +702,6 @@ const App = struct {
                 else
                     SessionAppRuntime.resumeRequestedSession(&app);
                 resumed catch |err| {
-                    // Why a v1 session could not be converted, for the exit message (D61).
                     launch.resume_refusal = SessionAppRuntime.conversionRefusal(&app, alloc, err);
                     return err;
                 };
@@ -731,8 +730,6 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
     }
@@ -847,14 +844,11 @@ const App = struct {
     /// handoff is owned by the caller.
     pub fn shutdownForProcessExit(self: *App) app_session_runtime.ShutdownOutcome {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
-        // Failed startups (no TTY, too small) never earn a shutdown report.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
-        // Hand the terminal back first; nothing below renders.
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
         self.auth.stopProviderPreparation();
-        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream();
         self.worker.requestShutdown();
@@ -864,31 +858,24 @@ const App = struct {
         WorkspaceAppRuntime.requestStop(self);
         self.managed_executions.terminateForProcessExit();
         shutdown_trace.mark("background_stops_requested");
-        // Terminals belong to this process and end with it, with no prompt.
-        // Subagents share this client, so theirs end here too. Ending them
-        // also releases a worker waiting on one.
         self.terminal_client.closeOwnedTerminals();
         shutdown_trace.mark("terminals_ended");
 
-        // The worker mutates session state, so it stops before persistence.
         if (self.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
-        // Cancel a /usage fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
         const shutdown_failure = self.session_persistence.shutdown_failure;
-        // These delete image snapshots and log discarded drafts.
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
 
-        // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit(self.alloc);
@@ -916,12 +903,8 @@ const App = struct {
     /// `shutdownForProcessExit`.
     pub fn deinit(self: *App) void {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
-        // Only real interactive sessions earn a shutdown report; failed
-        // startups (no TTY, too small) reach deinit through errdefer and must
-        // not write to the profile directory.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
         self.auth.stopProviderPreparation();
-        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
@@ -1038,7 +1021,6 @@ const App = struct {
 
     pub fn suspendToJobControl(self: *App) !void {
         try self.flushBeforeBlockingExternalWork();
-        // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
     }
@@ -1456,7 +1438,6 @@ const App = struct {
         return true;
     }
 
-    // Caller owns the returned prompt until worker admission succeeds.
     fn snapshotPrompt(
         self: *App,
         prompt: []const u8,
@@ -2160,8 +2141,6 @@ const App = struct {
         var providers = builtin_providers.native;
         providers.definitions = self.provider_selection.definitions.definitions;
         if (self.provider_selection.gateway_http_pool) |pool| {
-            // Rebind the gateway stream provider to the process-long pooled
-            // client so chat requests reuse warm keep-alive connections.
             if (providers.gateway.agent_stream) |stream| {
                 var stamped = stream;
                 stamped.context = pool;
@@ -2277,8 +2256,6 @@ const App = struct {
                 self.auth.modelCatalogAccess(),
             );
         } else {
-            // Warming without the launch credential would fetch the catalog
-            // twice; the credential's arrival starts the warmup instead.
             if (AuthAppRuntime.startupCredentialPending(self)) {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
@@ -2295,7 +2272,6 @@ const App = struct {
     }
 
     pub fn isModelCacheLoading(self: *App) bool {
-        // The catalog load waits for a deferred launch credential.
         return self.model_cache.isLoading() or AuthAppRuntime.startupCredentialPending(self);
     }
 
@@ -2854,10 +2830,6 @@ const App = struct {
     fn nativeClearProbeEligible(self: *const App, byte: u8) bool {
         if (byte < 32 or byte == 127) return false;
         if (io_mod.getenv("TMUX") != null) return false;
-        // An alternate-screen surface (full transcript, approval review,
-        // catalog menu) owns the terminal cursor. The probe compares against
-        // the main-grid footer row, so any response from the alternate screen
-        // is a guaranteed false mismatch; never begin while one is active.
         if (self.terminal.alternate_screen_owner != .none) return false;
         if (self.terminal_input_runtime.native_clear_probe.disabled() or
             self.terminal_input_runtime.native_clear_probe.active() or
@@ -3056,10 +3028,6 @@ const App = struct {
         const now_ms = io_mod.milliTimestamp();
         self.terminal_input_runtime.terminal_theme_monitor.poll(now_ms);
 
-        // A configured light|dark pin (FX_THEME or the settings "theme" key)
-        // locks the variant; keep owning protocol bytes (monitor started) but
-        // never query or apply live theme updates. Custom theme files stay
-        // live: updates re-resolve the theme pair.
         if (ui_render.themeInputLocked()) {
             _ = self.terminal_input_runtime.terminal_theme_monitor.takeSettledUpdate();
             return;
@@ -3109,7 +3077,6 @@ const App = struct {
             try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
         }
         if (comptime host_profile.native_auth) {
-            // Settle a deferred launch credential before admitting prompts.
             try AuthAppRuntime.collectStartupCredentialFacts(self);
             AuthAppRuntime.collectDeferredStartupInventory(self);
         }
@@ -3175,8 +3142,6 @@ const App = struct {
                 }
             };
         }
-        // Terminal width changed with the modal open, so the footer
-        // panel needs to re-wrap labels and descriptions.
         if (self.question_prompt.isActive() and cols_before_resize != self.shell.layout.cols) {
             self.shell.render_requests.request(.modal);
         }
@@ -3594,11 +3559,6 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             io_mod.setIo(threaded.io());
 
             var owned_launch = launch;
-            // Interactive shutdown has already persisted the session and
-            // terminated child processes. What remains is freeing memory and
-            // joining threads that can still be waiting on DNS, the network,
-            // or a disk scan, so end the process here. The app is declared in
-            // this scope because those threads still reference it.
             var app: App = undefined;
             const outcome = app_entry_runtime.runInteractive(App, &app, alloc, &owned_launch, auth_mode) catch exitFast(1);
             exitFast(switch (outcome) {
@@ -3806,7 +3766,6 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout") or
-            // MCP-v2's verbs start a host or delete a stored login.
             std.mem.eql(u8, effective_args[1], "show") or
             std.mem.eql(u8, effective_args[1], "login") or
             std.mem.eql(u8, effective_args[1], "remove") or
@@ -3820,12 +3779,10 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "provider") or
         std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
-        // Resolve a stored credential, which reads the platform key store out of process.
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
         std.mem.eql(u8, command, "credits") or
-        // Reads AI Gateway usage reports over HTTP with a deadline.
         std.mem.eql(u8, command, "usage");
 }
 
@@ -4688,13 +4645,9 @@ test "deferred resumed diff builds once and degrades to its preview" {
     };
     try app.registerAndEmitDiffBlock(payload);
     const id = app.diff_entries.items[0].id;
-    // Registering and drawing a resumed edit builds nothing; the full diff
-    // waits for the full transcript to ask for it.
     try std.testing.expect(app.diff_entries.items[0].deferred != null);
     try std.testing.expect(app.diff_entries.items[0].full == null);
 
-    // No saved session owns the snapshots: the entry falls back to its
-    // preview, and the failed build is not retried on every lookup.
     try std.testing.expect(!App.hasFullDiffForLifecycle(&app, lifecycle));
     try std.testing.expect(app.diff_entries.items[0].deferred == null);
     try std.testing.expect(App.fullDiffForMarker(&app, id) == null);
@@ -5091,7 +5044,7 @@ fn runRushEmbed(
     var session = try rush_embed.Session.init(allocator, env_list);
     defer session.deinit();
 
-    var index: usize = 1; // args[0] is the re-exec'd executable path, not a flag
+    var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = std.mem.sliceTo(args[index], 0);
         if (std.mem.eql(u8, arg, "-c")) {
@@ -5114,7 +5067,6 @@ fn runRushEmbed(
         }
     }
 
-    // Cooked-mode REPL: the tty line discipline provides one command per line.
     var read_buffer: [64 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buffer);
     while (true) {

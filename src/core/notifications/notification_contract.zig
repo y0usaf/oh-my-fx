@@ -6,7 +6,6 @@ pub const ConfigureError = std.mem.Allocator.Error || hooks.RegistrationError;
 pub const Preferences = struct {
     turn_end: bool = false,
     attention_required: bool = false,
-    // Max retains the ordinary sound gates and enables additional direct cues.
     max: bool = false,
 };
 

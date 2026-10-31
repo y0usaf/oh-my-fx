@@ -1,6 +1,3 @@
-// Drives the real fx binary with every shell call the TLA+ model covers and
-// records what fx actually did. No model calls: a local fake Gateway serves
-// exact argument bytes, so shapes such as invalid JSON reach fx unchanged.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ObservedCall, ObservedTurn } from "./bridge";
@@ -17,9 +14,7 @@ export interface RunContext {
 }
 
 const SESSION_INTENTS = new Set(["type", "observe", "stop"]);
-// Prints which shell ran the command. Kept free of quotes so every encoding carries it unchanged.
 const MARK = "echo FXT:${BASH_VERSION:+bash}${ZSH_VERSION:+zsh}";
-// Bash-style text that zsh treats differently: an unmatched glob, a =word, and ${arr[0]}.
 const EQ = "echo before; ls *.fxt-nomatch 2>/dev/null; echo =====; arr=(a b); echo ${arr[0]}; echo after";
 const EQ_BASH_LINES = ["before", "=====", "a", "after"];
 const TYPED = "FXT_TYPED\n";
@@ -82,9 +77,7 @@ export function encode(e: Emission, sid: string): string {
     case "flat_action": return JSON.stringify(today(e.intent, sid));
     case "wrapped": return JSON.stringify({ request: today(e.intent, sid) });
     case "wrapped_string": return JSON.stringify({ request: JSON.stringify(today(e.intent, sid)) });
-    // A string request whose JSON is cut off before its closing quote and brace.
     case "wrapped_broken": return JSON.stringify({ request: JSON.stringify(today(e.intent, sid)).slice(0, -2) });
-    // Unescaped quotes inside a string: the whole argument text is not JSON.
     case "invalid_json": return `${JSON.stringify(today(e.intent, sid)).slice(0, -1)},"note":"say "hi""}`;
     case "legacy_names": return JSON.stringify(legacy(e.intent, sid));
     case "with_irrelevant": return JSON.stringify(irrelevant(e.intent, sid));
@@ -128,7 +121,6 @@ export function interpret(body: string, sid: string | null): Pick<ObservedCall, 
   }
   const shell = /FXT:(bash|zsh)\b/.exec(output)?.[1];
   if (!shell) return { executed: true, decoded: "unknown", outcome: "ok" };
-  // Inside a fx TTY run the command's stdout is not a terminal, so read the backend.
   const tty = value.backend === "tty";
   const decoded = shell === "bash" ? (tty ? "run_bash_tty" : "run_bash") : (tty ? "run_tty" : "run");
   return { executed: true, decoded, outcome: "ok" };
@@ -218,10 +210,7 @@ export async function runTurn(ctx: RunContext, spec: TurnSpec): Promise<Observed
       resultBody,
     } as ObservedCall;
   });
-  // final: fx asked again after the last served call and got the final text.
-  // guard: fx stopped after the last served call and reported its loop guard.
   const askedAfterLast = requests.length > offset + sent.length;
-  // fx ask --json reports the stop as a stderr notice.
   const guardReported = stderr.includes(LOOP_STOP) || stdout.includes(LOOP_STOP) ||
     existsSync(join(home, ".fx", "sessions")) && readdirSync(join(home, ".fx", "sessions")).some((id) => {
       const events = join(home, ".fx", "sessions", id, "events.jsonl");
@@ -248,7 +237,6 @@ export function turnSpecs(emits: string[]): TurnSpec[] {
   });
   return [
     ...single,
-    // These shapes are rejected in both designs, so the guard is exercised either way.
     { name: "guard same rejected call repeated", calls: Array(3).fill({ intent: "run", shape: "wrapped_broken" }) },
     { name: "no guard after accepted repeats", calls: Array(2).fill({ intent: "run", shape: "flat_action" }) },
     { name: "no guard for different rejected calls",

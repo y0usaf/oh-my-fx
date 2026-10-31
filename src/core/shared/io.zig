@@ -4,19 +4,13 @@ const darwin_process_spawn = @import("darwin_process_spawn.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
-// Process globals are installed before threads start and remain read-only.
 var real_io: ?std.Io = null;
 
-// Fallback used by non-test code only when setIo was not called. The real
-// application installs `real_io` from main before spawning threads.
 var fallback_threaded: std.Io.Threaded = .init_single_threaded;
 
 var global_environ: ?*const std.process.Environ.Map = null;
 var global_environ_block: ?std.process.Environ.Block = null;
 var global_raw_environ: ?RawEnviron = null;
-// Set when another program owns the process environment and may change it,
-// as Node.js does for the N-API addon: the environment is read from libc at
-// each use and no pointer to it is kept.
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
@@ -211,9 +205,6 @@ fn openExistingRegularFileWithPolicy(
     const initial = try dir.statFile(getIo(), sub_path, .{
         .follow_symlinks = policy.final_symlink == .follow,
     });
-    // A lookup that races an atomic replacement can return the replaced file
-    // after its last link is gone. Apply the opened-file policy, so a
-    // read-only open accepts that snapshot as the check after the open does.
     try verifyOpenedRegularFileWithPolicy(initial, policy);
 
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
@@ -358,7 +349,6 @@ test "read-only opens accept a file that a concurrent atomic replacement unlinks
         replacer.stop.store(true, .release);
         thread.join();
     }
-    // Some lookups see the replaced file after its last link is gone.
     for (0..5000) |_| {
         var file = try openExistingRegularFile(tmp.dir, "target", .read_only);
         file.close(getIo());
@@ -438,7 +428,6 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     if (global_raw_environ) |raw| return getenvFromLibc(key) orelse getenvFromRaw(raw, key);
     if (global_libc_environ) {
         if (getenvFromLibc(key)) |value| return value;
-        // getenvFromLibc copies the key into a 128-byte buffer.
         if (key.len < 128) return null;
         return getenvFromRaw(liveLibcEnviron() orelse return null, key);
     }
@@ -543,8 +532,6 @@ pub fn readFileToEnd(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: us
     const zio = getIo();
     var read_buf: [8192]u8 = undefined;
     var r = file.reader(zio, &read_buf);
-    // A file of exactly `max_bytes` is too long. `appendRemaining` keeps that
-    // boundary, while `allocRemaining` accepts it.
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     try r.interface.appendRemaining(alloc, &content, .limited(max_bytes));
@@ -1095,7 +1082,6 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
     if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
-        // F_GETPATH (macOS fcntl command 50): resolve filesystem path for an fd.
         var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
         const rc = std.c.fcntl(handle, @as(c_int, 50), @intFromPtr(&path_buf));
         if (rc == -1) return error.HandlePathUnavailable;
@@ -1202,7 +1188,6 @@ test "homeDir accepts only an absolute HOME" {
     for ([_][]const u8{ "", "relative/home", "./home", "~" }) |value| {
         try environ.put("HOME", value);
         try std.testing.expect(homeDir() == null);
-        // The raw value stays available to code that passes it on.
         try std.testing.expectEqualStrings(value, getenv("HOME").?);
     }
 
@@ -1334,7 +1319,6 @@ test "libc environment lookups follow a host that grows the environment" {
     defer for (names[0..set]) |*name| {
         _ = libc.unsetenv(name);
     };
-    // Enough new names that libc moves its array, as a host's writes do.
     while (set < count) : (set += 1) {
         const written = try std.mem.print(names[set][0..31], "FX_IO_LIVE_ENV_{d}", .{set});
         names[set][written.len] = 0;
@@ -1633,7 +1617,6 @@ test "durable replace can record what stopped it before the rename" {
     try std.testing.expectEqual(@as(?anyerror, error.InjectedSyncFailure), cause);
     try std.testing.expectError(error.FileNotFound, dir.dir.statFile(getIo(), "marker", .{ .follow_symlinks = false }));
 
-    // A replace that succeeds records nothing.
     cause = null;
     try durableReplaceVerifiedWithOps(alloc, &dir, "marker", "new", .{ .pre_rename_cause = &cause });
     try std.testing.expectEqual(@as(?anyerror, null), cause);

@@ -40,7 +40,6 @@ async function collect(turn) {
 }
 
 try {
-  // Identical text must survive both one oversized transport write and many writes.
   const source = "\u{1f600}界".repeat(1_200_000) + " tail\n";
   for (const fragmented of [false, true]) {
     console.log(`${backend}: large output fragmented=${fragmented}`);
@@ -55,7 +54,6 @@ try {
     agent = null;
   }
 
-  // A fast producer cannot publish the entire response into an unread JS queue.
   let received = 0;
   let pressure;
   console.log(`${backend}: paused consumer`);
@@ -78,7 +76,6 @@ try {
   await agent.close();
   agent = null;
 
-  // Cancellation releases an output wait without requiring an iterator to resume.
   console.log(`${backend}: cancel and reuse`);
   received = 0;
   let aborted = false;

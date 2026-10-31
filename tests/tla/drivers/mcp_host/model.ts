@@ -1,12 +1,3 @@
-// Model gate for the fx-layer MCP-v2 models: each model's smoke config
-// (safety and liveness), its stress config, every planted bug, the stated
-// properties the code is expected to break (findings), and repair witnesses.
-//
-// Verdicts, as MCP-v2's tools/run.py gives them:
-//   PASS     exit 0, the completed marker, an empty queue
-//   CAUGHT   a planted bug: exit 12 naming its invariant, or exit 13 for its property
-//   FINDING  a findings config: exit 12 naming the stated invariant (13 for a property)
-// Anything else is FAIL. Usage: bun model.ts OUTPUT_DIR [--model NAME]
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { configWith, runTlc, sha256, sha256Text, tlaDir, tools, type TlcRun } from "./tlc";

@@ -281,7 +281,6 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
     try testing.expectEqualStrings("b", store.current.get(1).name);
     try testing.expectEqualStrings("{\"description\":\"x\",\"name\":\"b\",\"inputSchema\":{}}", store.current.find("b").?.raw);
     try testing.expectEqual(@as(?Tool, null), store.current.find("c"));
-    // A restart drops what was gathered; the current list stays.
     _ = try store.addPage(testing.allocator, try parsePage("{\"tools\":[{\"name\":\"z\",\"inputSchema\":{}}],\"nextCursor\":\"q\"}"));
     store.discard();
     try testing.expectEqual(@as(usize, 0), store.gathering.len());
@@ -303,7 +302,6 @@ test "over HTTP, tools with an invalid x-mcp-header are dropped; the others stay
     try testing.expectEqual(@as(u32, 2), added.bad_headers);
     try testing.expectEqualStrings("invalid_space", added.first_bad.?.name);
     try testing.expectEqual(error.NotToken, added.first_bad.?.reason);
-    // Over stdio the same page keeps every tool.
     var stdio: Store = .{};
     defer stdio.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 3), (try stdio.addPage(testing.allocator, page)).added);

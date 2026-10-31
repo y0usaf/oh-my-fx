@@ -1,5 +1,3 @@
-// /usage in the TUI against loopback fakes for AI Gateway, ChatGPT (Codex),
-// and the Grok CLI proxy. The clock is pinned so day ranges are exact.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -102,14 +100,12 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       expect(week).toContain("provider/week");
       expect(week).not.toContain("provider/month");
 
-      // r refreshes at once, inside the one-minute floor, and reads only today.
       await session.sendKeys("r");
       await session.waitForPane(() => fake.reportRanges().length === 4, TIMEOUT);
       expect(fake.reportRanges()[3]).toBe(`${TODAY}..${TODAY}`);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(TIMEOUT);
-      // Reopening inside the floor shows the cache without reading again.
       await session.sendText("/usage");
       await session.waitForText("model (", TIMEOUT);
       expect(fake.reportRanges()).toHaveLength(4);

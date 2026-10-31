@@ -378,8 +378,6 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
-        // Terminals end with this process. Ending them first also releases
-        // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
         self.managed_executions.deinit();
@@ -581,7 +579,6 @@ test "ACP provider routes are host-managed only when configured and never leak i
     state.account_id = null;
     state.gateway_team = null;
 
-    // A Codex turn leaves the process host-managed with no token.
     var codex = (try prepareCredentialForProvider(&state, .codex)).?;
     try std.testing.expectEqual(types.CredentialSource.host_managed, codex.source);
     try std.testing.expectEqual(@as(usize, 0), codex.token.len);
@@ -589,26 +586,22 @@ test "ACP provider routes are host-managed only when configured and never leak i
     codex.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.host_managed, state.credential_source.?);
 
-    // The next Gateway turn gets its own key, not the host-managed source.
     var gateway = (try prepareCredentialForProvider(&state, .gateway)).?;
     defer gateway.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
     try std.testing.expectEqualStrings("gateway-key", gateway.token);
 
-    // A Grok turn is host-managed the same way.
     var grok = (try prepareCredentialForProvider(&state, .grok)).?;
     defer grok.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
     try std.testing.expectEqual(@as(usize, 0), grok.token.len);
 
-    // So is a configured provider: the host adds its API key, if any.
     const configured = model_provider.parse("local").?;
     var custom = (try prepareCredentialForProvider(&state, configured)).?;
     defer custom.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.host_managed, custom.source);
     try std.testing.expectEqual(@as(usize, 0), custom.token.len);
 
-    // Without the policy each provider needs its own credential.
     state.cfg.provider_auth_mode = .local;
     try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
     try std.testing.expect(!hostManagesRoute(state.cfg, .grok));
@@ -926,7 +919,6 @@ pub fn runWithTransport(
         .lifecycle_view = lifecycle_view,
     };
     defer state.deinit();
-    // One backend per process; the wasm host stays on v1.
     if (comptime !host_target.is_wasm) if (session_adapter.enabled(false)) {
         state.sessions_v2_requested = true;
         state.sessions_v2 = (if (cfg.home_override) |home|
@@ -985,8 +977,6 @@ pub fn runWithTransport(
         };
         if (state.terminate_connection) break;
     }
-    // Release any prompt thread parked on a pending approval before
-    // state.deinit() joins it, or shutdown deadlocks.
     handleCancel(&state, false);
 }
 
@@ -1386,8 +1376,6 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
             }
         },
         .mcp_message => {
-            // Request-scoped MCP notifications, such as progress, are not
-            // delivered to the running operation yet.
             debug_trace.logf("acp", "dropped mcp/message notification bytes={d}", .{if (msg.params_raw) |raw| raw.len else 0});
         },
         else => {},
@@ -1650,7 +1638,6 @@ fn writePromptInProgress(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
 /// only after the turn has fully returned, so joining the finishing worker
 /// here never waits on work that needs this reader.
 fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
-    // libfx kernel hosts steer through `libfx/steer`.
     if (state.cfg.minimal_kernel) return writePromptInProgress(state, alloc, msg.id);
     const params = msg.params_raw orelse return writePromptInProgress(state, alloc, msg.id);
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
@@ -1671,8 +1658,6 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
     const session = if (state.active_session) |*active| active else unreachable;
     session.steering.enqueueRequest(state.alloc, text, msg.id) catch |err| switch (err) {
         error.SteeringNotActive => {
-            // The running turn already stopped taking input. Let it answer,
-            // then run this prompt as the next turn instead of rejecting it.
             debug_trace.logf("acp", "steering prompt arrived after the turn closed input; starting next turn", .{});
             reapActivePrompt(state, true);
             return startPrompt(state, alloc, msg);
@@ -1753,7 +1738,6 @@ fn handleKernelCheckpoint(
     const bytes = active.session_rt.agent.checkpoint(alloc, meta) catch
         return state.writer.writeError(alloc, msg.id, unavailable);
     defer alloc.free(bytes);
-    // The checkpoint leaves as raw bytes beside the response frame.
     const attachment = store.put(bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
@@ -1799,7 +1783,6 @@ fn handleKernelRestore(
         }),
     };
     defer alloc.free(bytes);
-    // A journaled session's history changes only through its journal.
     if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_request,
         .message = "A journaled libfx session cannot restore a checkpoint",
@@ -1807,7 +1790,6 @@ fn handleKernelRestore(
     const saved = active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch |err|
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            // The host reports a newer checkpoint as it reports a newer journal.
             .message = if (err == error.UnsupportedCheckpointVersion)
                 "libfx checkpoint was written by a newer fx"
             else
@@ -1815,8 +1797,6 @@ fn handleKernelRestore(
         });
     defer saved.free(alloc);
     if (saved.isEmpty()) return state.writer.writeResponse(alloc, msg.id, "null");
-    // What the checkpoint recorded about the agent that saved it, for the
-    // host to compare with its own.
     var response: std.Io.Writer.Allocating = .init(alloc);
     defer response.deinit();
     try response.writer.writeAll("{\"checkpointMeta\":");
@@ -1882,8 +1862,6 @@ fn handleKernelJournalOpen(
         .code = ErrorCode.invalid_request,
         .message = "libfx journal is already open",
     });
-    // A host that stores every input before handing it in, as libfx's
-    // session executor does, needs no wait before a request carries one.
     const inputs_durable = if (parsed.value.object.get("inputsDurable")) |value| switch (value) {
         .bool => |durable| durable,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -1922,7 +1900,6 @@ fn handleKernelJournalOpen(
     };
     defer opened.checkpoint_meta.free(alloc);
     active.journal = journal;
-    // The host runs the follow-ups the journal held, after any resume.
     const follow_ups = active.journal.?.takeFollowUps();
     defer journal_events.freePendingInputs(state.alloc, follow_ups);
     var response: std.Io.Writer.Allocating = .init(alloc);
@@ -1931,14 +1908,11 @@ fn handleKernelJournalOpen(
         opened.turns,
         if (opened.resumable) "true" else "false",
     });
-    // The open turn stopped at the host's time, not in a crash.
     if (opened.yielded) try response.writer.writeAll(",\"yielded\":true");
     if (!opened.checkpoint_meta.isEmpty()) {
         try response.writer.writeAll(",\"checkpointMeta\":");
         try opened.checkpoint_meta.writeJson(&response.writer);
     }
-    // The host's ids for the open turn and the last one, so a retried prompt
-    // can continue or skip its turn instead of running it twice.
     if (opened.open_turn_id.slice()) |id| {
         try response.writer.writeAll(",\"openTurnId\":");
         try writeJsonStr(id, &response.writer);
@@ -1947,8 +1921,6 @@ fn handleKernelJournalOpen(
         try response.writer.writeAll(",\"lastTurnId\":");
         try writeJsonStr(id, &response.writer);
     }
-    // The calls the open turn left running, which the host may have the
-    // resume run again instead of leaving them to the model.
     const running = active.journal.?.ambiguousCalls();
     if (running.len > 0) {
         try response.writer.writeAll(",\"runningCalls\":[");
@@ -2008,8 +1980,6 @@ fn handleKernelSnapshot(
     const journal = if (active.journal) |*value| value else return state.writer.writeResponse(alloc, msg.id, none);
     const yielded = journal.yieldedQuiet();
     if (!journal.quiet() and !yielded) return state.writer.writeResponse(alloc, msg.id, none);
-    // A session past a snapshot's bounds gets none until compaction brings it
-    // back within them; the host learns why.
     const checkpoint = active.session_rt.agent.checkpoint(alloc, meta) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CheckpointTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, if (active.session_rt.agent.history.items.len > journal_events.max_history_turns) .too_many_turns else .too_large),
@@ -2025,7 +1995,6 @@ fn handleKernelSnapshot(
         error.SnapshotTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, .too_large),
     };
     defer alloc.free(bytes);
-    // A snapshot travels back as one host attachment.
     if (bytes.len > journal_events.max_snapshot_bytes) return writeSnapshotSkipped(state, alloc, msg.id, .too_large);
     const attachment = store.put(bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2133,8 +2102,6 @@ fn handleKernelSteer(
             },
         });
     };
-    // While the model streams a reply, the steer cuts it short, as in the fx
-    // CLI. The turn shows the steer when a boundary places it.
     if (active.steering.claimInterrupt(&active.cancel_flag)) {
         debug_trace.logf("acp", "libfx steer interrupts the streaming reply bytes={d}", .{text.string.len});
     }
@@ -2252,7 +2219,6 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
-            // v2 names a storage fault (D29); v1 keeps the error name.
             .message = if (active.state.sessions_v2 != null)
                 sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
             else
@@ -2482,7 +2448,6 @@ fn parseInitializeRequest(
         }
     }
     if (capabilities.object.get("session")) |session| {
-        // Omitted and null both mean no.
         if (session == .object) if (session.object.get("notices")) |notices| {
             request.client_notices = notices != .null;
         };
@@ -2832,8 +2797,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
-        // MCP-v2 takes only what ACP v1 defines and it speaks: stdio and
-        // HTTP.
         .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm and !mcp_host.selected(),
         .mcp_sse = !mcp_host.selected(),
     });
@@ -2853,8 +2816,6 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
     if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // libfx cores skip the startup catalog resolve; explicit effort and
-        // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
         var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
@@ -2873,8 +2834,6 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
-    // A failed catalog lookup cannot name the supported set; the turn-time
-    // capability check remains the backstop.
     if (state.capability_resolver.state == .failed) return true;
 
     const rejection = effortOverrideRejection(alloc, capabilities, effort, state.selected_model) catch {
@@ -2972,8 +2931,6 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
     if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // Shares the effort override's one-shot catalog resolve: creation is
-        // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
         var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
@@ -2992,8 +2949,6 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
-    // A failed catalog lookup cannot confirm a fast path; the turn-time
-    // capability gate remains the backstop.
     if (state.capability_resolver.state == .failed) return true;
 
     const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
@@ -3124,8 +3079,6 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
-        // A libfx turn keeps its queued steering until it ends, which hands
-        // back what never reached the model.
         if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
     }
     cancelPendingOutbound(state, notify_client);
@@ -3361,7 +3314,6 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     staged_credential.?.gatewayTeam(),
                     staged_credential.?.accountId(),
                 );
-            // Provider selection is independent of earlier prompt cancellation.
             var catalog_cancel_flag = std.atomic.Value(bool).init(false);
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
@@ -3529,7 +3481,6 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     const provider = catalogProviderFor(state, active.provider) orelse return;
     std.debug.assert(state.active_prompt == null);
-    // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
     try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
         .access = if (state.cfg.auth_mode == .host_managed)
@@ -3709,7 +3660,6 @@ fn applyActiveSessionUltrafast(
             });
             return false;
         }
-        // Fast and Ultrafast are exclusive, as in the CLI.
         if (session.fast_mode and !try storeSessionFast(state, alloc, msg, session, false)) return false;
     }
     return storeSessionUltrafast(state, alloc, msg, session, ultrafast);

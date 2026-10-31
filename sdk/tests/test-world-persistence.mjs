@@ -1,13 +1,4 @@
 #!/usr/bin/env node
-// libfx on a real World (@workflow/world-local) through a persistence store
-// written outside libfx (world-persistence.mjs): a session stored in a run,
-// fencing between two processes, a killed process whose session a new one
-// resumes, and checkpoints a load starts from.
-//
-//   node sdk/tests/test-world-persistence.mjs <world-root> [native|wasm]
-//
-// <world-root> holds node_modules/@workflow/world-local, such as sdk/durable
-// after `npm ci --prefix sdk/durable`: the World libfx bundles.
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
@@ -40,8 +31,6 @@ const toolResults = (prompt) => prompt
   .filter((part) => part.type === "tool-result");
 const userTexts = (prompt) => prompt.filter((message) => message.role === "user").map(textOf);
 
-// "send it" asks for one send_email call, then answers. Any other prompt is
-// answered with its own text.
 function framesFor(prompt) {
   const asked = prompt.some((message) => message.role === "user" && textOf(message) === "send it");
   if (asked && toolResults(prompt).length === 0) {
@@ -81,8 +70,6 @@ async function startGateway() {
   return { server, requests, sessionIds, port: server.address().port };
 }
 
-// The app's agent, the same in every process: a store for the session, whose
-// run id is also the session id.
 function defineAgent(port, onSend) {
   const send = {
     description: "Sends an email.",
@@ -114,8 +101,6 @@ const freshWorld = async () => {
   return world;
 };
 
-// The session's events, decoded from the records a load returns. Records are
-// libfx's bytes; only libfx's own tests read them.
 async function storedEvents(world, runId) {
   const { journal } = await worldPersistence(world, { runId }).load();
   return journal.flatMap((record) => JSON.parse(new TextDecoder().decode(record.data)).events);
@@ -128,8 +113,6 @@ async function until(check, message, ms = 5000) {
   }
 }
 
-// world-local's queue teardown calls undici's Agent.close(), which Bun's
-// built-in undici lacks. Only that known failure is skipped, and only on Bun.
 async function closeWorld(world) {
   try {
     await world.close?.();
@@ -144,9 +127,6 @@ async function run(agent, input, options) {
   return turn.result;
 }
 
-// Child: start a session, report its run id, run "send it", and stop inside
-// send_email after its effect, the way a process dies mid-turn. The parent
-// kills it there.
 if (child) {
   const world = createWorld({ dataDir: child.data, recoverActiveRuns: false });
   await world.start?.();
@@ -228,8 +208,6 @@ test("a second process on the session fences the first, and its late write is no
   const store = worldPersistence(world);
   const first = await createAgent(store);
   await run(first, "one");
-  // turn.result does not wait for the turn's last appends, so the takeover
-  // waits for the commit to reach the World.
   await until(async () => (await storedEvents(world, store.runId)).some((event) => event.type === "turn_committed"), "the first turn never committed");
 
   const second = await createAgent(worldPersistence(world, { runId: store.runId }));

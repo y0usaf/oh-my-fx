@@ -1,6 +1,3 @@
-// Sessions kept in Vercel's World, the store and queue behind Vercel
-// Workflow. libfx bundles that World into this module when it is packaged,
-// so an app installs nothing more and ignores any copy it has.
 import { getVercelOidcToken } from "@vercel/oidc";
 import { createWorld } from "@workflow/world-vercel";
 import { world } from "./world.mjs";
@@ -23,14 +20,10 @@ import { world } from "./world.mjs";
 export function vercel({ reserveMs, leaseMs } = {}) {
   return world(() => createWorld(), {
     name: "vercel",
-    // The deployment's own AI Gateway credential, fresh for each request.
     gatewayKey: () => getVercelOidcToken(),
     livenessKnown: false,
     queueLeases: leaseMs === undefined,
-    // A turn the request runs after its response keeps the function alive,
-    // through the request context `@vercel/functions` reads.
     waitUntil: (work) => globalThis[Symbol.for("@vercel/request-context")]?.get?.()?.waitUntil?.(work),
-    // Vercel Queues keeps a message until a delivery acknowledges it.
     queueDurable: true,
     pollMs: 1000,
     reserveMs,

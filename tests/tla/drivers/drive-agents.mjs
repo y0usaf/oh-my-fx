@@ -1,23 +1,3 @@
-// Drives real libfx durable agents along the TLC state graphs of
-// AgentRouting.tla, and checks after every step that the code is where the
-// model allows.
-//
-//   bun tests/tla/drivers/drive-agents.mjs [--walks N] [--depth N] [--seed S]
-//
-// Two processes, p1 and p2, are two worker threads (agent-process.mjs), each
-// with a module instance and a globalThis of its own: p1 has the agents S
-// and C, and p2 only S, all over one world-local directory, each agent on a
-// World of its own, as agents created without a durability have. The
-// queue they share is the driver's: it holds every message until the walk
-// delivers it to a process, to one of its Worlds picked at random, as the
-// graph's Send and Deliver steps say. A prompt's input is stored before it
-// is queued, as on every durability.
-//
-// After each step the driver reads back each session's owner from its log,
-// the turns each agent ran, the names a process had no agent for, and the
-// messages still queued, and moves to the successor with that state. A step
-// with no such successor is a conformance failure. Each walk ends by draining
-// the queue through p1, as the queue's fairness does in the model.
 import { strict as assert } from "node:assert";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -35,7 +15,6 @@ const walks = Number(option("walks", 40));
 const depth = Number(option("depth", 24));
 let seed = Number(option("seed", Date.now() % 100000));
 const firstSeed = seed;
-// A small deterministic generator, so a failing walk can be run again.
 const random = () => {
   seed = (seed * 1103515245 + 12345) % 2147483648;
   return seed / 2147483648;
@@ -46,7 +25,6 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 const graph = await loadGraph(resolve(here, "../sdk/graphs/agents-send.dot"));
 const hosts = { p1: ["S", "C"], p2: ["S"] };
 
-// The queue the processes share: every message, until a step delivers it.
 const held = [];
 const keys = new Map();
 let sentCount = 0;
@@ -59,7 +37,6 @@ function enqueue({ queueName, payload, idempotencyKey }) {
   return { messageId: message.id };
 }
 
-// A process: calls to its worker, which also sends to the queue.
 function startProcess(name) {
   const worker = new Worker(new URL("./agent-process.mjs", import.meta.url), { workerData: { names: hosts[name] } });
   const calls = new Map();
@@ -84,8 +61,6 @@ function startProcess(name) {
 
 const processes = Object.fromEntries(Object.keys(hosts).map((name) => [name, startProcess(name)]));
 
-// The parts of a model state the driver observes, in one canonical form:
-// records by key, and the sets queue, ran and missed in sorted order.
 const canonical = (value) => {
   if (Array.isArray(value)) return `<<${value.map(canonical).join(",")}>>`;
   if (value && typeof value === "object") return `[${Object.keys(value).sort().map((key) => `${key}:${canonical(value[key])}`).join(",")}]`;
@@ -108,7 +83,6 @@ async function openWalk() {
   return { sessions, ran: new Set(), missed: new Set(), sends: 0, close };
 }
 
-// The driver's view of the code, in the model's terms.
 async function observe(walk) {
   const nameOf = new Map(Object.entries(walk.sessions).map(([name, id]) => [id, name]));
   const owners = await processes.p1.call("owners", { sessionIds: Object.values(walk.sessions) });
@@ -118,7 +92,6 @@ async function observe(walk) {
   return { owner, queue, ran, missed: [...walk.missed], sends: walk.sends };
 }
 
-// Performs the step `act` names on the code.
 async function perform(walk, act) {
   if (act.name === "Send") {
     await processes.p1.call("prompt", { agent: act.n, sessionId: walk.sessions[act.s], input: `prompt ${act.id}`, messageId: `m${act.id}` });
@@ -143,7 +116,6 @@ const seenEdges = new Set();
 const outcomes = { send: 0, run: 0, forward: 0, miss: 0 };
 let steps = 0;
 
-// What a step from `from` to `to` did, as the model has it.
 function outcomeOf(from, to) {
   if (to.act.name === "Send") return "send";
   if (to.queue.length === from.queue.length) return set(to.queue) === set(from.queue) ? "miss" : "forward";
@@ -155,7 +127,6 @@ async function walkOnce(number) {
   let at = graph.init;
   const path = [];
   const step = async (choose) => {
-    // A self-loop is a step too: a second miss in p2 leaves the state as is.
     const successors = [...(graph.next.get(at) ?? [])];
     const chosen = choose(successors);
     if (chosen === undefined) return false;
@@ -177,8 +148,6 @@ async function walkOnce(number) {
   };
   try {
     for (let taken = 0; taken < depth; taken += 1) if (!(await step((successors) => (successors.length ? pick(successors) : undefined)))) break;
-    // The queue's fairness: every message reaches a process that has its
-    // agent, so the queue drains.
     for (let left = 32; left > 0 && graph.states.get(at).queue.length > 0; left -= 1) {
       await step((successors) => successors.find((id) => graph.states.get(id).act.name === "Deliver" && graph.states.get(id).act.p === "p1"));
     }

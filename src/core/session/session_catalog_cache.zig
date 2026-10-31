@@ -24,8 +24,6 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-// v6 stores the disposable row payload in a bounded binary encoding. Every
-// older format remains a cache miss and is rebuilt from canonical sessions.
 const magic = "fx-resume-catalog-v6\n";
 const file_name = ".resume-catalog";
 const max_bytes = 64 * 1024 * 1024;
@@ -170,8 +168,6 @@ pub const Loaded = struct {
     }
 
     fn loadChecked(alloc: Allocator, dir: std.Io.Dir, cancelled: ?*const std.atomic.Value(bool)) !Loaded {
-        // Opening a FIFO or device for reading can block, so the helper checks
-        // the entry and opens it without blocking before any read.
         var file = try io_mod.openExistingRegularFile(dir, file_name, .read_only);
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
@@ -447,11 +443,6 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     var digest = Sha256.init(.{});
     addStat(&digest, before);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    // Classification observes each of these files, and its result depends on
-    // whether each is present: a legacy session carries no event log, and a
-    // schema_v3 session whose manifest is lost is listed from its log. Their
-    // presence, absence, or replacement must invalidate a cached row, so bind
-    // them into the digest.
     for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "display.json" }) |name| {
         const path = try std.mem.print(&path_buffer, "{s}/{s}", .{ id, name });
         if (try statOptional(dir, path)) |stat| {
@@ -585,8 +576,6 @@ const CatalogWorker = struct {
             var candidate = self.read.store.readOnlyCandidate(self.alloc, id, self.read.cancelled) catch |err| switch (err) {
                 error.OutOfMemory, error.Cancelled => return err,
                 else => fallback: {
-                    // A legacy upgrade interrupted mid-rename stays listed from
-                    // its stable snapshot, so resuming it can run recovery.
                     if (self.read.store.readOnlyFencedLegacyCandidate(self.alloc, id, self.read.cancelled)) |value| {
                         fenced = true;
                         break :fallback value;
@@ -606,20 +595,9 @@ const CatalogWorker = struct {
             const is_active = if (self.read.active_id) |active| std.mem.eql(u8, id, active) else false;
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
-            // The fingerprint binds every classification input, so each settled
-            // row is cacheable, a replayed schema_v3 projection included: the
-            // commit watermark and checkpoint the replay also reads are
-            // replaced by rename, which changes the session directory stat the
-            // fingerprint binds. A row read around an interrupted upgrade
-            // describes a transition, and a failed replay can be transient,
-            // so neither is ever reused. Empty sessions stay listed; the
-            // picker alone hides rows without resumable content.
             var cacheable = !fenced and candidate.projection_state != .stale;
             const managed = child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                // An unverifiable marker or first event stays listed, as
-                // `fx sessions` always did; exact resume still refuses a real
-                // child. The row is not cached, so the check runs again.
                 else => blk: {
                     cacheable = false;
                     break :blk false;
@@ -665,7 +643,6 @@ pub fn listActionableCatalog(
     defer cached.deinit(std.heap.c_allocator);
     var read = CatalogRead{ .store = store, .candidates = store.readOnlyCandidates(), .active_id = active_id, .cancelled = stop_requested, .cache = &cached };
     read.changed.store(!cached.present(), .monotonic);
-    // Worker storage is independent of the caller's allocator and ends after the merge.
     const worker_alloc = std.heap.c_allocator;
     var workers: [4]CatalogWorker = undefined;
     for (&workers) |*worker| worker.* = .{ .read = &read, .alloc = worker_alloc };
@@ -783,8 +760,6 @@ test "actionable catalog preserves discovery and child visibility" {
     var stopped = std.atomic.Value(bool).init(false);
     var catalog = try listActionableCatalog(store, alloc, null, &stopped, null);
     defer catalog.deinit(alloc);
-    // Children stay private; an empty session is listed, and only the picker
-    // hides rows without resumable content.
     try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
     for (catalog.summaries.items) |summary| {
         try std.testing.expect(std.mem.eql(u8, summary.id, "public") or std.mem.eql(u8, summary.id, "empty"));
@@ -882,7 +857,6 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    // Oldest persisted format: a schema v2 snapshot with no event log.
     const manifest = try alloc.print("{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
     defer alloc.free(manifest);
     var file = try tmp.dir.createFile(std.testing.io, "home/.fx/sessions/legacy-old/session.json", .{});
@@ -896,8 +870,6 @@ test "actionable catalog lists and caches legacy sessions without event logs" {
     var stopped = std.atomic.Value(bool).init(false);
     var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer catalog.deinit(alloc);
-    // Legacy sessions stay resumable, so every listing shows them, and the row
-    // lands in the cache so later scans reuse it instead of reparsing.
     try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
     try std.testing.expectEqualStrings("legacy-old", catalog.summaries.items[0].id);
     var saved = try Loaded.load(alloc, writer.dir, null);
@@ -916,8 +888,6 @@ test "a summary outside the row contract stays listed without disabling the inde
     try tmp.dir.createDirPath(std.testing.io, "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    // A legacy snapshot whose clock stepped back records an update before its
-    // creation, which the index row contract rejects.
     const Snapshot = struct { id: []const u8, created_at_ms: i64, updated_at_ms: i64 };
     for ([_]Snapshot{
         .{ .id = "legacy-ok", .created_at_ms = 1, .updated_at_ms = 2 },
@@ -950,7 +920,6 @@ test "a summary outside the row contract stays listed without disabling the inde
         try std.testing.expect(saved.contains("legacy-ok"));
         try std.testing.expect(!saved.contains("clock-skewed"));
     }
-    // The next listing reuses the saved row and leaves the index untouched.
     const index_path = "home/.fx/sessions/.resume-catalog";
     const before = try tmp.dir.statFile(std.testing.io, index_path, .{});
     var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
@@ -983,8 +952,6 @@ test "actionable catalog lists an interrupted legacy upgrade without caching it"
     var stopped = std.atomic.Value(bool).init(false);
     var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer catalog.deinit(alloc);
-    // The stable snapshot keeps the session listed so resuming it can finish
-    // the upgrade, but the row describes a transition and is never reused.
     try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
     try std.testing.expectEqualStrings("fenced", catalog.summaries.items[0].id);
     var saved = try Loaded.load(alloc, writer.dir, null);
@@ -1026,8 +993,6 @@ test "actionable catalog lists an unverifiable child marker without caching it" 
     var stopped = std.atomic.Value(bool).init(false);
     var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
     defer catalog.deinit(alloc);
-    // A damaged marker cannot prove the session is a child, so it stays
-    // listed; the row is not cached so the next listing checks it again.
     try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
     try std.testing.expectEqualStrings("unverified", catalog.summaries.items[0].id);
     var saved = try Loaded.load(alloc, writer.dir, null);
@@ -1050,7 +1015,6 @@ test "catalog cache ignores a FIFO without blocking" {
     if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
-    // Reading a FIFO waits for a writer that never comes; the index is ignored.
     var loaded = try Loaded.load(alloc, dir, null);
     defer loaded.deinit(alloc);
     try std.testing.expect(!loaded.present());
@@ -1133,8 +1097,6 @@ test "catalog older versions cancellation and bounds are misses" {
     try std.testing.expectEqual(@as(usize, 1), retained.count());
     var file = try writer.dir.dir.openFile(std.testing.io, file_name, .{ .mode = .read_write });
     defer file.close(std.testing.io);
-    // Every earlier format, including v4 files that still carry legacy
-    // ranking rows, is ignored and rebuilt rather than partially trusted.
     for ([_][]const u8{ "1", "2", "3", "4", "5" }) |version| {
         try file.writePositionalAll(std.testing.io, version, "fx-resume-catalog-v".len);
         var old_version = try Loaded.load(alloc, writer.dir, null);
@@ -1176,10 +1138,8 @@ test "catalog fingerprint binds authority fence display sidecar and missing even
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{}\n");
     }
-    // Legacy sessions carry no event log; the fingerprint must still exist.
     const legacy = (try fingerprint(tmp.dir, "session")).?;
     try std.testing.expectEqual(legacy, (try fingerprint(tmp.dir, "session")).?);
-    // A later appearance of events.jsonl invalidates the legacy observation.
     {
         var file = try tmp.dir.createFile(std.testing.io, "session/events.jsonl", .{});
         defer file.close(std.testing.io);
@@ -1187,9 +1147,6 @@ test "catalog fingerprint binds authority fence display sidecar and missing even
     }
     const with_events = (try fingerprint(tmp.dir, "session")).?;
     try std.testing.expect(!std.mem.eql(u8, &legacy, &with_events));
-    // Adding or removing the authority marker, fence, or display sidecar must
-    // invalidate the observation even when session.json and events.jsonl are
-    // untouched.
     for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
         const path = try std.testing.allocator.print("session/{s}", .{name});
         defer std.testing.allocator.free(path);

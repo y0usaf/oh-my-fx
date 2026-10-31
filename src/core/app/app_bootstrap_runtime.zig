@@ -267,7 +267,6 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Runtime(App).enableSessionStores(app);
         }
 
-        // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
             const summary = try app.alloc.print("{s} (ctrl+o to view)", .{summary_lead});
             defer app.alloc.free(summary);
@@ -282,7 +281,6 @@ pub fn Runtime(comptime App: type) type {
         fn beginStartupSkillsLoad(app: *App) !bool {
             if (comptime host_target.is_wasm or !@hasDecl(App, "requestSkillsRefresh")) return false;
             const dir = (try app_runtime_setup.resolveManagedSkillsDir(std.heap.c_allocator)) orelse return false;
-            // An empty catalog records the managed directory the refresh scans.
             app.skills.replaceLoaded(std.heap.c_allocator, dir, &.{}, &.{}) catch |err| {
                 std.heap.c_allocator.free(dir);
                 return err;
@@ -343,8 +341,6 @@ pub fn Runtime(comptime App: type) type {
         /// not replay it, matching other full-only startup detail.
         fn writeSessionAssemblyNotice(app: *App, provider_label: []const u8) !void {
             var mcp_servers: std.ArrayList(SessionAssemblyMcpServer) = .empty;
-            // Names are duped: the health snapshot is released with its lease
-            // at the end of the acquire block, before the body is rendered.
             defer {
                 for (mcp_servers.items) |server| app.alloc.free(server.name);
                 mcp_servers.deinit(app.alloc);
@@ -459,10 +455,6 @@ pub fn Runtime(comptime App: type) type {
                 startup.credential_load_failure,
                 startup.credential_onboarding_skipped,
             );
-            // A deferred credential runs the inventory and onboarding steps
-            // when it arrives, so the first frame does not wait for them. An
-            // active credential needs no onboarding, so a fresh launch probes
-            // the other sources after its first frame.
             const can_defer_inventory = comptime @hasDecl(@TypeOf(app.auth), "deferStartupSourceInventory");
             const inventory_deferred = can_defer_inventory and
                 !credential_deferred and
@@ -487,7 +479,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
-                // Own theme protocol bytes even under FX_THEME; probing stays gated.
                 app.terminal_input_runtime.terminal_theme_monitor.start();
                 if (startup.theme_monitor_enabled) {
                     app.terminal.enableThemeNotifications() catch |err| {
@@ -520,8 +511,6 @@ pub fn Runtime(comptime App: type) type {
                 try provider_runtime.replaceModel(app, selected_model);
             }
             const active_model = provider_runtime.model(app);
-            // Per-launch --effort/--fast flags shape runtime state only; the
-            // configured and stored preferences keep their pre-flag values.
             const persisted_effort = startup.effort;
             const persisted_fast_mode = startup.fast_mode;
             const persisted_ultrafast_mode = startup.configured_ultrafast_mode;
@@ -554,7 +543,6 @@ pub fn Runtime(comptime App: type) type {
             app.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             app.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
             app.worker.agent_turn_settings.effort = startup.effort;
-            // Worker-owned memory uses the C allocator, matching worker deinit.
             try app.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
@@ -636,11 +624,8 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
                     try app.presentProjectMcpPrompt();
                 }
-                // Fresh sessions only: on resume the transcript must stay
-                // empty until the deferred session load replays history.
                 try writeSessionAssemblyNotice(app, startup.provider.label());
             }
-            // A deferred catalog reports its discovery issues when it lands.
             if (!skills_deferred) try writeSkillDiagnosticsNotice(app);
             if (comptime @hasField(App, "auth")) {
                 if (!credential_deferred) {
@@ -1163,15 +1148,12 @@ test "app_bootstrap_runtime applies interactive launch flag overrides" {
     try std.testing.expect(app.fast_mode);
     try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
     try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("low")));
-    // Stored preferences keep the configured values; the flags stay per-launch.
     try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expect(!capture.configured_fast_mode);
-    // --fast binds to the launch model so the footer indicator reflects it.
     try std.testing.expect(capture.configured_fast_mode_model_bound);
     try std.testing.expect(capture.configured_ultrafast_mode);
     try std.testing.expectEqual(@as(?bool, false), capture.ultrafast_process_override);
     try std.testing.expectEqualStrings("configured-model", capture.configuredModel());
-    // The process overrides carry the flag values so a resume re-applies them.
     try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
     try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
     try std.testing.expectEqual(@as(?model_provider.ProviderId, null), capture.provider_process_override);
@@ -1484,7 +1466,6 @@ test "app_bootstrap_runtime records a full-only session assembly record" {
 
     try runBootstrapForTest(&app, &capture);
 
-    // The record lives in the full-detail side list, not the transcript.
     try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
     try std.testing.expectEqual(@as(usize, 1), app.shell.full_detail_records.items.len);
     const record = app.shell.full_detail_records.items[0].notice;

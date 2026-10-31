@@ -2847,16 +2847,12 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
-    // The older turn exceeds the model's normal 16k input allowance: one
-    // summary request, then the continued turn.
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, old_marker);
     try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
     try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
     try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":16000");
     try expectBodyContains(&gateway, 1, "compacted_conversation");
-    // The user message and final reply stay exact; the work in between is
-    // summarized.
     try expectBodyContains(&gateway, 1, "User 1:\\nOLD_USER_REQUEST_KEPT_EXACTLY");
     try expectBodyContains(&gateway, 1, "Assistant 1, in between:\\nThe earlier assistant work is summarized.");
     try expectBodyContains(&gateway, 1, "Assistant 1, final reply:\\nOLD_FINAL_REPLY_KEPT_EXACTLY");
@@ -2979,7 +2975,6 @@ test "compaction writes the summary with the least reasoning each model accepts"
         .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent answer") } },
     };
     const effort = types.ReasoningEffort.literal;
-    // This model cannot turn reasoning off, so low is the least it takes.
     const primary_efforts = [_]types.ReasoningEffort{ effort("low"), effort("medium"), effort("high"), effort("xhigh"), effort("max") };
     const fallback_efforts = [_]types.ReasoningEffort{ effort("none"), effort("low"), effort("high"), effort("xhigh") };
     const model = "anthropic/claude-opus-5.5";
@@ -2987,7 +2982,6 @@ test "compaction writes the summary with the least reasoning each model accepts"
         .{ .model = model, .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000, .reasoning_efforts = .fromSlice(&primary_efforts) } },
         .{ .model = "openai/gpt-6-sol", .capabilities = .{ .context_window = 400_000, .max_output_tokens = 16_000, .reasoning_efforts = .fromSlice(&fallback_efforts) } },
     };
-    // The conversation's model fails the summary, so the fallback writes it.
     const completions = [_]FakeCompletion{
         .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"summary rejected\"}}" },
         .{ .content = "The earlier assistant work is summarized." },
@@ -3002,7 +2996,6 @@ test "compaction writes the summary with the least reasoning each model accepts"
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.effort = effort("xhigh");
-    // Strict routing is the user's choice, so the fallback keeps it too.
     const only_bedrock = [_][]const u8{"bedrock"};
     config.provider_order = &only_bedrock;
     config.provider_strict = true;
@@ -3020,7 +3013,6 @@ test "compaction writes the summary with the least reasoning each model accepts"
     try std.testing.expectEqualStrings("openai/gpt-6-sol", gateway.request_models.items[1]);
     try expectBodyContains(&gateway, 1, "\"reasoning\":\"none\"");
     try expectBodyContains(&gateway, 1, "\"only\":[\"bedrock\"]");
-    // The conversation itself keeps its own effort.
     try std.testing.expectEqualStrings(model, gateway.request_models.items[2]);
     try expectBodyContains(&gateway, 2, "\"reasoning\":\"xhigh\"");
     try std.testing.expectEqualStrings("Done", hooks.finish_assistant_text.?);
@@ -3207,7 +3199,6 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
     const steering = [_][]const u8{"STEER_DURING_COMPACT_SENTINEL"};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.available_capability_overrides = &available_overrides;
-    // Step-top boundary is take 1; the post-compaction boundary is take 2.
     hooks.steering_messages = &steering;
     hooks.steering_take_at = 2;
     defer hooks.deinit();
@@ -3261,8 +3252,6 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectNotesAfterConversation(&gateway, 0, 1);
-    // The first post-compaction request already carries the steering guidance.
-    // (Before the boundary fix it only appeared in the reply after it.)
     try expectBodyContainsInOrder(&gateway, 1, &.{ "compacted_conversation", "user_steering", "STEER_DURING_COMPACT_SENTINEL" });
     try expectBodyContains(&gateway, 2, "COMPACT_STEER_RESULT");
     try std.testing.expectEqualStrings("Steered answer after compaction.", hooks.finish_assistant_text.?);
@@ -3313,8 +3302,6 @@ fn compactBehindSystemPrompt(comptime system_bytes: usize) !usize {
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "OLD_BUDGET_FACT");
-    // The newest turn stays as it is, so it is never listed for notes. It is
-    // in the request only when the notes follow the conversation itself.
     try expectBodyContains(&gateway, 0, "\\nTurn 1 (");
     try expectBodyNotContains(&gateway, 0, "\\nTurn 3 (");
     if (std.mem.find(u8, gateway.request_bodies.items[0], "of the conversation above") == null) try expectBodyNotContains(&gateway, 0, "RECENT_BUDGET_FACT");
@@ -3330,8 +3317,6 @@ test "automatic compaction keeps the newest turns unchanged" {
 }
 
 test "a large fixed part of the request leaves less room for the kept turns" {
-    // The system prompt alone fills most of the room after compaction, so
-    // only the newest turn stays.
     try std.testing.expectEqual(@as(usize, 2), try compactBehindSystemPrompt(104_000));
 }
 
@@ -3427,7 +3412,6 @@ test "processQueuedPrompt compacts and retries one context overflow" {
     const overflow_bodies = [_][]const u8{
         \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
         ,
-        // Anthropic's rejection, as the gateway returns it.
         \\{"error":{"message":"prompt is too long: 1077372 tokens > 1000000 maximum","type":"AI_APICallError"}}
         ,
     };
@@ -3469,8 +3453,6 @@ test "processQueuedPrompt compacts and retries one context overflow" {
         try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
         try expectBodyContains(&gateway, 1, "\"tools\":[]");
         try expectBodyContains(&gateway, 2, "compacted_conversation");
-        // The retry drops the tool output and keeps the prior turn's exact
-        // messages.
         try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_TOOL_OUTPUT");
         try expectBodyContains(&gateway, 2, "User 1:\\nCONTEXT_OVERFLOW_PRIOR_USER");
         try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
@@ -3507,7 +3489,6 @@ test "processQueuedPrompt stops after one context overflow recovery" {
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(model);
-    // A tool call leaves work to summarize, so recovery asks the model.
     var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
     var prior_results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("prior-read"),
@@ -3572,7 +3553,6 @@ test "image context overflow keeps one recovery and preserves the current image"
         job.model = @constCast("fixture/image");
         job.images = &images;
         job.authorized_image_catalog = &images;
-        // A tool call leaves work to summarize, so recovery asks the model.
         var prior_calls = [_]ToolCall{toolCall("prior-read", "read_file", "{\"path\":\"notes.md\"}")};
         var prior_results = [_]types.PersistedToolResult{.{
             .tool_call_id = @constCast("prior-read"),
@@ -3613,8 +3593,6 @@ test "retained tool images stay out of the measured text estimate" {
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
 
-    // A valid image with a large encoded payload makes the text-vs-image
-    // pricing gap unambiguous.
     const image_len = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
     const original = try alloc.alloc(u8, image_len);
     defer alloc.free(original);
@@ -3655,7 +3633,6 @@ test "retained tool images stay out of the measured text estimate" {
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     const body = gateway.request_bodies.items[1];
-    // Sanity: the real serializer really embedded the payload.
     try std.testing.expect(std.mem.find(u8, body, payload[0..64]) != null);
 
     const measurement_request = agent_stream_provider.RequestData{
@@ -3670,12 +3647,8 @@ test "retained tool images stay out of the measured text estimate" {
     var raw_estimator = token_estimate.StreamingEstimator{};
     raw_estimator.consume(body);
     const raw_text_tokens: usize = @intCast(@min(raw_estimator.estimate(), std.math.maxInt(usize)));
-    // The payload dominates the body, so the image-aware estimate is a small
-    // fraction of the raw text estimate.
     try std.testing.expect(measured.estimated_input_tokens * 4 < raw_text_tokens);
 
-    // Without the tool-image signal the same body is priced as pure text: the
-    // phantom estimate that drove premature compaction.
     const blind_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
     const blind = try prompt_context.measureProviderRequest(alloc, body, blind_request);
     try std.testing.expectEqual(raw_text_tokens, blind.estimated_input_tokens);
@@ -3812,7 +3785,6 @@ test "retained context automatic compaction archives oversized parallel results 
     const measurement_request = agent_stream_provider.RequestData{ .model = model, .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
     try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[0], measurement_request)).estimated_input_tokens < context_window * 4 / 5);
     const continued_tokens = (try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[2], measurement_request)).estimated_input_tokens;
-    // An oversized newest exchange is compacted too; its results stay saved unchanged.
     try std.testing.expect(continued_tokens < context_window / 4);
     try expectBodyContains(&gateway, 1, "OLDER_HISTORY_SENTINEL");
     try expectBodyContains(&gateway, 1, "RECENT_EXACT_A");
@@ -3926,8 +3898,6 @@ test "compaction summarizes an oversized only recent exchange without repeating 
     try expectBodyContains(&gateway, 2, "RECENT_ONLY");
     try expectBodyNotContains(&gateway, 2, text_utils.repeat("r", 10_000));
     try expectBodyContains(&gateway, 2, "compacted_conversation");
-    // The current request stays as the live user message and is not copied
-    // into the compacted user messages as well.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[2], "user prompt"));
     try expectBodyNotContains(&gateway, 2, "User 1:");
     try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
@@ -4115,7 +4085,6 @@ test "compaction summarizes a truncated result that has no saved copy" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    // The summarizer reads the result exactly as the model saw it.
     try expectBodyContains(&gateway, 1, "ineligible result");
     try expectBodyContains(&gateway, 1, "The tool calls will not be available later");
     try expectBodyContains(&gateway, 2, "compacted_conversation");
@@ -4208,8 +4177,6 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
 
-    // A reachable catalog that simply lacks fast metadata stays quiet; the
-    // notice is reserved for a catalog that failed outright.
     var fast_notice_count: usize = 0;
     for (hooks.texts.items) |text| {
         if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
@@ -6035,8 +6002,6 @@ test "processQueuedPrompt pauses uncertain tool recovery with an inspection acti
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 1;
-    // The provider-attempt budget no longer pauses; a lifecycle pause (the
-    // user's try-later) parks the recovery retry instead.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.recovery_pause_flag = &pause_flag;
@@ -6143,8 +6108,6 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Provider unavailable · provider_error: route failed once · retrying request");
     try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s");
-    // The in-flight republication mirrors the wait row's delay segment so the
-    // status row never changes shape mid-cycle.
     try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s");
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3");
 }
@@ -6173,15 +6136,10 @@ test "processQueuedPrompt probes gateway stream timeout without consuming the at
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    // A gateway stream timeout is never terminal on its own and never stalls:
-    // the turn probes the connection immediately without consuming the
-    // provider-attempt budget, then recovers on the first healthy response.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqualStrings("Recovered after probe", hooks.history_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
-    // Probes are paced (250ms, then 1s) so a provider that always times out
-    // cannot hot-loop; the pacing still never consumes the attempt budget.
     try expectRouteStatus(
         &hooks,
         0,
@@ -6194,7 +6152,6 @@ test "processQueuedPrompt probes gateway stream timeout without consuming the at
         .auto_retry,
         "⚠ Gateway stream timed out · checking the connection · 1s",
     );
-    // Both probes transmitted nothing billable, so the success is attempt 1.
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 1");
 }
 
@@ -6251,8 +6208,6 @@ test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    // The detail must stay masked in every published status, including the
-    // terminal stall stop after three identical failures.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     for (hooks.route_recovery_statuses.items) |status| {
         var buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
@@ -6290,8 +6245,6 @@ fn expect_rejected_replacement_retains_preview(cancel_after_replacement: bool) !
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
-    // Without cancellation, a lifecycle pause (the user's try-later) parks the
-    // recovery after the rejected replacement; the budget no longer pauses.
     var pause_flag = std.atomic.Value(bool).init(false);
     if (!cancel_after_replacement) {
         hooks.pause_on_auto_retry_status = true;
@@ -6398,9 +6351,6 @@ test "processQueuedPrompt cancellation during recovery clears the durable checkp
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    // The cancel lands during the episode's first retry wait, before any
-    // recovery strategy is assigned: the checkpoint must still die with the
-    // turn or the next resume would revive a turn the user stopped.
     try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
@@ -6990,8 +6940,6 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
-    // HTTP status failures retry patiently forever now; park the turn with a
-    // lifecycle pause (the user's try-later) after the second failure.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.pause_on_auto_retry_attempt = 2;
@@ -7011,8 +6959,6 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expect(!checkpoint.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.tool_steps.len);
     try std.testing.expectEqual(types.ModelRecoveryCause.provider_unavailable, checkpoint.cause);
-    // Each failure status is published once at failure and republished when the
-    // next attempt is admitted, so the pause status lands at index 3.
     try expectRouteStatus(&hooks, 3, .terminal_provider_error, "⚠ Provider unavailable · HTTP 502: gateway unavailable · recovery paused after 2 attempts");
 
     var continued_checkpoint = try checkpoint.dupe(alloc);
@@ -7053,8 +6999,6 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh attemp
     var fixture = PromptFixture{};
     var first_config = fixture.config();
     first_config.max_provider_attempts = 1;
-    // Park the interrupted first turn with a lifecycle pause (the user's
-    // try-later); the provider-attempt budget no longer pauses on its own.
     var pause_flag = std.atomic.Value(bool).init(false);
     first_hooks.pause_on_auto_retry_status = true;
     first_hooks.recovery_pause_flag = &pause_flag;
@@ -7189,8 +7133,6 @@ test "processQueuedPrompt keeps the settled checkpoint when recovery pauses" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 1;
-    // The pause now comes from the lifecycle pause flag (the user's try-later)
-    // raised when the retry is scheduled, not from budget exhaustion.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.recovery_pause_flag = &pause_flag;
@@ -7345,8 +7287,6 @@ test "processQueuedPrompt stops replay-safe ReadFailed when identical failures s
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
-    // Each retry publishes its status at failure and republishes it when the
-    // next attempt is admitted; the stall stop ends the sequence.
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
     try expectRouteStatus(&hooks, 1, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
@@ -7370,9 +7310,6 @@ test "processQueuedPrompt stall stop terminates the durable checkpoint" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    // A turn the UI calls stopped is stopped on disk too: without the clear,
-    // a later resume resurrects it and re-spends attempts (and the restored
-    // composer prompt is gone by then).
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
@@ -7396,8 +7333,6 @@ test "processQueuedPrompt replaces retry status after a different stream error" 
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    // The budget no longer stops the turn; the no-progress detector does after
-    // three identical zero-progress failures.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
     try expectRouteStatus(&hooks, 0, .auto_retry, "⚠ Network interrupted · connection dropped · retrying request");
@@ -7510,8 +7445,6 @@ test "processQueuedPrompt retries ReadFailed after assistant source until the st
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    // No budget exhaustion stop: the turn restarts the interrupted response
-    // until three identical failures trip the no-progress detector.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
@@ -7617,8 +7550,6 @@ test "processQueuedPrompt settles retry tool starts before pausing" {
     var config = fixture.config();
     config.gateway_retry_count = 1;
     config.max_provider_attempts = 2;
-    // Park the turn with a lifecycle pause after the second identical failure;
-    // the budget no longer pauses on its own.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.pause_on_auto_retry_attempt = 2;
@@ -7738,8 +7669,6 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    // The unexecuted tool stays unexecuted while the turn retries; three
-    // identical zero-progress failures then stop it via the stall detector.
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 5), hooks.route_recovery_statuses.items.len);
@@ -7771,8 +7700,6 @@ test "processQueuedPrompt settles an interrupted local tool after an HTTP failur
     var config = fixture.config();
     config.gateway_retry_count = 3;
     config.max_provider_attempts = 2;
-    // HTTP status failures retry patiently forever now; park the turn with a
-    // lifecycle pause (the user's try-later) after the HTTP failure.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.pause_on_auto_retry_attempt = 2;
@@ -8064,8 +7991,6 @@ test "processQueuedPrompt keeps retrying past the old budget without invoking ro
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.route_recovery_decisions = &decisions;
     var fixture = PromptFixture{};
-    // Status-class failures retry patiently forever now; cancel is the user's
-    // brake. Cancel when the second attempt's retry status publishes.
     hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
     hooks.cancel_on_auto_retry_attempt = 2;
     defer hooks.deinit();

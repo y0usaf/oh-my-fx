@@ -1,7 +1,3 @@
-// Bridge self-test. Real Zig traces from labs/trace_demo.zig plus hand-written
-// controls, all checked by real TLC against tests/tla/mcp/selftest/Selftest.tla.
-//
-//   bun test ./tests/tla/drivers/mcp/bridge.test.ts
 
 import { beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";

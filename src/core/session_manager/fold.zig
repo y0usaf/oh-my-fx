@@ -209,9 +209,6 @@ fn dupeOptional(gpa: std.mem.Allocator, value: ?[]const u8) error{OutOfMemory}!?
     return if (value) |v| try gpa.dupe(u8, v) else null;
 }
 
-// ---------------------------------------------------------------------------
-// Folding written lines
-
 pub const Line = struct {
     seq: u64,
     /// Byte offset of the line in the log.
@@ -254,9 +251,6 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
     state.last_seq = line.seq;
     state.clean_exit = line.body == .closed;
 }
-
-// ---------------------------------------------------------------------------
-// Planning a batch: the turn and child rules
 
 /// What a caller asks the manager to append. The manager stamps turn
 /// numbers; hosts never choose them.
@@ -314,8 +308,6 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 break :blk .{ .turn_interrupted = .{ .turn = turn, .reason = reason } };
             },
             .set => |s| .{ .set = s },
-            // One unfinished work item per child (`tests/tla/session_manager/Subagents.tla`
-            // OneOpenWork); a finish names exactly that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
                 break :blk .{ .child_spawned = c };
@@ -345,9 +337,6 @@ fn openWorkAt(state: *const State, earlier: []const Event, child: []const u8) ?[
     return open;
 }
 
-// ---------------------------------------------------------------------------
-// Snapshots
-
 /// Appends the state as one JSON object (without `last_seq` and
 /// `clean_exit`, which the snapshot line's own position gives).
 pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *const State) error{OutOfMemory}!void {
@@ -359,8 +348,6 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
     if (state.last_interrupted) |i| {
         try out.print(gpa, "{{\"turn\":{d},\"reason\":\"{s}\"}}", .{ i.turn, @tagName(i.reason) });
     } else try out.appendSlice(gpa, "null");
-    // Raw values are written only when present, so a value that is the
-    // JSON `null` stays distinct from no value.
     inline for (setting_fields) |name| {
         if (@field(state, name)) |value| try appendRawField(gpa, out, name, value);
     }
@@ -432,9 +419,6 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
     }
     return state;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
 
 const testing = std.testing;
 
@@ -516,7 +500,7 @@ fn specValid(open: bool, event: Event) ?bool {
         .turn_started => !open,
         .item, .turn_committed, .turn_interrupted => open,
         .compacted, .set => true,
-        .child_spawned, .child_finished => null, // not in TurnLifecycle
+        .child_spawned, .child_finished => null,
     };
 }
 
@@ -537,7 +521,6 @@ test "plan accepts exactly the transitions TurnLifecycle allows" {
             try apply(testing.allocator, &state, 0, .{ .seq = step + 1, .offset = 0, .body = out[0] });
             try kinds.append(testing.allocator, std.meta.activeTag(out[0]));
         }
-        // AtMostOneOpenTurn, ItemsInsideTurns, EndsCloseATurn over the written kinds.
         var open = false;
         for (kinds.items) |kind| switch (kind) {
             .turn_started => {
@@ -581,7 +564,6 @@ test "child work is finished once, and only after its spawn" {
     try testing.expectError(error.InvalidTransition, plan(&state, &.{ finish, finish }, &two));
     try plan(&state, &.{finish}, &one);
     try apply(testing.allocator, &state, 0, .{ .seq = 2, .offset = 0, .body = one[0] });
-    // The child stays listed with its outcome; its work is no longer open.
     try testing.expectEqual(@as(usize, 1), state.children.items.len);
     try testing.expect(!state.children.items[0].open);
     try testing.expectEqual(@as(?schema.Outcome, .ok), state.children.items[0].outcome);
@@ -602,7 +584,6 @@ test "a child has one unfinished work item, and keeps its newest work, outcome a
         seq += 1;
         try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
     }
-    // A second spawn, or a finish of other work, is refused while w2 is open.
     try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .child_spawned = .{ .child = "c", .work_id = "w3" } }}, &one));
     try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .child_finished = .{ .child = "c", .work_id = "w1", .outcome = .ok } }}, &one));
     const child = state.children.items[0];
@@ -613,7 +594,6 @@ test "a child has one unfinished work item, and keeps its newest work, outcome a
     try testing.expectEqual(@as(?[]u8, null), child.spawn_data);
     try testing.expectEqualStrings("{\"error\":\"e\"}", child.finish_data.?);
     try testing.expectEqual(@as(u64, 3), child.seq);
-    // The parent cancels it.
     try plan(&state, &.{.{ .child_finished = .{ .child = "c", .work_id = "w2", .outcome = .cancelled } }}, &one);
     try apply(testing.allocator, &state, 0, .{ .seq = 4, .offset = 0, .body = one[0] });
     try testing.expectEqual(@as(?schema.Outcome, .cancelled), state.children.items[0].outcome);
@@ -641,7 +621,6 @@ test "resume from the newest snapshot equals a full fold, and snapshots are igno
         const length = random.uintLessThan(usize, 50);
         for (0..length) |_| {
             if (random.uintLessThan(u8, 6) == 0) {
-                // The manager writes a snapshot of the state folded so far.
                 var encoded: std.ArrayList(u8) = .empty;
                 try encodeState(m.arena.allocator(), &encoded, &state);
                 const body: schema.Body = .{ .snapshot = .{ .covers_seq = state.last_seq, .state = encoded.items, .compaction_offset = state.compaction_offset } };
@@ -661,10 +640,10 @@ test "resume from the newest snapshot equals a full fold, and snapshots are igno
         var stripped = try m.fullFold(true);
         defer stripped.deinit(testing.allocator);
         try testing.expect(full.eql(&state));
-        try testing.expect(resumed.eql(&full)); // ResumeEqualsFullReplay
-        stripped.last_seq = full.last_seq; // stripping renumbers nothing but removes lines
+        try testing.expect(resumed.eql(&full));
+        stripped.last_seq = full.last_seq;
         stripped.clean_exit = full.clean_exit;
-        try testing.expect(stripped.eql(&full)); // SnapshotsAreIgnorable
+        try testing.expect(stripped.eql(&full));
     }
 }
 
@@ -675,7 +654,6 @@ test "snapshot state round trips" {
     defer state.deinit(testing.allocator);
     state.title = try testing.allocator.dupe(u8, "\"a \\\"title\\\"\"");
     state.language = try testing.allocator.dupe(u8, "\"und-Latn\"");
-    // The JSON `null` as a value is kept apart from no value.
     state.usage = try testing.allocator.dupe(u8, "null");
     try state.children.append(testing.allocator, .{
         .id = try testing.allocator.dupe(u8, "c\"1"),

@@ -1,22 +1,4 @@
 #!/usr/bin/env bash
-# Decide whether a change needs the macOS arm64 checks.
-#
-# Usage: detect-macos-need.sh <base-revision> <head-revision>
-#
-# macOS runs only when a change touches behavior that can differ on macOS: a
-# Zig file with a macOS, BSD, or Linux code path before or after the change,
-# build.zig, the macOS signing script, the native SDK addon, an E2E file listed
-# in tests/e2e/macos-platform-tests.json, a shared E2E helper that reads the
-# platform before or after the change, or the macOS checks themselves. A Linux
-# branch counts because macOS takes its other path. A Windows-only branch does
-# not, because macOS and Linux share its other path. Set MACOS_REQUESTED to a
-# reason to force the checks, and SDK_NATIVE_REQUESTED=true to force the native
-# SDK addon check.
-#
-# Writes needed=true|false and sdk_native=true|false to $GITHUB_OUTPUT and the
-# reasons to $GITHUB_STEP_SUMMARY when those files are set. Exits non-zero when
-# either revision cannot be read, so the macOS check fails instead of passing
-# without having looked at the change.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -42,7 +24,6 @@ require_sdk_native() {
   require "$1"
 }
 
-# Matches either side of the change, so removing a platform branch counts too.
 has_platform_code() {
   local content
   content="$({ git show "$head:$1" 2>/dev/null; git show "$base:$1" 2>/dev/null; } || true)"

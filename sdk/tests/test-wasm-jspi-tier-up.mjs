@@ -2,15 +2,6 @@
 import { strict as assert } from "node:assert";
 import { setImmediate } from "node:timers";
 
-// A hot Wasm loop must survive resumption across host tasks during JIT tier-up.
-// Bun 1.3.14 crashes here without any SDK, fetch, or instance teardown involved.
-// Fixture source (Zig 0.16, wasm32-freestanding, ReleaseSmall, no entry, rdynamic):
-// extern "host" fn next() i32;
-// export fn run() i32 {
-//     var sum: i32 = 0;
-//     for (0..100000) |_| sum +%= next();
-//     return sum;
-// }
 const module = await WebAssembly.compile(new Uint8Array([
   0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127, 2,
   13, 1, 4, 104, 111, 115, 116, 4, 110, 101, 120, 116, 0, 0, 3, 2,

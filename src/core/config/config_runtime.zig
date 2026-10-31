@@ -1899,7 +1899,6 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
     if (root.object.get("provider_order")) |order_value| {
         if (order_value != .array) return error.InvalidProviderOrderType;
         const items = order_value.array.items;
-        // An empty array explicitly clears an inherited routing list.
         if (items.len > settings_store.max_provider_order_entries) {
             return error.InvalidProviderOrderValue;
         }
@@ -2422,8 +2421,6 @@ test "provider routing settings merge across layers with project defaults" {
     try std.testing.expectEqualStrings("vertex", order[0]);
     try std.testing.expectEqual(false, settings.provider_strict.?);
 
-    // Project defaults fill in only when neither the profile nor the workspace
-    // sets routing, so this case needs its own home without profile values.
     var project_settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, project_only_root);
     defer project_settings.deinit(std.testing.allocator);
 
@@ -2501,7 +2498,6 @@ test "parseProviderOrderList validates trims and deduplicates slugs" {
     try std.testing.expectEqualStrings("azure", order[0]);
     try std.testing.expectEqualStrings("bedrock", order[2]);
 
-    // Mixed-case gateway slugs like vertexAnthropic are valid.
     const mixed = parseProviderOrderList(alloc, "vertexAnthropic,claudeaws");
     const mixed_order = switch (mixed) {
         .ok => |maybe| maybe orelse return error.TestExpectedEqual,
@@ -2821,7 +2817,6 @@ test "skill_symlink_authorities is profile-only and workspace overrides replace 
     try std.testing.expectEqual(@as(usize, 1), workspace_paths.len);
     try std.testing.expectEqualStrings("/opt/workspace-skills", workspace_paths[0]);
 
-    // A committed project file must never grant filesystem authority.
     var project_only = try loadMergedSettingsFromHome(alloc, home_root, project_only_root);
     defer project_only.deinit(alloc);
     const project_only_paths = project_only.skill_symlink_authorities.?;
@@ -4161,8 +4156,6 @@ test "full model provenance table drops process override bookkeeping without fai
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("m0", result.settings.models.get(model_provider.parse("p0").?).?);
-    // The 36th provenance entry was dropped, so the diagnostic reads as the
-    // default rather than failing the whole settings load.
     try std.testing.expectEqual(ConfigSource.compiled_default, result.model_source.?);
 }
 
@@ -4185,8 +4178,6 @@ test "provider routing stays fail-closed only when provider fields are broken" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    // Unrelated malformed fields downgrade to diagnostics; the valid provider
-    // routing triple (connection, selection, model) survives.
     try std.testing.expect(result.settings.provider.? == .configured);
     try std.testing.expectEqualStrings("local", result.settings.provider.?.label());
     try std.testing.expectEqualStrings("local-model", result.settings.models.get(model_provider.parse("local").?).?);
@@ -4240,9 +4231,6 @@ test "workspace provider definitions stay ignored when a sibling workspace field
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    // Recovery follows the same layer scope as normal parsing: workspace
-    // override provider definitions are ignored, so the global connection
-    // survives the malformed sibling field.
     try std.testing.expect(result.settings.provider.? == .configured);
     try std.testing.expectEqualStrings("local", result.settings.provider.?.label());
     try std.testing.expectEqualStrings("http://localhost:11434/v1", result.settings.providers.?.get("local").?.base_url);
@@ -4636,7 +4624,6 @@ test "selectProviderModel chooses only its provider-scoped model" {
     try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
     try std.testing.expectEqualStrings("grok-model", grok.model);
 
-    // A launch --provider override selects that provider and its saved model.
     try gateway_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
     const overridden = try selectProviderModel("default/model", &gateway_settings, .grok, null);
     try std.testing.expectEqual(model_provider.ProviderId.grok, overridden.provider);
@@ -4650,7 +4637,6 @@ test "selectProviderModel chooses only its provider-scoped model" {
 }
 
 test "selectProviderModel accepts the run model when the provider has none saved" {
-    // FX_PROVIDER=codex FX_MODEL=... in a profile that never saved a Codex model.
     const missing_codex = Settings{ .provider = .codex };
     const env_codex = try selectProviderModel("default/model", &missing_codex, null, "gpt-env");
     try std.testing.expectEqual(model_provider.ProviderId.codex, env_codex.provider);
@@ -4660,26 +4646,22 @@ test "selectProviderModel accepts the run model when the provider has none saved
     const env_grok = try selectProviderModel("default/model", &missing_grok, null, "grok-env");
     try std.testing.expectEqualStrings("grok-env", env_grok.model);
 
-    // FX_PROVIDER=local names a custom connection, which has no default either.
     const missing_local = Settings{ .provider = model_provider.parse("local").? };
     try std.testing.expectError(error.ConfiguredModelNotSelected, selectProviderModel("default/model", &missing_local, null, null));
     const env_local = try selectProviderModel("default/model", &missing_local, null, "local-env");
     try std.testing.expectEqualStrings("local-env", env_local.model);
 
-    // --provider codex with FX_MODEL from a Gateway-only profile.
     const gateway_only = Settings{ .provider = .gateway };
     const launched = try selectProviderModel("default/model", &gateway_only, .codex, "gpt-env");
     try std.testing.expectEqual(model_provider.ProviderId.codex, launched.provider);
     try std.testing.expectEqualStrings("gpt-env", launched.model);
 
-    // A saved model remains the persisted preference; FX_MODEL applies on top of it later.
     var saved_codex = Settings{ .provider = .codex };
     defer saved_codex.deinit(std.testing.allocator);
     try saved_codex.models.putCopy(std.testing.allocator, .codex, "gpt-saved");
     const saved = try selectProviderModel("default/model", &saved_codex, null, "gpt-env");
     try std.testing.expectEqualStrings("gpt-saved", saved.model);
 
-    // Gateway keeps its compiled default as the persisted preference.
     const gateway = try selectProviderModel("default/model", &gateway_only, null, "gpt-env");
     try std.testing.expectEqualStrings("default/model", gateway.model);
 }

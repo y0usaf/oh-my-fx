@@ -1,11 +1,4 @@
 #!/usr/bin/env node
-// Parallel tool stress and fault injection. Each turn asks for one batch of
-// tool calls drawn from a seeded PRNG: random writer flags, latencies and
-// thrown errors, and sometimes a cancel while the batch runs. Every batch is
-// checked from the real start and end order of the tools and the order the
-// next model request carried their results. The WebAssembly core runs host
-// tools one at a time, which satisfies every check; the report's concurrency
-// and speedup show how much parallelism each backend has.
 import { createFxEngine, supportsJspi } from "../../sdk/node.js";
 import {
   batchSteps,
@@ -38,7 +31,6 @@ if (backend === "wasm" && !supportsJspi()) throw new Error("Wasm needs JSPI; run
 if (!Number.isInteger(batches) || batches < 1 || !Number.isInteger(agentTurns) || agentTurns < 1) throw new Error("invalid counts");
 if (!(cancelRate >= 0 && cancelRate <= 1)) throw new Error("--cancel-rate must be 0..1");
 
-// Fixed batches first: the list-then-read order check and write-then-read.
 const fixed = ["list-then-read", "write-then-read"].map((name) => ({
   name,
   calls: durableWorkloads[name][0].calls.map((call) => ({ name: call.name, writes: durableTools[call.name].writes, latencyMs: 2, fault: null })),

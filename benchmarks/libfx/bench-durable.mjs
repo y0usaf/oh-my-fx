@@ -1,18 +1,4 @@
 #!/usr/bin/env node
-// Durable libfx benchmark: what persistence costs per turn, per tool call and
-// per restore, against the same workloads with no durability.
-//
-// "control" runs each scripted workload with no durability. "today-rN"
-// emulates a host that makes libfx durable from outside, on a remote log with an N ms
-// round trip: four sequential acknowledged writes per tool call and a
-// checkpoint after each turn (durable.mjs todayAdapterWrites). "journal-rN"
-// gives libfx a persistence store on the same remote log, which acks each
-// append N ms after it: libfx sends records one at a time, and waits for them
-// only before a model request or a tool call. Journal rows report append calls
-// instead of awaited writes. The restore section measures checkpoint and
-// journal size and restore time against history length. With --world-root (a
-// directory holding @workflow/world-local), "world-local" runs libfx with the
-// World store in sdk/tests/world-persistence.mjs.
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,8 +41,6 @@ const createWorld = options["world-root"]
 
 const stepsFor = (prompt) => durableWorkloads[promptDirectives(prompt).workload] ?? durableWorkloads["no-tool"];
 
-// A persistence store on a remote log: each append lands one round trip
-// after its call. `stored` is the session's events, decoded for the report.
 function remoteStore(roundTrip, records = []) {
   const store = {
     records: [...records],
@@ -78,14 +62,12 @@ function remoteStore(roundTrip, records = []) {
   return store;
 }
 
-// A remote store is its own counter.
 const persisted = (store) => Object.assign(store, { persistence: store });
 
 const turnBytes = (events, turn) => events
   .filter((event) => event.turn === turn)
   .reduce((sum, event) => sum + JSON.stringify(event).length, 0);
 
-// A World store that counts libfx's record writes as a store counts appends.
 function countingWorld(inner) {
   const counter = { appends: 0, bytes: 0 };
   const create = (runId, request, params) => {
@@ -102,8 +84,6 @@ function countingWorld(inner) {
   return counter;
 }
 
-// world-local's queue teardown calls undici's Agent.close(), which Bun's
-// built-in undici lacks; only that known failure is skipped.
 async function closeWorld(world) {
   try {
     await world.close?.();
@@ -112,8 +92,6 @@ async function closeWorld(world) {
   }
 }
 
-// One agent whose tools record their real start and end times on `active`.
-// `store` counts appends; its `persistence` is what the agent writes to.
 async function openAgent({ roundTrip = null, checkpoint, store } = {}) {
   let active = null;
   const run = async (name, input, { signal }) => {
@@ -259,7 +237,6 @@ for (const history of histories) {
       const row = await runTurn(handle, "no-tool", index, null);
       lastTurnJournalBytes = row.journal_bytes;
     }
-    // One tool turn after `history` turns; turns count from 1.
     await runTurn(handle, "one-safe", history, null);
     for (let index = 0; index < restoreSamples; index += 1) {
       const startedAt = performance.now();

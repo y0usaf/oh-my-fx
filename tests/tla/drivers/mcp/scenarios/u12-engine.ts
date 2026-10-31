@@ -1,10 +1,3 @@
-// U12 engine, step 6: tests/tla/drivers/mcp/labs/engine_lab.zig drives src/mcp/engine.zig
-// over fake stdio servers (tests/tla/drivers/mcp/fakes/stdio.ts), one per name. Every
-// server's machines trace into one file: the engine gate under the server's
-// name, and its stdio core, request table, era, catalog, subscriptions,
-// rounds, and elicitations under "<name>.". Request ids and logical handles
-// count per server: detection is x1, the tool list listen x2, and calls
-// follow, so a call's rounds are the instance after them.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,8 +11,6 @@ const WITH_SERVER = join(import.meta.dir, "../with-server.ts");
 const MODERN = "2026-07-28";
 const LEGACY = "2025-11-25";
 
-// ---- fake servers ----
-
 const discover: Rule = { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: { listChanged: true } } } };
 const listen: Rule = { method: "subscriptions/listen", noReply: true };
 const tool = (name: string) => ({ name, inputSchema: { type: "object" } });
@@ -31,8 +22,6 @@ const ok25 = (text: string, extra: Partial<Rule> = {}): Rule => ({ method: "tool
 const crash = (name: string): Rule => ({ method: "tools/call", tool: name, noReply: true, then: "crash" });
 export const modern = (...extra: Rule[]): Rule[] => [discover, listen, list("echo"), ...extra, ok("fine")];
 export const legacy = (...extra: Rule[]): Rule[] => [initialize, list25("add"), ...extra, ok25("fine")];
-
-// ---- the lab ----
 
 interface Line {
   did?: { action?: string; expect?: string; met?: boolean; error?: string; line?: string; k?: number };
@@ -112,7 +101,6 @@ function engineScenario(c: EngineCase): Scenario {
       const lab = [ctx.bin.engine_lab, ctx.tracePath, join(ctx.caseDir, "script.txt"), "--probe-ms", "3000", "--max-attempts", String(attempts), ...(c.labFlags ?? [])];
       if (!c.http) return lab;
       const server = [process.execPath, FAKE_HTTP, "--script", join(ctx.caseDir, "http.rules.json"), "--log", join(ctx.caseDir, `${c.http.name}.jsonl`), ...(c.http.flags ?? [])];
-      // Bun takes a leading "--" as its own, so an --env comes first.
       return [process.execPath, WITH_SERVER, "--env", "MCPV2_ENGINE=1", "--", ...server, "--", ...lab, "--define", "URL=http://127.0.0.1:{port}/mcp"];
     },
     expect: {
@@ -399,8 +387,6 @@ export const scenarios: Scenario[] = [
     script: ["call h echo", "expect h.called.1.result 5000", "call h echo", "expect h.called.2.cancelled 5000", "expect h.phase.backoff 5000", "call h echo", "expect h.called.3.result 10000", "status"],
     machines: { h: ["engine", "request", "era", "catalog"] },
     check: (lines, logs) => {
-      // The hung initialize's stream must close before the restart's
-      // initialize, not when the lab exits.
       const raw = logs.h as unknown as { t: number; dir: string; id?: number; body?: string }[];
       const inits = raw.filter((l) => l.dir === "in" && l.body && JSON.parse(l.body).method === "initialize");
       const hung = inits[1] && JSON.parse(inits[1].body!).id;
@@ -416,8 +402,6 @@ export const scenarios: Scenario[] = [
     name: "u12-stopped-reading",
     description: "A stdio server stops reading stdin and gets a call bigger than a pipe holds: only that server's stdin writer waits, so another server's call still answers and the stuck call times out",
     servers: {
-      // Answers server/discover, then never reads stdin again; a Bun fake
-      // keeps reading into its own buffer, so this is a shell.
       a: { rules: [], argv: ["/bin/sh", "-c", `read -r _; printf '%s\\n' '${STUCK_DISCOVER}'; exec sleep 60`] },
       b: { rules: modern() },
     },

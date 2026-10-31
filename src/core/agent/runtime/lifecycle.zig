@@ -291,7 +291,6 @@ fn prepareToolCallFromCheckpoint(
     if (integrity != .valid) {
         var rejected = call;
         rejected.argument_integrity = integrity;
-        // Raw arguments reach this point only when the provider did not classify them.
         if (integrity == .malformed_json and call.argument_integrity == .valid) {
             rejected.argument_diagnostic = try types.ToolArgumentDiagnostic.diagnose(result_allocator, call.arguments_json);
         }

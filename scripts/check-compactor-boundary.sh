@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# fx-compactor keeps all compaction logic in src/core/compactor behind one
-# front door, compactor.zig. Code outside imports only that file, and the
-# compactor imports only fx's shared basics; anything else it needs, such as
-# the model caller and the record store, is handed in through its API.
 
 set -euo pipefail
 

@@ -76,8 +76,6 @@ pub fn completeCancellable(
     var dir = std.Io.Dir.openDirAbsolute(io, resolved, .{ .iterate = true }) catch return error.PathUnavailable;
     defer dir.close(io);
 
-    // Listing a folder's contents: the folder itself is the first row, so it
-    // can be selected and not only opened.
     const folder = listedFolder(parsed);
     const reserved: usize = @intFromBool(folder != null);
     const entries = out[reserved..];
@@ -91,7 +89,6 @@ pub fn completeCancellable(
         try checkCancellation(cancel);
         if (!text_utils.isTerminalSafe(entry.name)) continue;
         const score = matcher.score(entry.name) orelse continue;
-        // candidateKind may stat symlinks or unknown kinds.
         try checkCancellation(cancel);
         const kind = candidateKind(&dir, entry.name, entry.kind) orelse continue;
 
@@ -419,7 +416,6 @@ test "path completion lists a folder first so it can be selected" {
     try std.testing.expectEqualStrings("src/main.zig", results[1].path);
     try std.testing.expect(isCurrentCandidateKind(root, results[0].path, .directory));
 
-    // A partial name lists matching entries only.
     try std.testing.expectEqual(@as(usize, 1), try complete(root, "src/ma", &results, &spans, &paths));
     try std.testing.expectEqualStrings("src/main.zig", results[0].path);
 
@@ -428,7 +424,6 @@ test "path completion lists a folder first so it can be selected" {
     try std.testing.expectEqualStrings("~", results[0].path);
     try std.testing.expectEqualStrings("~/notes.txt", results[1].path);
 
-    // With room for one row, the folder itself is kept.
     try std.testing.expectEqual(@as(usize, 1), try complete(root, "src/", results[0..1], &spans, paths[0..file_index.max_path_len]));
     try std.testing.expectEqualStrings("src", results[0].path);
 }

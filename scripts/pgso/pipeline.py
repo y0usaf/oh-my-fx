@@ -20,12 +20,6 @@ from scripts.pgso.runner import hermetic_environment, run_checked
 from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 
 
-# Zig 0.17 emits array bitcasts as per-element loops that the optimizer later
-# folds into single loads. Instrumentation runs before loop unrolling, so it
-# would count every element. Unroll constant-trip loops first, in both the
-# generation and use pipelines, so their CFG hashes keep matching. Unrolling
-# without the surrounding instcombine and simplifycfg left the ui-activity
-# benchmark about 11% slower than a plain O2 build.
 PROFILE_PREPARATION_PASSES = (
     "function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,"
     "instcombine<no-verify-fixpoint>,simplifycfg)"
@@ -39,8 +33,6 @@ GENERATION_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>",
 )
 
-# Apply the profile before partitioning so every part inherits the accepted
-# whole-program optimization and profile metadata.
 USE_FLAGS = (
     "--disable-vp",
     "-pgo-kind=pgo-instr-use-pipeline",
@@ -60,11 +52,8 @@ OUTLINE_CLEANUP_FLAGS = (
     "-internalize-public-api-list=main,_mh_execute_header",
 )
 
-# Zig writes raw bitcode. LLVM's own writer, which the IR size passes use,
-# wraps Darwin bitcode in the 0x0B17C0DE wrapper header.
 BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
 
-# Drop the constants that `ir_size.py sparse-constants` left without uses.
 SPARSE_CLEANUP_FLAGS = (
     "-passes=globaldce,verify",
 )
@@ -360,7 +349,6 @@ def zig_build_argv(
 
 
 def zig_build_env(paths: PipelinePaths) -> dict[str, str]:
-    # `zig build` takes its global cache only from the environment.
     environment = os.environ.copy()
     environment["ZIG_GLOBAL_CACHE_DIR"] = str(paths.global_cache)
     return environment
@@ -534,8 +522,6 @@ _STUB_TARGET_LIST = re.compile(r"(targets:\s*)\[([^\]]*)\]")
 
 
 def apple_ld_system_stub(text: str) -> str:
-    # Zig 0.17's macOS 27 stub lists arm64e.x1 targets, which the Xcode 16.4
-    # linker rejects as an unknown architecture. An arm64 link never uses them.
     def drop_arm64e_x1(match: re.Match[str]) -> str:
         targets = [target.strip() for target in match.group(2).split(",")]
         kept = [t for t in targets if t and not t.startswith("arm64e.x1-")]
@@ -573,7 +559,6 @@ def temporal_candidate_link_argv(
         "_main",
         "-no_deduplicate",
         "-no_function_starts",
-        # fx builds without unwind tables; newer ld otherwise emits ~160 KB.
         "-no_compact_unwind",
         "-order_file",
         str(paths.logs / "candidate-order.txt"),
@@ -837,8 +822,6 @@ def candidate_object_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
 ) -> tuple[str, ...]:
-    # A second AArch64 outliner pass can fold sequences exposed by the first.
-    # Keep benchmark artifacts on their established code-generation contract.
     outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
     return (
         str(toolchain.llc),
@@ -883,8 +866,6 @@ def emit_bitcode(
     )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
     _require_bitcode_header(paths.bitcode)
-    # Every job derives instrumentation and profile use from this file, so
-    # the helper attributes are part of the recorded bitcode identity.
     staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
     run_checked(
         ir_size_argv(toolchain, "outline-helpers", paths.bitcode, staged),
@@ -1479,7 +1460,6 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     if result.stdout:
         raise PgsoError("unexpected temporal linker stdout")
     link_map = paths.logs / "candidate-link.map"
-    # Apple maps include opaque literal bytes outside the named text symbols.
     layout = validate_temporal_link_map(
         link_map.read_text(encoding="utf-8", errors="surrogateescape"),
         paths.profile_use_object, ordered,

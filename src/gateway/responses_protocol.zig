@@ -141,7 +141,6 @@ pub fn writeInput(
                     }
                 }
                 if (span_end) |end| {
-                    // Capture can end inside the separator before the next message.
                     const tail = content[end..];
                     if (tail.len > 2 or !std.mem.startsWith(u8, "\n\n", tail)) return error.InvalidProviderState;
                 } else if (content.len > 0) try write_assistant_text(writer, &first, content, legacy_phase);
@@ -801,7 +800,6 @@ const TextPart = struct {
     digest: TextDigest = .init(.{}),
     finalized: bool = false,
 
-    // Receipt is independent of capture: capped text cannot validate a final prefix.
     fn final_suffix(self: *const TextPart, text: []const u8) ![]const u8 {
         if (text.len < self.received_bytes or
             (self.finalized and text.len != self.received_bytes)) return error.ResponsesTextConflict;
@@ -1204,7 +1202,7 @@ pub const Reducer = struct {
             if (message.length == 0) message.offset = before;
             message.length += self.content.items.len - before;
             part.digest.update(suffix);
-            part.received_bytes += suffix.len; // Bounded by the aggregate total above.
+            part.received_bytes += suffix.len;
             self.text_bytes = total;
             self.last_text_key = update.key;
             if (boundary) callbacks.on_content(callbacks.context, "\n\n");
@@ -1676,7 +1674,6 @@ test "Responses message replay releases request scratch on allocation failure" {
     const Probe = struct {
         fn run(alloc: std.mem.Allocator) !void {
             const messages = [_]types.ChatMessage{.{ .role = .assistant, .content = "a\n\nb", .provider_replay = .{ .source = .{ .provider = .codex, .model = "fixture-model" }, .parts_json = "[{\"type\":\"message\",\"offset\":0,\"length\":1},{\"type\":\"message\",\"offset\":3,\"length\":1}]" } }};
-            // Output storage is separate from the scratch allocator under test.
             var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
             defer wire.deinit();
             try ImageInputTest.write(alloc, &wire.writer, &messages, null);

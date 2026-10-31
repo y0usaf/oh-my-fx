@@ -36,7 +36,6 @@ pub fn main(init: std.process.Init) !void {
     io_mod.setIo(init.io);
     io_mod.setEnvironMap(init.environ_map);
     const alloc = std.heap.c_allocator;
-    // FX_CONFIGURED_PROVIDERS defines the app's own provider, if it has one.
     const configured_providers = io_mod.getenv("FX_CONFIGURED_PROVIDERS");
     var custom_context: ?host_chat_completions.Context = null;
     defer if (custom_context) |*context| context.deinit(alloc);
@@ -68,7 +67,6 @@ pub fn main(init: std.process.Init) !void {
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
         .provider_override = try providerOverrideFromEnv(io_mod.getenv("FX_PROVIDER"), if (custom_context) |*context| context else null),
-        // The JS host adds provider credentials at its fetch edge.
         .provider_auth_mode = .host_managed,
         .configured_providers_json = configured_providers,
         .model_override = io_mod.getenv("FX_MODEL"),
@@ -89,7 +87,6 @@ const js_host_gateway_provider = gateway_provider.Provider{
 };
 
 const codex_context = host_openai_codex.Context{ .transport = js_host_stream_provider.transport };
-// Mutable: it remembers the Grok client version between requests.
 var grok_context = host_xai_grok.Context{ .transport = js_host_stream_provider.transport };
 
 const js_host_provider_set = set: {

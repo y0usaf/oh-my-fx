@@ -299,7 +299,6 @@ describe("fx ask presentation", () => {
     expect(gateway.requests[5]!.body).toContain("nested");
     expect(existsSync(nestedExecMarker)).toBe(true);
     expect(gateway.requests[6]!.body).toContain("neighbor-exec");
-    // The refused tty run never reached the terminal store.
     expect(
       existsSync(join(root.home, ".fx"))
         ? Array.from(new Bun.Glob("**/terminal/state/record-*.json").scanSync({
@@ -951,7 +950,6 @@ describe("fx ask presentation", () => {
   );
 });
 
-// Both login shells read these files, so the tests hold for zsh and bash.
 function writeStartupFiles(home: string, body: string): void {
   writeFileSync(join(home, ".zshrc"), body);
   writeFileSync(join(home, ".bash_profile"), body);
@@ -1012,15 +1010,12 @@ describe("fx ask shell startup files", () => {
       expect(gateway.requests[index]!.body).toContain(`PATH=${marker}`);
     }
     expect(gateway.requests[5]!.body).toContain("FX_RELOADED_ALIAS");
-    // One capture, and one more after the edit: never once per command.
     expect(startupLoads(root.home)).toBe(2);
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
   test("startup files the snapshot cannot capture fall back with one notice", async () => {
     const root = createRoot();
-    // A 9 MB alias exceeds the 8 MiB capture limit, while full startup still
-    // works for every command.
     writeStartupFiles(
       root.home,
       "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
@@ -1043,16 +1038,13 @@ describe("fx ask shell startup files", () => {
     const notice = "shell snapshot unavailable (the captured state exceeded 8 MiB)";
     expect(occurrences(result.stderr, `fx ask: warning: ${notice}`)).toBe(1);
     expect(occurrences(gateway.requests[1]!.body, notice)).toBe(1);
-    // The later request repeats the history, so one notice in total.
     expect(occurrences(gateway.requests[2]!.body, notice)).toBe(1);
     expect(occurrences(gateway.requests[2]!.body, "FX_FULL_STARTUP_ALIAS")).toBe(2);
-    // The failed capture plus one full startup per command.
     expect(startupLoads(root.home)).toBe(3);
   }, TIMEOUT);
 
   test("a fallback notice still appears when the snapshot recovers in the same run", async () => {
     const root = createRoot();
-    // The first startup run, the capture, kills its own shell; later runs work.
     writeStartupFiles(
       root.home,
       "if [ ! -e \"$HOME/fault-fired\" ]; then : > \"$HOME/fault-fired\"; kill -9 $$; fi\n" +

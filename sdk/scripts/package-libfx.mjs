@@ -79,7 +79,6 @@ if (cjsBuild.status !== 0) process.exit(cjsBuild.status ?? 1);
 for (const [source, destination] of files) {
   await cp(resolve(repoRoot, source), resolve(outputDir, destination));
 }
-// The TypeScript declarations the manifest's `types` conditions name.
 const declarations = (await readdir(resolve(repoRoot, "sdk/types"))).filter((name) => /\.d\.c?ts$/.test(name)).sort();
 await mkdir(resolve(outputDir, "types"), { recursive: true });
 for (const name of declarations) await cp(resolve(repoRoot, "sdk/types", name), resolve(outputDir, "types", name));
@@ -89,7 +88,6 @@ for (const addon of nativeAddons) {
   await cp(addon, resolve(outputDir, destination));
 }
 
-// Each durability module carries the World it wraps; see bundle-durable.mjs.
 if (!existsSync(resolve(repoRoot, "sdk/durable/node_modules/@workflow"))) {
   throw new Error("bundling the durable Worlds needs `npm ci --prefix sdk/durable` first");
 }

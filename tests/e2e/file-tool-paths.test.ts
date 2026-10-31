@@ -443,11 +443,6 @@ describe("filesystem path handling", () => {
     "parallel read_file image calls keep their pixels through batch assembly",
     async () => {
       const root = createIsolatedRoot();
-      // Payloads larger than the turn arena's chunk size force dedicated
-      // allocations, which ArenaAllocator.free genuinely reclaims when the
-      // parallel run result is deinitialized after assembly. On the buggy
-      // path the retained history slices pointed at that freed memory and
-      // the next request build crashed or serialized garbage.
       const pngHeader = Buffer.from(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
         "base64",
@@ -761,8 +756,6 @@ describe("filesystem path handling", () => {
       } finally {
         firstGateway.stop();
       }
-      // The edit snapshots are large, so they live behind a handle and stay
-      // out of the log that resume reads.
       const events = readFileSync(
         join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
         "utf8",
@@ -780,8 +773,6 @@ describe("filesystem path handling", () => {
         expect(secondGateway.requests.length).toBe(1);
         const live = JSON.parse(liveBody) as { prompt: unknown[]; tools?: unknown };
         const next = JSON.parse(secondGateway.requests[0].body) as { prompt: unknown[]; tools?: unknown };
-        // Provider prompt caching depends on the resumed request starting
-        // with exactly the bytes the live session last sent.
         const livePrompt = live.prompt.map((message) => JSON.stringify(message));
         const nextPrompt = next.prompt.map((message) => JSON.stringify(message));
         expect(livePrompt.length).toBeGreaterThanOrEqual(3);
@@ -1485,7 +1476,6 @@ describe("filesystem path handling", () => {
       try {
         const target = join(root.workspace, "strategy.ts");
         writeFileSync(target, "export interface RacePlan {\n  laps: number;\n}\n");
-        // The requested removal is already applied, so both edits fail.
         const failingEdit = {
           path: "strategy.ts",
           old_string: "  trajectory?: Trajectory;\n}",
@@ -1595,7 +1585,6 @@ describe("filesystem path handling", () => {
       const root = createIsolatedRoot();
       try {
         mkdirSync(join(root.workspace, "src"), { recursive: true });
-        // 3,000 lines of 100 bytes, then the match on line 3,001.
         writeFileSync(
           join(root.workspace, "src", "big.txt"),
           `${"x".repeat(99)}\n`.repeat(3000) + "LARGE_FILE_NEEDLE\n",
@@ -1766,8 +1755,6 @@ describe("filesystem path handling", () => {
           expectedResultRequest: ["HomeNotSet"],
         });
 
-        // Nothing resolves against the workspace: no tilde folder, and no
-        // profile written under the relative path.
         expect(existsSync(join(root.workspace, "~"))).toBe(false);
         expect(existsSync(join(root.workspace, "relative"))).toBe(false);
       } finally {

@@ -36,8 +36,6 @@ pub fn state(random: [32]u8) [43]u8 {
     return out;
 }
 
-// ---- Form encoding ----
-
 fn writeEscaped(w: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
     for (value) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~') {
@@ -77,8 +75,6 @@ fn unescape(a: Allocator, value: []const u8) error{ OutOfMemory, Malformed }![]c
     return out[0..n];
 }
 
-// ---- The authorization request ----
-
 pub const AuthorizationRequest = struct {
     endpoint: []const u8,
     client_id: []const u8,
@@ -104,8 +100,6 @@ pub fn writeAuthorizationUrl(w: *std.Io.Writer, r: AuthorizationRequest) std.Io.
     try writeParam(w, &first, "code_challenge_method", "S256");
     try writeParam(w, &first, "resource", r.resource);
 }
-
-// ---- The authorization response ----
 
 pub const Response = struct {
     code: ?[]const u8 = null,
@@ -141,7 +135,6 @@ pub fn parseResponse(a: Allocator, callback: []const u8, redirect_uri: []const u
             &r.err_description
         else
             continue;
-        // A parameter given twice can't be trusted (RFC 6749 §3.1).
         if (slot.* != null) return error.Malformed;
         slot.* = value;
     }
@@ -159,8 +152,6 @@ pub fn checkResponse(r: Response, expected_state: []const u8, issuer: []const u8
         .err = r.err != null or r.code == null,
     };
 }
-
-// ---- Registration ----
 
 pub const Method = enum { none, client_secret_basic, client_secret_post };
 
@@ -204,8 +195,6 @@ pub fn chooseMethod(registered: ?Method, has_secret: bool, supported: ?[]const u
     if (wire.arrayHasString(list, "client_secret_post") catch false) return .client_secret_post;
     return .client_secret_basic;
 }
-
-// ---- Token requests and responses ----
 
 pub const Client = struct {
     id: []const u8,
@@ -326,8 +315,6 @@ pub fn refusesGrant(raw: []const u8) bool {
     return std.mem.eql(u8, wire.plainString(f[0] orelse return false) orelse return false, "invalid_grant");
 }
 
-// ---- Scopes ----
-
 /// At most 31 scope names, so every mask fits TLC's integers in the traces;
 /// more are dropped, and a step-up for a dropped one ends at the bound.
 pub const max_scopes = 31;
@@ -383,17 +370,13 @@ pub const ScopeSet = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "PKCE S256 and the state (RFC 7636 appendix B)" {
-    // The RFC's example: its verifier is the base64url of these 32 bytes.
     const random = [32]u8{ 116, 24, 223, 180, 151, 153, 224, 37, 79, 250, 96, 125, 216, 173, 187, 186, 22, 212, 37, 77, 105, 214, 191, 240, 91, 88, 5, 88, 83, 132, 141, 121 };
     const p: Pkce = .init(random);
     try testing.expectEqualStrings("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", &p.verifier);
     try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", &p.challenge);
-    // As long as the verifier: a bridge such as fx.sh's takes no shorter one.
     try testing.expectEqual(@as(usize, 43), state(@splat(7)).len);
 }
 
@@ -424,11 +407,9 @@ test "reads the authorization response and checks state and iss exactly" {
     try testing.expectEqualStrings("c+1", r.code.?);
     const ok = checkResponse(r, "abc", "https://auth.x.com", true);
     try testing.expect(ok.state_ok and ok.iss == .match and !ok.err);
-    // A trailing slash is another issuer; no normalization.
     try testing.expectEqual(core.Iss.wrong, checkResponse(r, "abc", "https://auth.x.com/", true).iss);
     try testing.expect(!checkResponse(r, "abd", "https://auth.x.com", true).state_ok);
     try testing.expect(!checkResponse(.{ .code = "c" }, "abc", "https://auth.x.com", false).state_ok);
-    // Neither a code nor an error: nothing to redeem.
     try testing.expect(checkResponse(.{ .state = "abc" }, "abc", "https://auth.x.com", false).err);
     const e = try parseResponse(a, "http://127.0.0.1:5000/callback?error=access_denied&error_description=No+way&state=abc", redirect);
     const checked = checkResponse(e, "abc", "https://auth.x.com", false);
@@ -469,7 +450,6 @@ test "token requests put the client where its method says" {
     try testing.expectEqualStrings("grant_type=refresh_token&refresh_token=r&resource=https%3A%2F%2Fm&client_id=i&client_secret=s%26", out.written());
     try testing.expectEqual(@as(?[]const u8, null), try basicAuthorization(a, post));
     const basic: Client = .{ .id = "a:b", .secret = "c", .method = .client_secret_basic };
-    // "a%3Ab:c" in base64.
     try testing.expectEqualStrings("Basic YSUzQWI6Yw==", (try basicAuthorization(a, basic)).?);
     out.clearRetainingCapacity();
     try writeTokenRequest(&out.writer, .{ .refresh = "r" }, "https://m", basic);
@@ -494,7 +474,6 @@ test "token responses: Bearer only, refresh and expiry optional" {
     try testing.expect(bare.refresh == null and bare.expires_in == null);
     try testing.expectError(error.Malformed, parseToken(a, "{\"access_token\":\"at\",\"token_type\":\"DPoP\"}"));
     try testing.expectError(error.Malformed, parseToken(a, "{\"access_token\":\"at\",\"token_type\":\"N_A\"}"));
-    // Slack's user tokens are sent as Bearer.
     const slack = try parseToken(a, "{\"ok\":true,\"access_token\":\"xoxp-1\",\"token_type\":\"user\",\"scope\":\"search:read\"}");
     try testing.expectEqualStrings("xoxp-1", slack.access);
     try testing.expectError(error.Malformed, parseToken(a, "{\"token_type\":\"Bearer\"}"));
@@ -529,7 +508,6 @@ test "a token endpoint's refusal is said in its own words, and a token never" {
     try std.testing.expectEqualStrings("its token endpoint answered HTTP 400", try tokenFailure(a, 400, "{\"errors\":[\"nope\"]}"));
     try std.testing.expectEqualStrings("its token endpoint's answer isn't a JSON object", try tokenFailure(a, 200, "access_token=secret"));
     try std.testing.expectEqualStrings("its token is of type mac, which can't be sent as a Bearer token", try tokenFailure(a, 200, "{\"access_token\":\"secret\",\"token_type\":\"mac\"}"));
-    // Slack answers 200 with its error.
     try std.testing.expectEqualStrings("invalid_code", try tokenFailure(a, 200, "{\"ok\":false,\"error\":\"invalid_code\"}"));
     try std.testing.expectEqualStrings("its token response has no token_type", try tokenFailure(a, 200, "{\"access_token\":\"secret\"}"));
     try std.testing.expectEqualStrings("its token response has no access_token", try tokenFailure(a, 200, "{\"token_type\":\"bearer\"}"));

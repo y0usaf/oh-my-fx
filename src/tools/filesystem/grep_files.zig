@@ -223,9 +223,6 @@ const SearchOutcome = union(enum) {
 fn callWithOps(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, ops: CallOps) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
 
-    // The scan and the per-call work use the scratch allocator, so each search
-    // returns its memory when it ends; only the result body comes from
-    // `ctx.allocator`.
     var arena_state = std.heap.ArenaAllocator.init(ctx.scratch_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
@@ -681,8 +678,6 @@ fn dispatchGrepFilesRaw(alloc: Allocator, workspace_root: []const u8, args_json:
 }
 
 test "grep_files keeps only its result in the turn's allocator" {
-    // fx passes the turn's arena as `allocator`, so a scan left there stays
-    // until the turn ends and every search adds another.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -710,7 +705,6 @@ test "grep_files keeps only its result in the turn's allocator" {
         }, registry, .{ .id = "call_1", .name = "grep_files", .arguments_json = args });
         try std.testing.expectEqual(.success, result.status);
         try std.testing.expect(std.mem.find(u8, result.body, "many/file-0001.txt") != null);
-        // Searching 2,050 files takes far more than this; the result does not.
         try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
     }
 }
@@ -1101,8 +1095,6 @@ test "grep_files single-file include matches the base name or the workspace path
     try std.testing.expectEqual(.success, basename_match.status);
     try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - src/single.zig:1: needle\n", basename_match.body);
 
-    // A pattern with a slash matches the path relative to the workspace, as in
-    // a search of the whole workspace.
     var path_pattern_match = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "src/*.zig", null, null, null);
     defer path_pattern_match.deinit(alloc);
     try std.testing.expectEqual(.success, path_pattern_match.status);
@@ -1464,8 +1456,6 @@ test "grep_files formatter reports candidate cap without output truncation wordi
 
     try std.testing.expectEqualStrings("[grep] no matches for needle\n... candidate list may be incomplete; candidate cap 2 reached before all files were discovered\n", body);
 
-    // A listing left incomplete by unreadable folders or git files says so,
-    // not that the cap was reached.
     const unreadable = try formatMatches(alloc, alloc, "", "needle", .{
         .matches = &.{},
         .candidate_incomplete = true,

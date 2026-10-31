@@ -243,7 +243,6 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
         if (startsPersistedToolStep(messages, index)) {
             if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
             steps += 1;
-            // Keep following continuation prompts, but not the completed reply.
             if (message.tool_calls.len == 0) prefix_start = index + 1;
         } else if (message.role == .user and message.content != null and
             (message.restored_steering or steeringText(message.content.?) != null))
@@ -300,7 +299,6 @@ fn isSteering(message: ChatMessage) bool {
 
 fn steeringText(content: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
-        // Keep the sender label in persisted text and ordinary history replay.
         return content[parent_steering_open.len .. content.len - parent_steering_close.len];
     }
     if (!std.mem.startsWith(u8, content, steering_open) or !std.mem.endsWith(u8, content, steering_close)) return null;
@@ -527,8 +525,6 @@ test "interrupted execution memory keeps steering typed right after a tool resul
     const memory = try buildInterruptedExecutionMemory(alloc, &messages, calls[1]);
     defer types.freeExecutionMemory(alloc, memory);
 
-    // The cancelled turn keeps what the user typed, after the step it
-    // followed; an unmarked plain message still stays out.
     try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
     try std.testing.expectEqualStrings("check the tests too", memory.steering[0].text);

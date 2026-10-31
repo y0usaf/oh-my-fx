@@ -48,7 +48,6 @@ try {
   assert.deepEqual(manifest.exports["./mcp"], typed("mcp.d.ts", "./mcp.js"));
   assert.deepEqual(manifest.exports["./skills"], typed("skills.d.ts", "./skills.js"));
   assert.deepEqual(manifest.exports["./skills/node"], typed("skills-node.d.ts", "./skills-node.js"));
-  // Every `types` condition names a declaration the package carries.
   for (const target of JSON.stringify(manifest.exports).match(/\.\/types\/[^"]+/g)) {
     assert.ok(existsSync(join(packageDir, target)), `package is missing ${target}`);
   }
@@ -56,7 +55,6 @@ try {
   const archiveValidator = packageJob.match(/- name: Validate package archive\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
   assert.ok(archiveValidator, "publisher archive validation must exist");
   const reportPath = join(temp, "libfx-pack.json");
-  // Every file, at its path in the package, as `npm pack` reports them.
   const archiveFiles = new Set((await readdir(packageDir, { recursive: true, withFileTypes: true }))
     .filter((entry) => entry.isFile())
     .map((entry) => relative(packageDir, join(entry.parentPath, entry.name)).split(sep).join("/")));

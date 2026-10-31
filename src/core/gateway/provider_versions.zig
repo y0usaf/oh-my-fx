@@ -71,7 +71,6 @@ pub fn resolveWithCache(alloc: Allocator, provider: Provider, lookup: Lookup, ca
         debug_trace.logf("models", "provider version lookup unavailable provider={t}; using cached version={s}", .{ provider, previous.version.slice() });
         break :blk previous.version;
     };
-    // The timestamp also bounds retries when the release service is unavailable.
     cache.save(cache.context, alloc, provider, .{ .version = version, .checked_at_ms = now_ms }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("models", "provider version cache write failed provider={t} err={s}", .{ provider, @errorName(err) });

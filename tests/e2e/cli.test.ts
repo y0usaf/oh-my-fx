@@ -1306,7 +1306,6 @@ describe("cli: usage", () => {
       return [{ model: "provider/a", request_count: 2, input_tokens: 10, output_tokens: 5, total_cost: 0.5 }];
     }
     if (end !== utcDate(USAGE_NOW_MS - DAY_MS)) return [];
-    // The month's finished days add a second model on top of the week's.
     return start === "2026-10-01"
       ? [
         { model: "provider/b", request_count: 4, input_tokens: 40, output_tokens: 8, total_cost: 2 },
@@ -1399,7 +1398,6 @@ describe("cli: usage", () => {
           expect(request.query.get("group_by")).toBe("model");
         }
 
-        // Later the same day only today is read again; the cache answers the rest.
         const week = await runFx(["usage", "--period", "7d"], { env });
         expect(week.code).toBe(0);
         expect(week.stderr).toBe("");
@@ -1408,7 +1406,6 @@ describe("cli: usage", () => {
         expect(week.stdout).toContain("- provider/a  $0.7500  3 requests  20 tokens");
         expect(fixture.fake.reportRanges().slice(3)).toEqual([`${today}..${today}`]);
 
-        // A new UTC day reads its finished days again.
         writeUsageClock(fixture.clock, USAGE_NOW_MS + DAY_MS);
         const next = await runFx(["usage", "--json", "--period", "today"], { env });
         expect(next.code).toBe(0);
@@ -1478,7 +1475,6 @@ describe("cli: usage", () => {
       try {
         expect((await runFx(["usage", "--json"], { env })).code).toBe(0);
         refuse = true;
-        // Past the one-minute floor, so the second process fetches again.
         writeUsageClock(fixture.clock, USAGE_NOW_MS + 2 * 60 * 1000);
         const json = await runFx(["usage", "--json"], { env });
         expect(json.code).toBe(1);
@@ -1506,7 +1502,6 @@ describe("cli: usage", () => {
         },
       });
       writeChatGptLogin(fixture.home, "acct_e2e");
-      // Times show in the local zone, fixed here at five and a half hours east of UTC.
       const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "codex-e2e-model", TZ: "IST-5:30" };
       try {
         const text = await runFx(["usage", "--period", "today"], { env });
@@ -1551,7 +1546,6 @@ describe("cli: usage", () => {
         grok: { billing: grokBillingBody(), settings: grokSettingsBody() },
       });
       writeGrokLogin(fixture.home, "acct_grok_e2e");
-      // Times show in the local zone; five and a half hours east, the reset moves to the next day.
       const env = { ...fixture.env, FX_PROVIDER: "grok", FX_MODEL: "grok-4.20", TZ: "IST-5:30" };
       try {
         const text = await runFx(["usage"], { env });
@@ -2167,7 +2161,6 @@ exit 99
   );
 });
 
-// The file backend is only selected off macOS, so these run on Linux CI.
 describe("cli: stored key file backend", () => {
   test.skipIf(platform() === "darwin")(
     "a 0600 key file resolves, and a loosened one is refused rather than reported absent",
@@ -2194,7 +2187,6 @@ describe("cli: stored key file backend", () => {
         expect(refused.code).toBe(0);
         const refusedJson = JSON.parse(refused.stdout);
         expect(refusedJson.auth).toBe("missing");
-        // Refusal must not read as absence.
         expect(refusedJson.auth_help).toContain("could not read the stored API key");
         expect(refusedJson.auth_help).not.toBe(MISSING_AUTH_MESSAGE);
 
@@ -2547,7 +2539,6 @@ describe("cli: sessions", () => {
           turns: ["review the landing page"],
         });
 
-        // Updated times show in the local zone, fixed here at five and a half hours east of UTC.
         const first = await runFx(["sessions"], {
           cwd: workspaceRoot,
           env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "IST-5:30" },
@@ -2613,12 +2604,10 @@ describe("cli: sessions", () => {
         const workspace = join(root, "workspace");
         mkdirSync(workspace);
         const workspaceRoot = realpathSync(workspace);
-        // 2023-07-10 14:40:00 UTC, during daylight saving time.
         writeConversationSession(home, workspaceRoot, "summer-session", {
           title: "Summer session",
           updatedAtMs: 1_689_000_000_000,
         });
-        // 2023-11-14 22:13:20.123 UTC, after daylight saving time ends.
         writeConversationSession(home, workspaceRoot, "winter-session", {
           title: "Winter session",
           updatedAtMs: 1_700_000_000_123,
@@ -3547,7 +3536,6 @@ describe("cli: models", () => {
     TIMEOUT,
   );
 
-  // Mirror the gateway's credential handling for private model catalogs.
   for (const scenario of [
     {
       name: "uses the anonymous public catalog without a credential",
@@ -4126,7 +4114,6 @@ describe("cli: ask success", () => {
           id: FAKE_GATEWAY_MODEL,
           type: "language",
           tags: ["tool-use"],
-          // Keep the stdin transport cases below the separate compaction threshold.
           context_window: 2_000_000,
           max_tokens: 16_384,
         }] },

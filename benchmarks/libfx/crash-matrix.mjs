@@ -1,40 +1,4 @@
 #!/usr/bin/env node
-// Crash matrix: kill a libfx process at every step of a turn and check what
-// the next process does.
-//
-// For each backend and workload, a worker child runs a committed setup turn,
-// saves a checkpoint, then runs the crash turn one step at a time: it prints
-// each step (prompt sent, each turn event, before and after each tool's side
-// effect) and waits for an ack on stdin. The parent kills it with SIGKILL at
-// step k instead of acking, then starts a restorer child. In "today" mode
-// the restorer does what a host can do without a journal: restore the last
-// checkpoint and send the stored prompt again. Side effects are counted from
-// a file, and each cell is checked by durable.mjs checkCrashCell. Failures
-// in "today" mode are recorded, not fatal, unless --require-clean is set.
-//
-// In "journal" mode the worker persists the session to a JSONL file through
-// `persistence`, with a step before and after each record lands, and saves
-// no checkpoint. The restorer opens the session from that file alone. It
-// calls `resume()` when the journal holds the crashed turn open, does nothing
-// when the turn was committed, and sends the prompt again only when no trace
-// of the turn reached the journal. Then it reopens the file once more. Two
-// more invariants apply: JournalFolds (every reopen succeeds) and
-// StartsWithDurableIntent (checked as each tool call starts).
-//
-// "world" mode is journal mode with the session in a world-local World,
-// through the persistence store in sdk/tests/world-persistence.mjs
-// (--world-root holds @workflow/world-local).
-//
-// --race (journal or world mode) holds the worker at step k instead of
-// killing it, runs the restorer while it waits, then releases it: a second
-// process takes the session over while the first is still alive. Two more
-// invariants apply: FencedNeverWrites (the released worker leaves the
-// session as the restorer left it) and SendRunsOnce over both processes.
-//
-// --inputs (journal or world mode) steers the crash turn and queues a
-// follow-up when its first tool runs, each acknowledgement a step of its
-// own. AckedAreDurable: an acknowledged steer or follow-up reaches the model
-// after the restore; PlacedOnce: neither reaches it twice.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,7 +19,6 @@ const options = parseArgs(process.argv.slice(2), {
   workloads: "no-tool,one-safe,one-send,list-then-read,write-then-read",
   dir: "",
   mode: "today",
-  // The Worlds libfx bundles, installed by `npm ci --prefix sdk/durable`.
   "world-root": fileURLToPath(new URL("../../sdk/durable/", import.meta.url)),
   race: false,
   inputs: false,
@@ -71,7 +34,6 @@ const setupTurns = 1;
 const steerText = "steer=keep";
 const followUpText = "workload=no-tool follow";
 
-// How often the steer and the follow-up reached the model in `prompt`.
 function inputCounts(prompt) {
   const users = prompt.filter((message) => message.role === "user").map(textOf);
   return {
@@ -80,7 +42,6 @@ function inputCounts(prompt) {
   };
 }
 
-// Runs every turn `resume()` hands back: the open turn, then held follow-ups.
 async function resumeAll(agent) {
   let first = null;
   for (let turn = agent.resume(); turn; turn = agent.resume()) {
@@ -103,20 +64,12 @@ else if (options.child === "restorer") await restorer();
 else if (options.child === "inspect") await inspect();
 else await parent();
 
-// Children: the effects live here (files, stdout, the agent).
-
 function intentStored(path, callId) {
   if (!existsSync(path) || !callId) return false;
   return readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line))
     .some((event) => event.type === "tool_intent" && event.data.some((call) => call.id === callId));
 }
 
-// A persistence store in a JSONL file, one event per line, so a kill leaves
-// whole lines. A record's cursor is the last seq it holds, and an append whose
-// `expected` cursor is not the file's last seq is fenced, so a process whose
-// session was taken over cannot interleave with the new one. `step` brackets
-// the write when the worker is stepping.
-// Declarations, not consts: the child roles run before this point.
 function readEvents(path) {
   const text = existsSync(path) ? readFileSync(path, "utf8") : "";
   return text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -147,8 +100,6 @@ function openWorld() {
   return createWorld({ dataDir: join(options.dir, "world"), recoverActiveRuns: false });
 }
 
-// world-local's queue teardown calls undici's Agent.close(), which Bun's
-// built-in undici lacks; only that known failure is skipped.
 async function closeWorld(world) {
   try {
     await world.close?.();
@@ -157,7 +108,6 @@ async function closeWorld(world) {
   }
 }
 
-// The events in one of the World store's record steps, or null.
 function recordStepEvents(request) {
   if (request?.eventData?.stepName !== "fx.record") return null;
   try {
@@ -168,8 +118,6 @@ function recordStepEvents(request) {
   }
 }
 
-// The World, with the same steps as fileStore around each record write.
-// libfx writes a session's records one at a time, in order.
 function steppedWorld(world, step) {
   const create = async (runId, request, params) => {
     const events = recordStepEvents(request);
@@ -186,16 +134,12 @@ function steppedWorld(world, step) {
   };
 }
 
-// Every journal event a World session holds: the records its store loads.
 async function worldEvents(world, runId) {
   const { journal = [] } = await worldPersistence(world, { runId }).load();
   return journal.flatMap((record) => recordEvents(record.data));
 }
 
 async function worker() {
-  // Steps can wait at the same time (a tool's effect and the turn's
-  // tool_start event). The parent acks in the order steps were printed, so
-  // waiters resolve first in, first out.
   const lines = createInterface({ input: process.stdin });
   let pendingAcks = 0;
   const waiters = [];
@@ -233,7 +177,6 @@ async function worker() {
   const run = async (name, _input, context) => {
     sendInputs();
     if (stepping) await step(`before_effect:${name}`);
-    // StartsWithDurableIntent: the journal already holds this call.
     const stored = worldMode
       ? (await worldEvents(world, agent.sessionId))
         .some((event) => event.type === "tool_intent" && event.data.some((call) => call.id === context?.executionId))
@@ -289,19 +232,16 @@ async function worker() {
     }
     await agent.close();
   } catch (error) {
-    // A worker released after a takeover (--race) stops on the fence.
     if (error?.cause?.code !== "FX_FENCED") throw error;
     process.stdout.write(`${JSON.stringify({ fenced: true })}\n`);
     await agent.close().catch(() => {});
   } finally {
     if (world) await closeWorld(world);
-    // The ack reader keeps stdin open; release it so the worker can exit.
     lines.close();
     process.stdin.destroy();
   }
 }
 
-// The session's journal as its contiguous events, for comparing two points.
 async function inspect() {
   let events;
   if (worldMode) {
@@ -348,9 +288,6 @@ async function restorer() {
     if (world) await closeWorld(world);
     return;
   }
-  // The setup turn is always committed. A second committed turn means the
-  // crashed turn finished before the kill; an open one is resumed.
-  // The setup turns, then the crash turn; a follow-up may have committed one more.
   const committedBeforeOpen = journaled && opened[0]?.turns >= setupTurns + 1;
   let result = { stopReason: "end_turn" };
   const resumed = journaled ? agent.resume() : null;
@@ -363,9 +300,7 @@ async function restorer() {
     result = await turn.result;
   }
   if (journaled) {
-    // Follow-ups the journal held run before the check.
     await resumeAll(agent);
-    // Every turn so far must reach the model; a check prompt shows them.
     const check = agent.prompt("workload=no-tool check");
     for await (const _ of check) {}
     await check.result;
@@ -394,14 +329,10 @@ async function restorer() {
   })}\n`);
 }
 
-// Parent: orchestration only.
-
 function runChild(role, settings) {
   return startChild(role, settings).done;
 }
 
-// `holdAt` leaves the child waiting at step k until `release()`, which acks
-// every step it printed meanwhile and every later one.
 function startChild(role, { backend, workload, dir, killAt = Infinity, holdAt = Infinity }) {
   const execArgs = !process.versions.bun && backend === "wasm" ? ["--experimental-wasm-jspi"] : [];
   const child = spawn(process.execPath, [...execArgs, scriptPath, "--child", role, "--mode", options.mode, "--world-root", options["world-root"], ...(options.inputs ? ["--inputs"] : []), "--backend", backend, "--workload", workload, "--dir", dir], {
@@ -456,7 +387,6 @@ function startChild(role, { backend, workload, dir, killAt = Infinity, holdAt = 
 async function parent() {
   const backends = listOption(options.backends);
   const workloads = listOption(options.workloads);
-  // Children get the JSPI flag themselves; the parent only orchestrates.
   for (const backend of backends) if (!new Set(["native", "wasm"]).has(backend)) throw new Error(`unknown backend: ${backend}`);
   for (const workload of workloads) if (!durableWorkloads[workload]) throw new Error(`unknown workload: ${workload}`);
 
@@ -471,8 +401,6 @@ async function parent() {
     violations_by_invariant: {},
     cells: 0,
     failing_cells: 0,
-    // Batching can make a run shorter than the clean one, so step k may not
-    // exist in it; such a cell tests nothing and is counted apart.
     skipped_cells: 0,
   };
   for (const backend of backends) {

@@ -543,8 +543,6 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(stdoutBeforeDecision.indexOf("\x1b[?1049l")).toBe(-1);
       const publishedBeforeApproval = stdoutBeforeDecision.slice(0, approvalEnter)
         .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").includes(marker);
-      // Complete blocks may publish before approval and be repainted as review
-      // context. Only text not yet published must stay out of the owned screen.
       if (!publishedBeforeApproval) {
         expect(stdoutBeforeDecision.slice(approvalEnter)
           .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")).not.toContain(marker);
@@ -1552,8 +1550,6 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       await session.sendKeys("C-o");
       await session.waitForText("full detail · ctrl+o close", TIMEOUT);
-      // Page to the tail of the second diff; the page count varies with
-      // session and network record height at the top of the transcript.
       let fullSecond = await session.capturePane();
       for (let page = 0; page < 24 && !fullSecond.includes("CTRL_O_SECOND_060"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "36", "7e"]);

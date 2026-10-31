@@ -1,7 +1,3 @@
-// In-memory ring buffer of recent gateway HTTP calls. Used by /trace
-// to surface latency / error patterns without forcing a persistent trace
-// log. Process-wide and lock-protected: callers do not need to plumb the
-// buffer through their context.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -284,14 +280,12 @@ test "turn rollups aggregate per turn and evict the coldest turn" {
     resetForTest();
     defer resetForTest();
 
-    // Three calls on turn 2 (one error, one subagent) and one on turn 9.
     record(.{ .duration_ms = 10, .started_at_ms = 1000, .turn_id = 2 });
     var failed: NetworkCall = .{ .duration_ms = 20, .started_at_ms = 2000, .turn_id = 2, .subagent_id = 7 };
     failed.setError("Timeout");
     record(failed);
     record(.{ .duration_ms = 30, .started_at_ms = 3000, .turn_id = 2 });
     record(.{ .duration_ms = 40, .started_at_ms = 4000, .turn_id = 9 });
-    // Untagged calls count toward lifetime only.
     record(.{ .duration_ms = 50, .started_at_ms = 5000 });
 
     var out: [turn_rollup_capacity]TurnRollup = undefined;
@@ -307,7 +301,6 @@ test "turn rollups aggregate per turn and evict the coldest turn" {
     try std.testing.expectEqual(@as(u32, 1), out[1].calls);
     try std.testing.expectEqual(@as(u64, 0), lifetimeStats().evicted_turns);
 
-    // Overflow the table: turn 2 and turn 9 must be evicted as the coldest.
     var t: u64 = 100;
     while (t < 100 + turn_rollup_capacity) : (t += 1) {
         record(.{ .duration_ms = 1, .started_at_ms = 6000, .turn_id = t });

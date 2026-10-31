@@ -798,7 +798,6 @@ describe("modern MCP Streamable HTTP", () => {
       }
       for (const source of [fixture, second]) {
         const reads = source.requests.filter((entry) => entry.message.method === "resources/read");
-        // Watching beta replaces the subscription and expires alpha; the final beta read stays cached.
         expect(reads.map((entry) => entry.message.params?.uri)).toEqual(["custom://alpha", "custom://beta", "custom://alpha"]);
         expect(reads[0].headers.authorization).toBe("Bearer shared-fixture-token");
       }

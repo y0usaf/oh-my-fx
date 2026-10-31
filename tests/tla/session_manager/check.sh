@@ -1,16 +1,4 @@
 #!/bin/sh
-# Model-check every session-manager spec with TLC.
-#
-# Needs Java 11+ and tla2tools.jar:
-#   brew install openjdk
-#   mkdir -p ~/.local/share/tla
-#   curl -fL -o ~/.local/share/tla/tla2tools.jar \
-#     https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
-#
-# Usage:
-#   ./check.sh                     # every spec
-#   ./check.sh SessionLog Fork     # selected specs
-#   TLA2TOOLS_JAR=/path/tla2tools.jar ./check.sh
 set -eu
 
 cd "$(dirname "$0")"
@@ -20,7 +8,6 @@ if [ ! -f "$jar" ]; then
     echo "tla2tools.jar not found at $jar (set TLA2TOOLS_JAR)" >&2
     exit 2
 fi
-# Prefer JAVA_HOME, then Homebrew's keg-only openjdk, then java on PATH.
 java=""
 for candidate in \
     "${JAVA_HOME:+$JAVA_HOME/bin/java}" \
@@ -39,17 +26,12 @@ fi
 
 all="SessionLog TurnLifecycle WriterLock ResumeSnapshot Fork Subagents Catalog Lifecycle Wiring MoveSideFiles V1Conversion"
 specs="${*:-$all}"
-# A new private folder per run for TLC state, so nothing planted in the temp
-# folder can redirect it. TLC prints to the terminal, so it is removed.
 work="$(mktemp -d "${TMPDIR:-/tmp}/session-manager-tlc.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 status=0
 for spec in $specs; do
     echo "== $spec"
-    # -deadlock: do not report states with no enabled action. Every spec is
-    # bounded (MaxLen, MaxLines, finite id sets), so terminal states are
-    # expected at the bound.
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
         -deadlock -workers auto -cleanup \
         -metadir "$work/$spec" \

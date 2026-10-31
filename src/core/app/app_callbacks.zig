@@ -603,12 +603,6 @@ pub fn Bindings(comptime App: type) type {
                                 }
                             }
                         } else if (comptime @hasField(App, "terminal_client") and @hasField(App, "managed_executions")) {
-                            // Terminal-session actions (interact, stop) carry no
-                            // command argument; their status line shows the launch
-                            // command resolved from the session registry, truncated
-                            // to the compact activity bound. Store the reflow-bound
-                            // display so group projection can reclip the phrase to
-                            // the live terminal width like any other command.
                             if (app.toolRegistry().lookup(started.tool_name)) |spec| {
                                 if (spec.executor_kind == .terminal) {
                                     const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
@@ -902,8 +896,6 @@ pub fn Bindings(comptime App: type) type {
         fn resolveSubagentModelOverride(ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
             const app: *App = @ptrCast(@alignCast(ctx.?));
             if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
-                // Wait out a still-loading catalog so early delegation does not
-                // skip matching. Only cancellation maps to passthrough.
                 _ = app.resolveModelCapabilitiesForRequest(raw_model) catch return .no_catalog;
             }
             if (comptime @hasDecl(App, "snapshotCachedModelIds")) {
@@ -924,7 +916,6 @@ pub fn Bindings(comptime App: type) type {
                 if (settings.fast_mode or settings.ultrafast_mode) {
                     if (app.worker.isCancelRequested()) return error.Cancelled;
                     app.ensureModelCache();
-                    // A host abort can settle the fetch before queued input reaches the worker.
                     app.cooperativeTransportPulse() catch |err| {
                         debug_trace.logf("gateway", "model catalog transport pulse failed err={s}", .{@errorName(err)});
                         return error.Cancelled;
@@ -1324,7 +1315,6 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentRestoreFailedPrompt(ctx: *anyopaque, prompt: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            // pushEvent copies the payload into the queue's ownership.
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .restore_failed_prompt = @constCast(prompt) });
         }
 
@@ -1514,9 +1504,6 @@ pub fn Bindings(comptime App: type) type {
                 provider_runtime.supported(App) and
                 @hasDecl(App, "modelCompletions"))
             {
-                // The Ctrl+P picker owns the borrowed composer while a draft
-                // is stashed; seeding the inline "/model " flow there would
-                // overwrite the catalog query or the effort and fast stages.
                 const InputRuntime = @TypeOf(app.input_runtime);
                 if (comptime @hasField(InputRuntime, "model_picker_draft")) {
                     if (app.input_runtime.model_picker_draft != null) return;
@@ -2269,7 +2256,6 @@ const SubagentWaitTestApp = struct {
 
         fn init() Host {
             var host: Host = .{ .runtime = undefined };
-            // Only the yielded list is read by the real pending predicate.
             host.runtime.yielded = .empty;
             return host;
         }
@@ -3068,7 +3054,6 @@ test "worker bridge model picker callback stays out of the borrowed composer" {
 
     try deps.open_model_picker(deps.ctx);
 
-    // The borrowed composer stays empty for the catalog menu's query box.
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
 }

@@ -1,4 +1,3 @@
-// Scenario contract for the MCP-v2 Bun driver.
 
 import type { Verdict } from "./bridge";
 

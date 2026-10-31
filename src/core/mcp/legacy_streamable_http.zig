@@ -271,8 +271,6 @@ pub const Client = struct {
     /// transport error, so the skip is otherwise unobservable.
     fn shouldTerminateSession(self: *const Client) bool {
         if (self.session_id == null) return false;
-        // The server answered 404 for this session id, so a DELETE would very
-        // likely 404 as well. Skip it rather than spend a request.
         return !self.session_retired.load(.acquire);
     }
 
@@ -731,9 +729,6 @@ fn postCore(alloc: Allocator, options: OperationOptions) !OperationResponse {
     const media_type = parseMediaType(content_type) orelse
         return error.UnsupportedContentType;
     if (media_type == .sse) {
-        // Legacy POST streams may remain open after this request's final
-        // response or fail while routing an interleaved event. Never let
-        // Request.deinit drain the long-lived stream on either path.
         request.connection.?.closing = true;
     }
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -830,8 +825,6 @@ fn resumeOnceCore(
         return error.MissingContentType;
     if (parseMediaType(content_type) != .sse) return error.UnsupportedContentType;
 
-    // Resumption GET streams may remain open after delivering this request's
-    // final response or fail while routing an interleaved event.
     request.connection.?.closing = true;
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -1456,8 +1449,6 @@ test "retiring an expired session keeps the id alive for in-flight requests" {
     const alloc = std.testing.allocator;
     const client = try testClientWithSession(alloc, "session-abc");
 
-    // Stand in for a request that is already past `acquireUse` and is using
-    // session_id as an outgoing header.
     try std.testing.expect(client.acquireUse());
     const in_flight = client.session_id.?;
 
@@ -1467,7 +1458,6 @@ test "retiring an expired session keeps the id alive for in-flight requests" {
     try std.testing.expectEqualStrings("session-abc", in_flight);
 
     client.releaseUse();
-    // deinit drains active_users before freeing, so it owns the free.
     client.deinit();
 }
 
@@ -1517,8 +1507,6 @@ test "deinit waits for an in-flight lease before it frees the session id" {
     client.retireExpiredSession();
     client.deinit();
 
-    // deinit must not have returned until the probe gave the lease back, and
-    // the id it was reading must have stayed valid for that whole window.
     try std.testing.expect(released.load(.acquire));
     try std.testing.expect(id_stayed_valid.load(.acquire));
     probe.join();
@@ -1551,7 +1539,6 @@ test "process-exit teardown skips the session DELETE that discard teardown sends
     exiting.deinitWithoutSessionTermination();
     try std.testing.expect(!try listenerHasPendingConnection(&listener));
 
-    // Nothing accepts, so this DELETE connects and then waits out its bound.
     const discarded = try testClientWithSession(alloc, "session-discard");
     discarded.url = url;
     discarded.deinit();
@@ -1562,7 +1549,6 @@ test "a retired session refuses new leases and skips the delete on teardown" {
     const alloc = std.testing.allocator;
     const client = try testClientWithSession(alloc, "session-xyz");
 
-    // A live session is still deleted on teardown; only retirement skips it.
     try std.testing.expect(client.shouldTerminateSession());
 
     client.retireExpiredSession();

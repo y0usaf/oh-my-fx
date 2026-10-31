@@ -41,7 +41,6 @@ pub var diff_removed_marker_style: []const u8 = "";
 pub var approval_button_active_style: []const u8 = shared_theme.fx_dark.approval_button_active_style;
 pub var approval_button_inactive_style: []const u8 = shared_theme.fx_dark.approval_button_inactive_style;
 pub var selected_completion_style: []const u8 = shared_theme.fx_dark.selected_completion_style;
-// Statusbar permissions "auto": a step brighter than the statusline gray.
 pub var permission_auto_style: []const u8 = shared_theme.fx_dark.permission_auto_style;
 var active_terminal_background: ?TerminalRgb = null;
 
@@ -51,9 +50,6 @@ pub fn setTruecolorSupport(enabled: bool) void {
     truecolor_enabled = enabled;
 }
 
-// A configured light|dark pin (FX_THEME or the settings "theme" key) locks the
-// variant. Custom themes keep the live monitor so terminal mode flips
-// re-resolve the theme pair without a restart.
 pub fn themeInputLocked() bool {
     return explicitThemeOverride() != null or shared_theme.variantPinned();
 }
@@ -89,8 +85,6 @@ pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
     selected_completion_style = theme.selected_completion_style;
     permission_auto_style = theme.permission_auto_style;
 
-    // Terminal-following defaults keep diff markers monochrome. An explicit
-    // light/dark pin or named theme enables its green/red marker colors.
     const theme_selected = shared_theme.variantPinned() or shared_theme.sourceName() != null;
     if (!theme_selected) {
         diff_added_marker_style = "";
@@ -113,7 +107,6 @@ pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
     return current.r != background.r or current.g != background.g or current.b != background.b;
 }
 
-// Explicit theme overrides skip OSC 11, leaving `rgb` null for fallback shading.
 pub const explicitThemeOverride = theme_detection.explicitThemeOverride;
 pub const explicitThemeName = theme_detection.explicitThemeName;
 pub const detectTheme = theme_detection.detectTheme;
@@ -319,8 +312,6 @@ fn composeWorkspaceIdentity(
         var end: usize = 0;
         if (statusline.git_branch) |branch| {
             if (branch.len > 0) {
-                // Below seven cells, showing fragments of both values is less
-                // useful than retaining the working-directory tail alone.
                 if (width_budget >= 7) {
                     const branch_width = display_width.visibleWidth(branch);
                     const max_branch_width = width_budget - 4;
@@ -742,8 +733,6 @@ test "terminal title writes the label to the caller's output file" {
     var sink = try tmp.dir.createFile(std.testing.io, "terminal-title.log", .{});
     defer sink.close(io_mod.getIo());
 
-    // A host that redirects its output keeps the escape sequence off the
-    // real stdout, which the Zig test runner owns as its protocol channel.
     terminalTitleFor(&sink).set("fx v" ++ build_options.app_version ++ " | fx");
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
@@ -797,7 +786,6 @@ pub fn formatResumeHandoff(
     sessions_v2: bool,
 ) ![]const u8 {
     const label = "Continue session with:";
-    // A v2 session resumes only with the flag that saved it.
     const command = if (sessions_v2) "fx --sessions-v2 --resume " else "fx --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
@@ -825,8 +813,6 @@ test "diff markers are monochrome by default and colored for selected themes" {
     try std.testing.expectEqualStrings("", diff_added_marker_style);
     try std.testing.expectEqualStrings("", diff_removed_marker_style);
 
-    // Explicit builtin pins are configured themes even though they use the
-    // same palette as the terminal-following default.
     shared_theme.setSource(null, true);
     initTheme(false, null);
     try std.testing.expectEqualStrings(shared_theme.fx_dark.diff_added_marker_truecolor, diff_added_marker_style);
@@ -836,8 +822,6 @@ test "diff markers are monochrome by default and colored for selected themes" {
     try std.testing.expectEqualStrings(shared_theme.fx_light.diff_added_marker_fallback, diff_added_marker_style);
     try std.testing.expectEqualStrings(shared_theme.fx_light.diff_removed_marker_fallback, diff_removed_marker_style);
 
-    // A named theme remains explicitly selected when its file is missing and
-    // startup falls back to the builtin variant.
     shared_theme.setSource("missing-light", false);
     initTheme(true, null);
     try std.testing.expectEqualStrings(shared_theme.fx_light.diff_added_marker_fallback, diff_added_marker_style);

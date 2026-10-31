@@ -63,7 +63,6 @@ async function collectTurn(agent, input) {
   return { events, result: await turn.result };
 }
 
-// tool_start carries the host tool's input object, in order, before tool_end.
 {
   const executions = [];
   const gateway = mockGateway([
@@ -103,7 +102,6 @@ async function collectTurn(agent, input) {
   await agent.close();
 }
 
-// Two tool calls in one turn keep their own inputs.
 {
   const gateway = mockGateway([
     [
@@ -131,8 +129,6 @@ async function collectTurn(agent, input) {
   await agent.close();
 }
 
-// An oversized input is truncated with a marker while the tool itself still
-// receives the complete arguments.
 {
   const huge = "x".repeat(128 * 1024);
   const executions = [];
@@ -168,8 +164,6 @@ async function collectTurn(agent, input) {
   await agent.close();
 }
 
-// Boundary: an input whose JSON is exactly the cap arrives whole; one byte
-// over is truncated. Non-ASCII previews stay valid UTF-8 within the byte cap.
 {
   const exactFit = { v: "x".repeat(64 * 1024 - JSON.stringify({ v: "" }).length) };
   assert.equal(encoded.encode(JSON.stringify(exactFit)).length, 64 * 1024);

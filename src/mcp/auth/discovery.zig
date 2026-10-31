@@ -9,8 +9,6 @@ const wire = @import("../protocol/wire.zig");
 
 const Allocator = std.mem.Allocator;
 
-// ---- Challenge ----
-
 pub const Challenge = struct {
     resource_metadata: ?[]const u8 = null,
     scope: ?[]const u8 = null,
@@ -36,7 +34,6 @@ pub fn parseChallenge(a: Allocator, value: []const u8) Allocator.Error!?Challeng
         while (j < value.len and isSpace(value[j])) j += 1;
         if (j < value.len and value[j] == '=' and name.len > 0) {
             j += 1;
-            // token68, such as base64 ending in "=": not a parameter.
             if (j == value.len or value[j] == '=' or value[j] == ',') {
                 while (j < value.len and value[j] == '=') j += 1;
                 i = j;
@@ -68,7 +65,6 @@ pub fn parseChallenge(a: Allocator, value: []const u8) Allocator.Error!?Challeng
                 c.insufficient_scope = std.mem.eql(u8, param, "insufficient_scope");
             }
         } else {
-            // A scheme name starts a challenge; only the first Bearer counts.
             bearer = !found and std.ascii.eqlIgnoreCase(name, "Bearer");
             found = found or bearer;
             if (name.len == 0) i += 1;
@@ -85,8 +81,6 @@ fn isSeparator(c: u8) bool {
 fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
-
-// ---- URLs ----
 
 pub const Url = struct {
     scheme: []const u8,
@@ -149,7 +143,6 @@ pub fn canonicalResource(a: Allocator, url: []const u8) (Allocator.Error || erro
     const out = try a.alloc(u8, u.origin.len + u.rest.len);
     _ = std.ascii.lowerString(out[0..u.origin.len], u.origin);
     var rest = u.rest;
-    // The trailing slash of the path, before any query.
     const q = std.mem.findScalar(u8, rest, '?') orelse rest.len;
     var n = u.origin.len;
     if (q > 0 and rest[q - 1] == '/') {
@@ -242,7 +235,6 @@ fn isInternal(host: []const u8) bool {
         (ip[0] == 169 and ip[1] == 254) or (ip[0] == 172 and ip[1] >= 16 and ip[1] <= 31) or
         (ip[0] == 192 and ip[1] == 168) or (ip[0] == 198 and (ip[1] == 18 or ip[1] == 19)) or ip[0] >= 224;
     if (std.mem.findScalar(u8, host, ':') == null) return false;
-    // IPv6: unspecified, unique local (fc00::/7), link-local (fe80::/10).
     if (std.mem.eql(u8, host, "::")) return true;
     if (host.len >= 2 and (std.ascii.toLower(host[0]) == 'f') and (std.ascii.toLower(host[1]) == 'c' or std.ascii.toLower(host[1]) == 'd')) return true;
     return host.len >= 3 and std.ascii.startsWithIgnoreCase(host, "fe") and std.mem.findScalar(u8, "89abAB", host[2]) != null;
@@ -259,8 +251,6 @@ fn ipv4(host: []const u8) ?[4]u8 {
     }
     return if (n == 4) out else null;
 }
-
-// ---- Documents ----
 
 pub const ResourceMetadata = struct {
     resource: []const u8,
@@ -340,8 +330,6 @@ fn endpoint(a: Allocator, raw: []const u8) DocumentError![]const u8 {
     return url;
 }
 
-// ---------------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "reads the Bearer challenge among others, quoted or not" {
@@ -359,7 +347,6 @@ test "reads the Bearer challenge among others, quoted or not" {
     try testing.expectEqual(@as(?Challenge, null), try parseChallenge(a, "Basic realm=\"x\""));
     const bare = (try parseChallenge(a, "Bearer")).?;
     try testing.expectEqual(@as(?[]const u8, null), bare.scope);
-    // Parameters of a later scheme aren't the Bearer challenge's.
     const later = (try parseChallenge(a, "Bearer scope=\"a\", DPoP scope=\"b\"")).?;
     try testing.expectEqualStrings("a", later.scope.?);
 }
@@ -389,7 +376,6 @@ test "metadata URLs in the spec's order" {
     try testing.expectEqualStrings("https://x.com/custom/meta.json", prm[0]);
     try testing.expectEqualStrings("https://x.com/.well-known/oauth-protected-resource/public/mcp", prm[1]);
     try testing.expectEqualStrings("https://x.com/.well-known/oauth-protected-resource", prm[2]);
-    // Another origin's metadata URL is ignored; a server at the root has one candidate.
     const root = try resourceMetadataUrls(a, "https://x.com/", "https://evil.example.com/meta");
     try testing.expectEqual(@as(usize, 1), root.len);
     const pathed = try serverMetadataUrls(a, "https://auth.example.com/tenant1");
@@ -431,7 +417,6 @@ test "reads and checks both metadata documents" {
     const m = try parseServerMetadata(a, ok, "https://auth.x.com");
     try testing.expect(m.iss_supported and !m.cimd_supported);
     try testing.expectEqualStrings("https://auth.x.com/register", m.registration_endpoint.?);
-    // The issuer is compared as a string: a trailing slash is another issuer.
     try testing.expectError(error.IssuerMismatch, parseServerMetadata(a, ok, "https://auth.x.com/"));
     try testing.expectError(error.NoPkce, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"https://a/x\",\"token_endpoint\":\"https://a/t\"}", "https://a"));
     try testing.expectError(error.NoPkce, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"https://a/x\",\"token_endpoint\":\"https://a/t\",\"code_challenge_methods_supported\":[\"plain\"]}", "https://a"));

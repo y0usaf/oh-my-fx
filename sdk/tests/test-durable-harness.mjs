@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// The durable libfx harnesses: their pure core on plain data, then a small
-// run of each driver (benchmarks/libfx/bench-durable.mjs, bench-parallel.mjs,
-// crash-matrix.mjs) on both backends.
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -24,8 +21,6 @@ import {
   turnNumber,
   turnStartIndex,
 } from "../../benchmarks/libfx/durable.mjs";
-
-// The pure core, on plain data.
 
 const user = (text) => ({ role: "user", content: [{ type: "text", text }] });
 const steer = (text) => user(`<user_steering>${text}</user_steering>`);
@@ -107,8 +102,6 @@ assert.equal(todayAdapterWrites(0).awaited, 1);
 assert.equal(todayAdapterWrites(2).awaited, 9);
 assert.equal(toolCallsIn(durableWorkloads["write-then-read"]), 2);
 
-// The drivers, small runs on both backends.
-
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const runtimeArgs = (backend) => (!process.versions.bun && backend === "wasm" ? ["--experimental-wasm-jspi"] : []);
 const run = (script, args, backend) => {
@@ -143,8 +136,6 @@ for (const backend of ["native", "wasm"]) {
     assert.ok(cell.killed, `step ${cell.k} was a real SIGKILL`);
     assert.ok(cell.completed && cell.rememberedSetup, `step ${cell.k}: restore finished the turn and kept history`);
   }
-  // With persistence, no crash step may run send_email twice or lose the
-  // setup turn.
   const journaled = run("crash-matrix.mjs", ["--backends", backend, "--workloads", "one-send", "--mode", "journal", "--require-clean"], backend);
   assert.ok(journaled.cells >= 5, "one cell per crash step");
   assert.equal(journaled.failing_cells, 0, `journal crash matrix on ${backend}`);

@@ -184,9 +184,6 @@ fn collectFinalityNominations(
         const identity = entry_tool_identities.get(entry_id) orelse continue;
         const turn = turn_nominations.get(identity.turn_id).?;
         if (turn.selected_entry_id != entry_id) continue;
-        // A later assistant entry closes a concrete group once all of its
-        // tools are terminal. Any subsequent tool start after visible text
-        // receives a new presentation-group identity.
         if (assistant_tail_entry_id != null and
             turn.selected_group_id != null and
             turn.selected_group_terminal)
@@ -817,8 +814,6 @@ pub const RetentionRebase = struct {
             const identity = self.before.line_provenance[probe];
             if (identity != .entry) continue;
             const range = self.retained_ranges.get(identity.entry) orelse {
-                // Skip the entire absent entry, not a retained-document scan for
-                // each of its old rendered rows.
                 while (probe + 1 < self.before.line_provenance.len and
                     std.meta.eql(self.before.line_provenance[probe + 1], identity)) : (probe += 1)
                 {}
@@ -1284,10 +1279,6 @@ fn prepareTranscriptSourceInternal(
         errdefer tool_turn_floors.deinit(alloc);
         for (finality_nominations.items, 0..) |nomination, index| {
             const floor_byte = finality_entry_floor_bytes[index] orelse blk: {
-                // An empty assistant tail contributes no mutable rendered
-                // bytes, so the complete prepared flow is final. Other empty
-                // nominations remain conservative because their state may
-                // still mutate an earlier rendered entry.
                 const fallback = switch (nomination.kind) {
                     .assistant_tail => bytes.len,
                     .mutation_pin, .tool_turn => 0,

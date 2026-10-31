@@ -98,9 +98,6 @@ pub const Storage = struct {
         const parent_path = std.Io.Dir.path.dirname(path) orelse ".";
         const name = std.Io.Dir.path.basename(path);
         const cwd = Io.Dir.cwd();
-        // Missing parents are the manager's own folders, so private too, for
-        // example `~/.fx/sessions` on a machine that never ran v1 (D19).
-        // Existing ones are left as they are.
         _ = cwd.createDirPathStatus(s.io, parent_path, .fromMode(folder_mode)) catch |err| return translate(err);
         var parent = cwd.openDir(s.io, parent_path, .{}) catch |err| return translate(err);
         defer parent.close(s.io);
@@ -416,9 +413,6 @@ fn translate(err: anyerror) Error {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 
 fn testRoot(tmp: *testing.TmpDir) Dir {
@@ -433,7 +427,6 @@ test "an I/O failure keeps its OS cause, and only unknown ones become Io (D29)" 
     try testing.expectEqual(error.ReadOnlyFileSystem, ioFault(translate(error.ReadOnlyFileSystem)));
     try testing.expectEqual(error.FileTooBig, ioFault(translate(error.FileTooBig)));
     try testing.expectEqual(error.Io, ioFault(translate(error.InputOutput)));
-    // Classified once, it stays classified through every layer above.
     inline for (.{ error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig, error.Io }) |kind| {
         try testing.expectEqual(kind, ioFault(ioFault(kind)));
     }
@@ -478,8 +471,6 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
     const s: Storage = .{ .io = io };
     const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
-    // Like `~/.fx/sessions/v2` where neither parent exists yet: all three
-    // folders are created private.
     const root_path = try std.Io.Dir.path.join(testing.allocator, &.{ base, "a", "sessions", "v2" });
     defer testing.allocator.free(root_path);
     const root = try s.openRoot(root_path);
@@ -513,12 +504,10 @@ test "symlinks under the root are refused" {
 
     try testing.expectError(error.Refused, s.openDir(root, "dir_link"));
     try testing.expectError(error.Refused, s.openFile(root, "file_link", .read_write));
-    // Exclusive create never writes through a symlink.
     try testing.expectError(error.AlreadyExists, s.createFile(root, "file_link"));
     const kept = try tmp.dir.readFileAlloc(io, "secret", testing.allocator, .limited(16));
     defer testing.allocator.free(kept);
     try testing.expectEqualStrings("keep", kept);
-    // A folder where a file is expected is refused too.
     try testing.expectError(error.Refused, s.openFile(root, "elsewhere", .read_only));
 }
 

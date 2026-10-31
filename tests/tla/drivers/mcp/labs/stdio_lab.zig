@@ -138,7 +138,6 @@ fn writeFields(w: *wire.Writer, object: []const u8) !void {
             try w.field(key);
             try w.raw(object[start..scanner.cursor]);
         },
-        // Keys written with escapes aren't needed by any script.
         else => return error.Usage,
     };
 }
@@ -215,14 +214,11 @@ const Lab = struct {
             .ready => |version| {
                 lab.process.setEra(if (version == .legacy) .legacy else .modern) catch {};
                 try lab.print("era", .{ .ready = lab.versionName(version) });
-                // The catalog starts over for each new process, once its era is known.
                 const generation = lab.process.conn.generation;
                 if (lab.catalog_generation != generation) {
                     lab.catalog_generation = generation;
                     try lab.stepCatalog(.{ .process_started = if (version == .legacy) .legacy else .modern });
                 }
-                // SUBS-05: the listens a process exit ended go out again
-                // once the new process's era is known.
                 if (!lab.subs.up) try lab.stepSubs(.transport_up);
             },
             .failed => |failure| try lab.print("era", .{ .failed = @tagName(failure) }),
@@ -243,7 +239,6 @@ const Lab = struct {
         for (out.effects()) |effect| switch (effect) {
             .send_page => {
                 lab.list_id = try lab.sendOperation(.list);
-                // Never written (the table refused it): the page failed.
                 if (lab.list_id == null and lab.catalog.pending != .none) try lab.stepCatalog(.page_failed);
             },
             .discard_pages => lab.store.discard(),
@@ -363,9 +358,7 @@ const Lab = struct {
             },
             .acknowledged => |a| try lab.print("sub", .{ .sub = a.sub, .acknowledged = a.filter }),
             .ended => |e| try lab.print("sub", .{ .sub = e.sub, .ended = @tagName(e.end) }),
-            // SUBS-04: on stdio a cancel is notifications/cancelled.
             .cancel_listen => |id| try lab.stepRequest(.{ .cancel_requested = id }),
-            // On stdio the listens go out when the process is back instead.
             .arm_retry => {},
             .relisten => |sub| try lab.sendListen(sub, lab.subs.subs[sub].asked, true),
         };
@@ -421,15 +414,12 @@ const Lab = struct {
         var lost: ?request.Id = null;
         for (out.effects()) |effect| switch (effect) {
             .write_request => |w| lab.sendEncoded(.request, w.id) catch {
-                // Not written (the connection isn't running): the request is lost.
                 lost = w.id;
             },
             .send_cancel => |id| lab.sendEncoded(.notification, id) catch {},
             .deliver => |d| {
                 if (d.id < max_ids) lab.outcomes[d.id] = d.outcome;
                 try lab.print("outcome", .{ .id = d.id, .outcome = @tagName(d.outcome) });
-                // Answers are classified where they arrive; here only a
-                // detection request that ended without one.
                 const unanswered = d.outcome != .result and d.outcome != .peer_error;
                 if (lab.detection) |pending| if (pending.id == d.id and unanswered) {
                     lab.detection = null;
@@ -440,7 +430,6 @@ const Lab = struct {
                     try lab.stepCatalog(.page_failed);
                 }
                 if (unanswered and d.id < max_ids) lab.call_ids.unset(d.id);
-                // SUBS-03: a server's notifications/cancelled ended a listen.
                 if (d.outcome == .ended) try lab.stepSubs(.{ .final = .{ .id = d.id, .end = .server_cancelled } });
             },
             .arm_timer => |a| {
@@ -501,16 +490,13 @@ const Lab = struct {
                         } });
                         try lab.eraAnswer(id, r.body);
                         try lab.catalogAnswer(id, r.body);
-                        // A result ends a listen gracefully, an error refuses it.
                         if (id < max_ids and lab.listen_ids.isSet(id)) try lab.stepSubs(.{ .final = .{ .id = id, .end = if (r.body == .result) .result else .refused } });
                     } else if (r.body == .failure and lab.detector.pending == .discover) {
-                        // An error without an id during the probe means a legacy server.
                         _ = try lab.stepEra(.legacy_answer);
                     },
                     .notification => |n| if (std.mem.eql(u8, n.method, "notifications/cancelled")) {
                         if (subscriptions.cancelledId(n.params)) |id| try lab.stepRequest(.{ .server_cancel_received = id });
                     } else if (subscriptions.subscriptionId(n.params)) |sid| switch (subscriptions.notice(n.method, n.params)) {
-                        // SUBS-02: on stdio the subscriptionId is the only way to tell them apart.
                         .acknowledged => |f| try lab.stepSubs(.{ .acknowledged = .{ .id = sid, .filter = f } }),
                         .changed => |kind| try lab.stepSubs(.{ .notified = .{ .id = sid, .kind = kind } }),
                         .other => {},
@@ -521,7 +507,6 @@ const Lab = struct {
                         const value = std.fmt.parseFloat(f64, found[1] orelse return) catch return;
                         try lab.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
                     } else if (std.mem.eql(u8, n.method, "notifications/tools/list_changed")) {
-                        // Invalidates everything cached for the server.
                         try lab.stepCatalog(.invalidated);
                     },
                     .request => {},
@@ -533,10 +518,8 @@ const Lab = struct {
                 try lab.print("seen", .{ .state = @tagName(c.state), .lost = c.lost });
                 if (c.lost) {
                     for (lab.table.slots) |slot| if (slot.used) try lab.stepRequest(.{ .transport_lost = slot.id });
-                    // SUBS-05: the exit ends every listen.
                     if (lab.subs.up) try lab.stepSubs(.transport_down);
                 }
-                // A subscription waiting to listen again is demand.
                 if (c.state == .idle and lab.subs.waiting()) lab.process.start() catch {};
             },
             .timeout => {},
@@ -567,7 +550,6 @@ const Lab = struct {
                 }
             } else p += 1;
         }
-        // Fire every request timer that is due.
         var i: usize = 0;
         while (i < lab.timer_count) {
             if (lab.timers[i].due_ms <= lab.now()) {

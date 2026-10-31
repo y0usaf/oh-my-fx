@@ -816,8 +816,6 @@ pub noinline fn composePickerOptionRowAnnotated(
     if (width_usize == 0 or start_col == 0 or start_col > width) return row;
 
     if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
-    // Model, provider, and model-catalog pickers signal selection by
-    // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
@@ -1380,8 +1378,6 @@ fn composeSlashMenuRow(
     errdefer row.deinit(alloc);
     if (width == 0) return row;
 
-    // Selection is signaled by brightness alone (like the model picker); no
-    // caret marker. The two-column indent stays fixed so rows stay aligned.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try row.appendSlice(alloc, "  ");
 
@@ -1575,7 +1571,6 @@ test "file picker grows to ten rows while five transcript rows stay visible" {
     try std.testing.expectEqual(@as(u16, 10), filePickerReservedRows(40, 0, 0));
     try std.testing.expectEqual(@as(u16, 10), filePickerReservedRows(24, 0, 0));
     try std.testing.expectEqual(@as(u16, 8), filePickerReservedRows(18, 0, 0));
-    // Short terminals keep the list picker's height.
     try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(16, 0, 0));
     try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(12, 0, 0));
     try std.testing.expectEqual(@as(u16, 1), filePickerReservedRows(6, 0, 0));

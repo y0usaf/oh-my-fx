@@ -111,8 +111,6 @@ pub const UpgradeRelaunch = struct {
     }
 };
 
-// The one resume alias that asks which session to open. Every other spelling
-// names its target, so it resumes without a prompt.
 const resume_picker_alias = "-r";
 
 pub const ResumeTarget = union(enum) {
@@ -916,8 +914,6 @@ fn activateProviderSelectionFallible(
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse @as(model_provider.ProviderId, .gateway)).eql(target);
-    // A selected provider without a persisted model still needs one chosen
-    // below; FX_MODEL only covers a single run, so it does not count here.
     const has_persisted_model = if (config_runtime.selectProviderModel(cfg.default_model, &settings, target, null)) |_| true else |_| false;
     if (caller == .provider_command and already_selected and has_persisted_model and
         (cfg.auth_mode == .host_managed or prepared_credential != null))
@@ -1116,7 +1112,6 @@ fn runNonInteractiveWithDeps(
         return .handled_success;
     }
 
-    // MCP-v2's verbs print their own help, and pass `-h` after `--` to the server.
     if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| if (kind != .mcp or !mcp_host.selected()) {
         const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, kind);
         defer alloc.free(text);
@@ -1182,7 +1177,6 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
-            // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
@@ -1213,7 +1207,6 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
-            // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
@@ -1732,8 +1725,6 @@ fn runNonInteractiveWithDeps(
                     try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                     return .handled_failure;
                 };
-                // It moves v1 sessions into the experimental store, where
-                // plain fx would no longer find them.
                 if (!sessions_v2) {
                     try writeLookupFailure(alloc, deps, "sessions", error.SessionsV2Required, format);
                     return .handled_failure;
@@ -1876,7 +1867,6 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return .handled_failure;
             };
-            // A relative $HOME counts as unset, as everywhere else in fx.
             const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
             if (!std.Io.Dir.path.isAbsolute(home)) {
                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
@@ -2162,9 +2152,6 @@ fn readMaskedKeyDefault(
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
-                // toOwnedSlice shrinks through realloc, which may move the buffer
-                // and free the original without zeroing it. Copy out and wipe the
-                // source so no unzeroed key is left behind in freed memory.
                 const owned = try alloc.dupe(u8, input.items);
                 secret.zeroAndFree(alloc, input.allocatedSlice());
                 input = .empty;
@@ -3316,7 +3303,6 @@ const sessions_v2_required_message = "sessions convert moves v1 sessions into th
 /// `fx sessions convert`: converts every v1 session v2 does not hold yet,
 /// and fails when it skipped any (D61).
 fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {
-    // Each conversion is traced (`[convert]`), as an open's is.
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     debug_trace.configureFromEnv(alloc, workspace_root);

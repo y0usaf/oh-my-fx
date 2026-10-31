@@ -201,7 +201,6 @@ pub const Session = struct {
                 if (s.listen != .none) s.listen = .off;
                 out.push(.post_initialized);
                 s.record(if (a.session) "init_answered_with_id" else "init_answered_without_id", 0, from, out);
-                // The client actions this enables, taken at once.
                 for (s.requests) |*r| if (r.used and r.state == .queued) s.post(r, out);
                 s.openListen(out);
             },
@@ -218,7 +217,6 @@ pub const Session = struct {
                 const r = s.find(e.id) orelse return error.UnknownRequest;
                 if (r.state != .posted and r.state != .resuming) return s.ignore("event", e.id, out);
                 if (e.retry_ms) |ms| r.retry_ms = ms;
-                // A `retry` alone is no event id: nothing the model sees changes.
                 if (!e.has_id) return;
                 r.has_event = true;
                 s.record("event", e.id, s.phase, out);
@@ -247,7 +245,6 @@ pub const Session = struct {
             .expired => |id| {
                 const r = s.find(id) orelse return error.UnknownRequest;
                 if (r.state != .posted and r.state != .resuming) return s.ignore("expired", id, out);
-                // A 404 without a session id is a plain failure.
                 if (r.session == 0) {
                     s.end(r, if (r.state == .posted) .failed else .lost, out);
                     return s.record("refused", id, s.phase, out);
@@ -262,8 +259,6 @@ pub const Session = struct {
                 }
                 s.sawEnd(r.session, out);
                 s.record("expired", id, from, out);
-                // A 404 for an older session starts no new one, so the request
-                // goes out again in the current session right away.
                 if (r.state == .queued and s.phase == .ready) s.post(r, out);
             },
             .resume_due => |id| {
@@ -292,8 +287,6 @@ pub const Session = struct {
                 if (s.listen != .open) return s.ignore("listen_broke", 0, out);
                 s.listen = .waiting;
                 s.record("listen_broke", 0, s.phase, out);
-                // Give up after too many reconnects in a row; the model
-                // never forces ListenDue.
                 if (s.listen_attempts < s.config.max_listen_attempts) {
                     const backoff = request.reconnectDelay(s.listen_attempts);
                     out.push(.{ .arm_listen = retry orelse backoff });
@@ -318,8 +311,6 @@ pub const Session = struct {
             .close => {
                 if (s.phase != .start and s.phase != .initializing and s.phase != .ready) return s.ignore("close", 0, out);
                 const from = s.phase;
-                // A 404 for the current session always starts a new one, so a
-                // ready session's id is live.
                 s.deleted = s.phase == .ready and s.sid != 0;
                 if (s.deleted) out.push(.delete);
                 s.phase = .closed;
@@ -434,11 +425,6 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, out: *const Outpu
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests. Each property of the model is checked after every step of every
-// event sequence to a small depth, against a test server that only does what
-// the model's server may do.
-
 const testing = std.testing;
 
 /// What the model's ghosts and server know, kept beside the core.
@@ -472,17 +458,16 @@ const World = struct {
         var seen: u32 = 0;
         for (w.seen_end, 0..) |b, i| if (b) {
             seen += 1;
-            try testing.expect(w.server_ended[i]); // SeenOnlyEnded
+            try testing.expect(w.server_ended[i]);
         };
-        try testing.expect(w.inits <= 1 + seen); // OneInitPerEnd
-        try testing.expect(!w.sent_closed); // NothingAfterClose
-        try testing.expect(!w.listen_after_405); // ListenRespects405
-        if (s.deleted) try testing.expect(s.phase == .closed and s.sid != 0 and !w.seen_end[s.sid]); // DeleteOnlyLive
+        try testing.expect(w.inits <= 1 + seen);
+        try testing.expect(!w.sent_closed);
+        try testing.expect(!w.listen_after_405);
+        if (s.deleted) try testing.expect(s.phase == .closed and s.sid != 0 and !w.seen_end[s.sid]);
         for (s.requests) |r| if (r.used) {
-            try testing.expect(r.posts <= 2 and (r.posts < 2 or r.after_404)); // NoReplayOfLostPost
-            if (r.state == .broken or r.state == .resuming) try testing.expect(r.has_event and r.resumes <= s.config.max_resumes); // ResumeAfterEventId
+            try testing.expect(r.posts <= 2 and (r.posts < 2 or r.after_404));
+            if (r.state == .broken or r.state == .resuming) try testing.expect(r.has_event and r.resumes <= s.config.max_resumes);
         };
-        // ResumeSameSession: a resume goes out only for the current session.
         for (out.effects()) |e| if (e == .get_resume) try testing.expectEqual(s.sid, s.requests[0..][indexOf(s, e.get_resume)].session);
     }
 };
@@ -568,7 +553,6 @@ test "every event sequence to depth 5 keeps the model's invariants" {
     var slots: [2]Request = undefined;
     const s: Session = .init(&slots, .{ .max_resumes = 1 });
     try explore(s, slots, .{}, 5, false);
-    // Again, with the server ending each session as soon as it exists.
     try explore(s, slots, .{}, 5, true);
 }
 
@@ -594,12 +578,10 @@ test "a 404 re-initializes once and re-sends only the requests that got it" {
     _ = try steps(&s, &.{ .start, .{ .initialize_answered = .{ .session = true } }, .{ .send = 1 }, .{ .send = 2 } });
     var out = try steps(&s, &.{.{ .expired = 1 }});
     try testing.expectEqualSlices(Effect, &.{.post_initialize}, out.effects());
-    // The second 404 of the same session starts nothing more.
     out = try steps(&s, &.{.{ .expired = 2 }});
     try testing.expectEqual(@as(usize, 0), out.effects().len);
     out = try steps(&s, &.{.{ .initialize_answered = .{ .session = true } }});
     try testing.expectEqualSlices(Effect, &.{ .post_initialized, .{ .post = 1 }, .{ .post = 2 } }, out.effects());
-    // A second 404 for a re-sent request fails it: no loop.
     out = try steps(&s, &.{.{ .expired = 1 }});
     try testing.expectEqual(Effect{ .deliver = .{ .id = 1, .outcome = .failed } }, out.effects()[0]);
 }
@@ -608,7 +590,6 @@ test "a 404 for an older session re-sends at once in the current one, without a 
     var slots: [2]Request = undefined;
     var s: Session = .init(&slots, .{ .listen = false });
     _ = try steps(&s, &.{ .start, .{ .initialize_answered = .{ .session = true } }, .{ .send = 1 }, .{ .send = 2 }, .{ .expired = 1 }, .{ .initialize_answered = .{ .session = true } } });
-    // Request 2 went out in session 1, which ended.
     const out = try steps(&s, &.{.{ .expired = 2 }});
     try testing.expectEqualSlices(Effect, &.{.{ .post = 2 }}, out.effects());
     try testing.expectEqual(@as(u32, 2), s.find(2).?.session);
@@ -623,7 +604,6 @@ test "a broken stream resumes after its event id and retry, and is lost without 
     try testing.expectEqualSlices(Effect, &.{.{ .arm_resume = .{ .id = 1, .after_ms = 500 } }}, out.effects());
     out = try steps(&s, &.{.{ .resume_due = 1 }});
     try testing.expectEqualSlices(Effect, &.{.{ .get_resume = 1 }}, out.effects());
-    // A `retry` without an id is no event id: the stream is lost, not re-POSTed.
     out = try steps(&s, &.{ .{ .event_seen = .{ .id = 2, .has_id = false, .retry_ms = 10 } }, .{ .broke = 2 } });
     try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .id = 2, .outcome = .lost } }}, out.effects());
 }
@@ -674,7 +654,6 @@ test "close deletes a live session once and sends nothing after" {
     try testing.expectEqualSlices(Effect, &.{ .delete, .{ .deliver = .{ .id = 1, .outcome = .cancelled } } }, out.effects());
     out = try steps(&s, &.{.{ .send = 2 }});
     try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .id = 2, .outcome = .failed } }}, out.effects());
-    // No session id, or one that ended: no DELETE.
     var t: Session = .init(&slots, .{ .listen = false });
     _ = try steps(&t, &.{ .start, .{ .initialize_answered = .{ .session = true } }, .{ .send = 1 }, .{ .expired = 1 } });
     out = try steps(&t, &.{.close});

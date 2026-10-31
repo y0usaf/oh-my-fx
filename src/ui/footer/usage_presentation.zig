@@ -77,8 +77,6 @@ const Line = union(enum) {
 
 const max_lines = 40;
 
-// ---------------------------------------------------------------- layout
-
 fn listedModels(p: Projection) []const ModelRow {
     const s = p.snapshot orelse return &.{};
     return s.of(p.period).models;
@@ -131,8 +129,6 @@ pub fn showsTables(p: Projection) bool {
 
 /// Rows of the main view above the model rows.
 fn tableRows(p: Projection) usize {
-    // heading, blank, period header + 3 rows, blank, [budget header + row,
-    // blank], model header.
     return 2 + 4 + 1 + (if (hasBudget(p)) @as(usize, 3) else 0) + 1;
 }
 
@@ -311,8 +307,6 @@ pub fn composeRow(alloc: Allocator, p: Projection, row_index: u16, visible_rows:
     };
 }
 
-// ----------------------------------------------------------------- cells
-
 const Cell = struct {
     text: []const u8,
     width: usize,
@@ -381,8 +375,6 @@ fn safeText(buf: []u8, text: []const u8) []const u8 {
     return buf[0..out];
 }
 
-// ---------------------------------------------------------------- heading
-
 /// `usage: <who>` on the left; the status ("updated 2m ago", "updating…",
 /// a failure) in the right corner. A narrow terminal shortens the left part
 /// first and drops the status only when even a short name would not fit.
@@ -405,7 +397,6 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
     if (show_status) {
         const used = prefix_width + display_width.visibleWidth(row.items[left_start..]);
         try row.appendNTimes(alloc, ' ', limit - used - status_width);
-        // A failure reads in normal weight; routine freshness stays dim.
         const failed = if (p.snapshot) |snap| snap.status == .failed else false;
         if (failed) {
             try row.appendSlice(alloc, status);
@@ -511,8 +502,6 @@ fn noModelsText(period: Period) []const u8 {
     };
 }
 
-// ---------------------------------------------------------------- period
-
 const period_header = [_]Cell{
     .{ .text = "period", .width = 8, .left = true },
     .{ .text = "spent", .width = 11 },
@@ -533,8 +522,6 @@ fn composePeriodRow(alloc: Allocator, p: Projection, period: Period, limit: usiz
     };
     return composeCells(alloc, &cells, .data, "", limit);
 }
-
-// ---------------------------------------------------------------- budget
 
 const BudgetColumns = enum { full, no_resets, small };
 
@@ -601,8 +588,6 @@ fn shortDay(buf: []u8, day: i64) []const u8 {
     return std.mem.print(buf, "{s} {d}", .{ months[md.month - 1], md.day }) catch "";
 }
 
-// ----------------------------------------------------------------- models
-
 const ModelColumns = enum { full, no_share, small };
 
 const ModelLayout = struct {
@@ -626,7 +611,6 @@ fn modelLayout(p: Projection, limit: usize) ModelLayout {
     var header_buf: [24]u8 = undefined;
     var name_width = display_width.visibleWidth(modelHeaderText(&header_buf, p.period));
     var safe_buf: [256]u8 = undefined;
-    // Measure what is drawn: control bytes are shown as `?`.
     for (listedModels(p)) |model| name_width = @max(name_width, display_width.visibleWidth(safeText(&safe_buf, model.model)));
     const room = limit -| gutter;
     for ([_]ModelColumns{ .full, .no_share, .small }) |columns| {
@@ -744,8 +728,6 @@ fn composeMoreRow(alloc: Allocator, p: Projection, first: usize, limit: usize) !
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
-
-// ----------------------------------------------------------------- detail
 
 fn selectedName(p: Projection) ?[]const u8 {
     const models = listedModels(p);
@@ -874,8 +856,6 @@ fn composePerfRow(alloc: Allocator, p: Projection, period: Period, limit: usize)
     return composeCells(alloc, &cells, .data, "", limit);
 }
 
-// ------------------------------------------------------------------ codex
-
 const CodexWindow = struct {
     limit: *const usage.codex.Limit,
     window: usage.codex.Window,
@@ -978,8 +958,6 @@ fn composeCodexLimitRow(alloc: Allocator, p: Projection, index: usize, limit: us
     return composeCells(alloc, &cells, .data, "", limit);
 }
 
-// ------------------------------------------------------------------- grok
-
 fn grokUsage(p: Projection) ?usage.grok.Usage {
     const s = p.snapshot orelse return null;
     return s.grok_usage;
@@ -992,7 +970,7 @@ const GrokSections = struct {
 };
 
 fn grokRows(sections: GrokSections) usize {
-    var rows: usize = 2 + 2; // heading, blank; plan header and row
+    var rows: usize = 2 + 2;
     if (sections.note) rows += 2;
     if (sections.limit) rows += 3;
     if (sections.products > 0) rows += 2 + sections.products;
@@ -1044,7 +1022,6 @@ fn composeGrokLimitRow(alloc: Allocator, p: Projection, limit: usize) !std.Array
             .weekly => "7d",
             .monthly => "month",
         } else "-", .width = 6 },
-        // Floored, as Grok truncates it.
         .{ .text = std.mem.print(&used_buf, "{d:.0}%", .{@floor(u.used_percent orelse 0)}) catch "-", .width = 7 },
         .{ .text = "", .width = 2 },
         .{ .text = if (u.resets_at_ms) |at| resetsIn(&resets_buf, at - p.snapshot.?.now_ms) else "-", .width = 10, .left = true },
@@ -1139,9 +1116,6 @@ fn composeGrokPlanRow(alloc: Allocator, p: Projection, limit: usize) !std.ArrayL
     return composeCells(alloc, &cells, .data, "", limit);
 }
 
-// Codex activity: tokens by period, usage by model and by surface, and the
-// account's records and habits.
-
 const CodexSpan = enum {
     today,
     days_7,
@@ -1215,7 +1189,7 @@ fn codexMostModels(p: Projection) usize {
 
 /// Rows the Codex view takes with `sections`.
 fn codexRows(p: Projection, sections: CodexSections) usize {
-    var rows: usize = 2 + 2; // heading, blank; plan header and row
+    var rows: usize = 2 + 2;
     if (codexProfile(p) != null) rows += 1 + CodexSpan.all.len + 1;
     if (sections.model_table) rows += 1 + sections.model_rows + 1;
     if (sections.where) rows += 3;
@@ -1368,7 +1342,6 @@ fn composeCodexModelMore(alloc: Allocator, p: Projection, shares: []const Share,
 
 fn codexEmptyText(period: Period) []const u8 {
     return switch (period) {
-        // ChatGPT reports days late, so an empty period may still fill in.
         .today => "no Codex usage reported today",
         .days_7 => "no Codex usage reported in the last 7 days",
         .month => "no Codex usage reported this month",
@@ -1555,8 +1528,6 @@ fn resetsIn(buf: []u8, ms: i64) []const u8 {
     return std.mem.print(buf, "in {d}d {d}h", .{ m / (24 * 60), (m % (24 * 60)) / 60 }) catch "-";
 }
 
-// ----------------------------------------------------------------- format
-
 fn shareOf(part: f64, whole: f64) ?f64 {
     if (whole <= 0) return null;
     return part / whole * 100;
@@ -1623,10 +1594,6 @@ fn compact(buf: *[16]u8, value: u64) []const u8 {
     return std.mem.print(buf, "{d}", .{value}) catch "";
 }
 
-// ---------------------------------------------------------------------------
-// Tests: every layout is drawn through the VT emulator at terminal widths
-// from 40 to 240 columns and read back from the grid.
-
 const testing = std.testing;
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -1668,7 +1635,6 @@ fn sumOf(rows: []const ModelRow) usage.report.Totals {
 fn testView(period: Period, rows: []const ModelRow, budget: bool) !usage.View {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     errdefer arena.deinit();
-    // Allocate before the arena is copied into the result.
     const models = try arena.allocator().dupe(ModelRow, rows);
     return .{
         .arena = arena,
@@ -1737,7 +1703,6 @@ fn draw(p: Projection, width: u16, visible_rows: u16) !Screen {
     while (index < rows) : (index += 1) {
         var r = try composeRow(alloc, p, index, rows, width);
         defer r.deinit(alloc);
-        // A row never passes the terminal width, or the VT would wrap it.
         try testing.expect(display_width.visibleWidthIgnoringAnsi(r.items) <= width);
         var cursor_buf: [32]u8 = undefined;
         try grid.feed(try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{index + 1}));
@@ -1770,13 +1735,11 @@ test "the df view lines its numbers up under the headers at every width" {
     for (test_widths) |width| {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
-        // The label on the left, the freshness in the right corner.
         try testing.expect(std.mem.startsWith(u8, screen.row(0), "usage: acme-de"));
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
         try testing.expectEqual(@as(usize, width), display_width.visibleWidth(screen.row(0)));
         try testing.expectEqual(width >= 61, std.mem.find(u8, screen.row(0), "acme-design-tools-platform (fx login)") != null);
 
-        // Period table: numbers end where their headers end.
         try testing.expectEqualStrings("period        spent  requests  tokens", screen.row(2));
         const spent_end = endColumn(screen.row(2), "spent").?;
         try testing.expectEqual(spent_end, endColumn(screen.row(3), "$6,576.24").?);
@@ -1784,17 +1747,14 @@ test "the df view lines its numbers up under the headers at every width" {
         try testing.expectEqual(endColumn(screen.row(2), "requests").?, endColumn(screen.row(5), "49,923").?);
         try testing.expect(std.mem.startsWith(u8, screen.row(4), "7d "));
 
-        // Budget table, with fewer columns as the terminal narrows.
         const budget = screen.find("budget").?;
         try testing.expectEqual(endColumn(screen.row(budget), "use%").?, endColumn(screen.row(budget + 1), "21%").?);
         try testing.expectEqual(width >= 55, std.mem.find(u8, screen.row(budget + 1), "nov 1") != null);
         try testing.expectEqual(width >= 47, std.mem.find(u8, screen.row(budget), "size") != null);
 
-        // Model table: the current model carries the marker.
         const header = screen.find("model (month)").?;
         try testing.expect(std.mem.startsWith(u8, screen.row(header + 1), "❯ anthropi"));
         try testing.expect(std.mem.startsWith(u8, screen.row(header + 2), "  openai/g"));
-        // Names stay whole once the longest fits beside spent and requests.
         try testing.expectEqual(width >= gutter + 42 + modelColumnsWidth(.small), screen.find("google/gemini-3.1-flash-lite-image-preview") != null);
         const model_spent = endColumn(screen.row(header), "spent").?;
         try testing.expectEqual(model_spent, endColumn(screen.row(header + 1), "$6,551.12").?);
@@ -1807,21 +1767,17 @@ test "the df view stays content-sized on wide terminals and drops columns on nar
     defer snapshot.deinit();
     const p: Projection = .{ .active = true, .snapshot = &snapshot };
 
-    // The longest name (42 columns) plus the four number columns.
     const content_width = gutter + 42 + modelColumnsWidth(.full);
     var at_100 = try draw(p, 100, 40);
     defer at_100.deinit();
     var at_240 = try draw(p, 240, 40);
     defer at_240.deinit();
-    // Only the heading spans the terminal, to put the status in the corner.
     try testing.expectEqual(content_width, at_100.widestFrom(1));
     try testing.expectEqual(content_width, at_240.widestFrom(1));
     for (1..at_100.count) |i| try testing.expectEqualStrings(at_100.row(i), at_240.row(i));
     try testing.expect(std.mem.endsWith(u8, at_240.row(0), "updated 2m ago"));
     try testing.expectEqual(@as(usize, 240), display_width.visibleWidth(at_240.row(0)));
 
-    // 80 columns: no room for share beside a 42-column name. 72: tokens go
-    // too. The names stay whole in both.
     var at_80 = try draw(p, 80, 40);
     defer at_80.deinit();
     const h80 = at_80.row(at_80.find("model (month)").?);
@@ -1832,7 +1788,6 @@ test "the df view stays content-sized on wide terminals and drops columns on nar
     const h72 = at_72.row(at_72.find("model (month)").?);
     try testing.expect(std.mem.find(u8, h72, "tokens") == null and std.mem.find(u8, h72, "requests") != null);
     try testing.expect(at_72.find("google/gemini-3.1-flash-lite-image-preview") != null);
-    // 40 columns: the long name is clipped in the middle, never wrapped.
     var at_40 = try draw(p, 40, 40);
     defer at_40.deinit();
     try testing.expect(at_40.find("google/gemini-3.1-flash-lite-image-preview") == null);
@@ -1843,7 +1798,6 @@ test "the df view stays content-sized on wide terminals and drops columns on nar
 test "the detail screen shows one model across today, 7d and month" {
     var snapshot = try testSnapshot(.ready, true, &month_models);
     defer snapshot.deinit();
-    // gpt-6.1-sol is listed today; gemini only in 7d and month.
     const p: Projection = .{ .active = true, .snapshot = &snapshot, .detail = true, .selected_model = 3 };
     for (test_widths) |width| {
         var screen = try draw(p, width, 40);
@@ -1856,7 +1810,6 @@ test "the detail screen shows one model across today, 7d and month" {
         } else {
             try testing.expect(std.mem.startsWith(u8, screen.row(2), "period        spent   share  requests"));
         }
-        // Not used today: dashes, aligned under the headers.
         try testing.expect(std.mem.startsWith(u8, screen.row(3), "today"));
         try testing.expectEqual(endColumn(screen.row(2), "spent").?, endColumn(screen.row(3), "-").?);
         try testing.expectEqual(endColumn(screen.row(2), "spent").?, endColumn(screen.row(5), "$9.80").?);
@@ -1864,7 +1817,6 @@ test "the detail screen shows one model across today, 7d and month" {
         const tokens = screen.find("tokens ").?;
         const wide = width >= 62;
         try testing.expectEqual(wide, std.mem.find(u8, screen.row(tokens), "cache write") != null);
-        // The narrow token table needs 48 columns for its last column.
         try testing.expectEqual(!wide and width >= cellsWidth(&tokens_header_narrow), std.mem.find(u8, screen.row(tokens), "cache wr") != null and std.mem.find(u8, screen.row(tokens), "cache write") == null);
         const perf = screen.find("perf").?;
         try testing.expectEqual(endColumn(screen.row(perf), "cache hit").?, endColumn(screen.row(perf + 3), "95.4%").?);
@@ -1888,11 +1840,9 @@ test "the model list scrolls and sums what is below the window" {
     defer screen.deinit();
     try testing.expect(screen.find("provider/m09") != null);
     try testing.expect(screen.find("provider/m10") == null);
-    // m10 through m24: 15 models, $90 down to $76.
     const more = screen.row(screen.find("15 more").?);
     try testing.expect(std.mem.find(u8, more, "$1,245.00") != null);
 
-    // Fewer rows than wanted: the window shrinks, the "more" line stays.
     var short = try draw(p, 80, @intCast(tableRows(p) + 4));
     defer short.deinit();
     try testing.expect(short.find("provider/m02") != null and short.find("provider/m03") == null);
@@ -1926,7 +1876,6 @@ test "states without numbers say so in one line" {
     try testing.expect(std.mem.endsWith(u8, first.row(0), "fetching…"));
     try testing.expectEqual(@as(usize, 80), display_width.visibleWidth(first.row(0)));
 
-    // Signed in, numbers fetched, nothing used today.
     var empty_today = try testSnapshot(.ready, false, &month_models);
     defer empty_today.deinit();
     empty_today.views[0].deinit();
@@ -1945,7 +1894,6 @@ test "the current model is bold and colorless in every theme" {
     var row = try composeRow(alloc, p, @intCast(tableRows(p)), 40, 120);
     defer row.deinit(alloc);
     try testing.expect(std.mem.startsWith(u8, row.items, ui_render.bold_style ++ "❯ "));
-    // No foreground or background color code anywhere in the row.
     try testing.expect(std.mem.find(u8, row.items, "[3") == null);
     try testing.expect(std.mem.find(u8, row.items, "[4") == null);
     try testing.expect(std.mem.find(u8, row.items, ";3") == null);
@@ -2139,7 +2087,6 @@ test "the Codex view lines up under its headers at every width" {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
         try testing.expectEqual(@as(usize, 30), screen.count);
-        // The name shortens before the status drops on narrow terminals.
         const full_heading = "usage: codex (ChatGPT), samdoe";
         try testing.expect(std.mem.startsWith(u8, screen.row(0), if (width >= full_heading.len + 2 + "updated 2m ago".len) full_heading else "usage: codex"));
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
@@ -2147,7 +2094,6 @@ test "the Codex view lines up under its headers at every width" {
         try testing.expectEqualStrings("today          39.9M", screen.row(3));
         try testing.expectEqualStrings("lifetime      315.7B", screen.row(6));
 
-        // Models: every one listed, largest first, ties by name.
         const models = screen.row(8);
         try testing.expect(std.mem.startsWith(u8, models, "model (month)"));
         const expected = [_]struct { []const u8, []const u8, []const u8 }{
@@ -2169,7 +2115,6 @@ test "the Codex view lines up under its headers at every width" {
         }
         try testing.expect(screen.find("more") == null);
 
-        // Surfaces: one row, under their names.
         const where = screen.row(19);
         try testing.expect(std.mem.startsWith(u8, where, "where (month)"));
         try testing.expectEqual(endColumn(where, "cli").?, endColumn(screen.row(20), "76.7%").?);
@@ -2208,7 +2153,6 @@ test "Tab changes the Codex model and surface numbers without moving any row or 
         var screen = try draw(.{ .active = true, .period = period, .snapshot = &snapshot }, 80, 40);
         defer screen.deinit();
         try testing.expectEqual(month.count, screen.count);
-        // Every table starts on the same row, and the columns stay put.
         for ([_][]const u8{ "where (", "record", "habits", "plan" }) |table| {
             try testing.expectEqual(month.find(table).?, screen.find(table).?);
         }
@@ -2226,9 +2170,7 @@ test "Tab changes the Codex model and surface numbers without moving any row or 
     try testing.expectEqual(endColumn(models, "share").?, endColumn(today.row(10), "41.2%").?);
     try testing.expect(std.mem.startsWith(u8, today.row(11), "gpt-6-luna"));
     try testing.expectEqual(endColumn(models, "share").?, endColumn(today.row(11), "<0.1%").?);
-    // The rest of the reserved rows stay blank.
     for (12..18) |i| try testing.expectEqualStrings("", today.row(i));
-    // The surface columns keep the month's order; today's numbers fill them.
     const where = today.row(19);
     try testing.expect(std.mem.startsWith(u8, where, "where (today)"));
     try testing.expect(startColumn(where, "cli").? < startColumn(where, "desktop app").?);
@@ -2274,13 +2216,11 @@ test "a short Codex terminal drops habits, records, surfaces, then scrolls the m
     try testing.expect(no_record.find("record") == null and no_record.find("where (") != null);
     try testing.expectEqualStrings(plan_row, no_record.row(23));
 
-    // Every model still fits once the surfaces go.
     var no_where = try draw(p, 80, 21);
     defer no_where.deinit();
     try testing.expect(no_where.find("where (") == null and no_where.find("more") == null);
     try testing.expectEqualStrings(plan_row, no_where.row(20));
 
-    // Three rows left: two models and a row pointing down to the rest.
     var scrolls = try draw(p, 80, 15);
     defer scrolls.deinit();
     try testing.expectEqual(@as(usize, 2), visibleModelItems(p, 15));
@@ -2289,15 +2229,12 @@ test "a short Codex terminal drops habits, records, surfaces, then scrolls the m
     try testing.expect(std.mem.startsWith(u8, scrolls.row(11), "↓ 7 more"));
     try testing.expectEqualStrings(plan_row, scrolls.row(14));
 
-    // Scrolled to the end, the row points back up; a window past the end is
-    // pulled back.
     var bottom = try draw(.{ .active = true, .model_window_start = 40, .snapshot = &snapshot }, 80, 15);
     defer bottom.deinit();
     try testing.expect(std.mem.startsWith(u8, bottom.row(9), "gpt-6-sol"));
     try testing.expect(std.mem.startsWith(u8, bottom.row(10), "gpt-6-luna"));
     try testing.expect(std.mem.startsWith(u8, bottom.row(11), "↑ 7 more"));
 
-    // Today's three models fit the same three rows: nothing moves.
     var today = try draw(.{ .active = true, .period = .today, .snapshot = &snapshot }, 80, 15);
     defer today.deinit();
     try testing.expect(today.find("more") == null);
@@ -2336,7 +2273,6 @@ test "a Grok plan shows its period's use, products, credits and pay-as-you-go" {
         try testing.expect(std.mem.startsWith(u8, screen.row(0), "usage: grok (xAI)"));
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
 
-        // The limit: the week, floored as Grok reports it, and its reset.
         const limit = screen.row(2);
         try testing.expect(std.mem.startsWith(u8, limit, "limit"));
         const row = screen.row(3);
@@ -2355,8 +2291,6 @@ test "a Grok plan shows its period's use, products, credits and pay-as-you-go" {
         try testing.expect(std.mem.startsWith(u8, plan, "plan"));
         try testing.expect(std.mem.startsWith(u8, screen.row(10), "SuperGrok Heavy"));
         try testing.expectEqual(endColumn(plan, "credits").?, endColumn(screen.row(10), "$12.50").?);
-        // Pay-as-you-go needs 47 columns here; narrower drops header and
-        // value together.
         if (width >= 47) {
             try testing.expectEqual(startColumn(plan, "pay as you go").?, startColumn(screen.row(10), "$3.00 of $100.00").?);
         } else {
@@ -2386,7 +2320,6 @@ test "a Grok plan without billing data or managed by a team says so instead" {
     try testing.expectEqualStrings("  usage is managed by your team: https://console.x.ai/team/usage", managed_screen.row(2));
     try testing.expect(managed_screen.find("limit") == null and managed_screen.find("product") == null);
 
-    // Settings that turn pay-as-you-go off win over a leftover cap.
     var off_value = test_grok;
     off_value.settings = .{ .plan = "SuperGrok", .on_demand_enabled = false };
     var off = try grokSnapshot(.ready, off_value);

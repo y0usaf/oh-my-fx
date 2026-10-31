@@ -77,7 +77,6 @@ test "selection scrolls only past the picker's own row count" {
     advanceSelectionWithin(&index, &start, 30, 1, rows);
     try std.testing.expectEqual(@as(usize, 10), index);
     try std.testing.expectEqual(@as(usize, 1), start);
-    // Other pickers keep six rows.
     index = 0;
     start = 0;
     for (0..6) |_| advanceSelection(&index, &start, 30, 1);

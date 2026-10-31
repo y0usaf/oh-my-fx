@@ -37,7 +37,6 @@ const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
 
-// A parent disable caps resumed children too; durable child opt-ins cannot bypass it.
 fn childUltrafastMode(parent_requested: bool, child_preference: bool) bool {
     return parent_requested and child_preference;
 }
@@ -442,8 +441,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        // v2 keeps no paused-response checkpoint (D31), so a v2 child, like
-        // a v2 root, offers the orchestrator no place to save one.
         .recovery_checkpoint = switch (context.turn.loaded) {
             .v1 => .{
                 .set = setRecoveryCheckpoint,
@@ -478,11 +475,6 @@ fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabili
 fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (context.cancel.load(.seq_cst)) return error.Cancelled;
-    // Prefer the host's shared resolver: it waits for the provider catalog and
-    // merges the loaded model cache, so gateway-hosted children resolve the
-    // same capabilities as the parent. The provider bundle's synchronous
-    // lookup is empty for providers that only fetch asynchronously (gateway),
-    // which previously left every gateway child at "unknown" support.
     if (context.config.tool_context.model_capability_resolver) |resolver| {
         return resolver.resolve(arena, model);
     }

@@ -497,7 +497,6 @@ fn answerField(
     return .{ .value = result };
 }
 
-// These local actions never share a namespace with server-supplied values.
 const CompactAction = union(enum) {
     value: ?[]const u8,
     decline,
@@ -858,8 +857,6 @@ fn validateNumberAnswer(
         else => false,
     };
     if (!valid) return error.InvalidAnswer;
-    // Constraint and integer checks run immediately afterward in the pure
-    // elicitation core, which retains the original JSON number lexeme.
     return alloc.dupe(u8, trimmed);
 }
 
@@ -942,8 +939,6 @@ fn answerUrl(
     if (!std.mem.eql(u8, answer, "Open URL")) return error.InvalidAnswer;
 
     if (try options.browser.open(alloc, url)) {
-        // Accept records consent only. The originating MCP operation decides
-        // completion when it is retried with this response.
         return alloc.dupe(u8, "{\"action\":\"accept\"}");
     }
 
@@ -1510,8 +1505,6 @@ fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
         .browser = fixture.browser(),
         .capabilities = .{ .form = true },
     }) catch |err| switch (err) {
-        // These boundaries deliberately hide allocator errors. In this
-        // allocation harness, their only injected failure is OutOfMemory.
         error.QuestionFailed, error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };

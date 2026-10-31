@@ -74,9 +74,6 @@ function log(message) {
   }
 }
 
-// By default the elicitation capability must appear only on requests that
-// can elicit, as v1 sends it. FX_MCP_SPEC_CLIENT=1 also accepts a client that
-// declares the same capabilities on every request, as the spec allows.
 const specClient = process.env.FX_MCP_SPEC_CLIENT === "1";
 
 function elicitationCapabilities() {
@@ -179,7 +176,6 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
-    // Answer with output fx must reject; the process itself stays up.
     if (mode === "startup_garbage") {
       process.stdout.write("Server started on stdio\n");
       return;
@@ -605,7 +601,6 @@ function handle(message) {
     }
     if (mode === "crash_always") process.exit(42);
     if (mode === "exit_after_result") {
-      // Answer, then exit so the next call finds the connection already closed.
       const result = {
         jsonrpc: "2.0",
         id: message.id,
@@ -794,7 +789,6 @@ function handle(message) {
                 params,
               },
             },
-            // The spec's requestState is a string; v1 also takes an object.
             requestState: specClient ? "opaque" : { fixture: "opaque" },
           },
         });

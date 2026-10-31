@@ -145,7 +145,6 @@ pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]con
     while (true) {
         var token = try nextToken(&scanner);
         if (token == .object_end) break;
-        // A key with escapes arrives in pieces; the last piece is a string.
         var escaped = false;
         const key = while (true) : (token = try nextToken(&scanner)) switch (token) {
             .string => |piece| break piece,
@@ -222,7 +221,6 @@ pub const Fields = struct {
             if ((try nextToken(&f.scanner)) != .end_of_document) return error.InvalidJson;
             return null;
         }
-        // A key with escapes arrives in pieces; the last piece is a string.
         while (token != .string) token = try nextToken(&f.scanner);
         const key_end = f.scanner.cursor;
         const quote = std.mem.findScalarPos(u8, f.object, before, '"') orelse return error.InvalidJson;
@@ -333,7 +331,6 @@ fn failureOf(raw: []const u8) DecodeError!Failure {
     const code_raw = found[0] orelse return error.InvalidErrorObject;
     const message = found[1] orelse return error.InvalidErrorObject;
     if (message[0] != '"') return error.InvalidErrorObject;
-    // Error codes are integers; the scanner has already checked the syntax.
     const value = std.fmt.parseInt(i64, code_raw, 10) catch return error.InvalidErrorObject;
     return .{ .code = value, .message = message, .data = found[2] };
 }
@@ -541,7 +538,6 @@ test "decodes errors, including the spec's unsupported-version example" {
 }
 
 test "a key written with escapes never matches a field" {
-    // The scanner splits this key into pieces, and the last one is "id".
     const message = try decode("{\"jsonrpc\":\"2.0\",\"x\\u0000id\":5,\"id\":1,\"result\":{}}");
     try testing.expectEqual(@as(?RequestId, 1), message.response.id);
 }

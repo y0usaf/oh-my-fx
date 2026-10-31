@@ -1,8 +1,3 @@
-// An app's own World handed to libfx through `world()`, as an app with
-// Workflow's Postgres World would: the test builds and starts world-local
-// itself, libfx never starts or closes it, and `closeAppWorlds()` closes
-// them after the agents. `local()` supplies the lease settings libfx needs
-// for a World on this machine.
 import { local } from "../durable/local.mjs";
 import { world } from "../durable/world.mjs";
 

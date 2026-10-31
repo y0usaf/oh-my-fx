@@ -168,8 +168,6 @@ async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<
   while (Date.now() < deadline) {
     const fresh = traceReports(root).filter(name => !before.has(name));
     if (fresh.length > 0) {
-      // The filename becomes visible between create and the content write, so
-      // wait for the report's closing section before reading.
       const path = join(traceTmpDir(root), fresh[fresh.length - 1]);
       const content = readFileSync(path, "utf8");
       if (content.includes("## Transcript Timeline")) return content;
@@ -227,8 +225,6 @@ test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was gener
     await tui.sendText("refactor the renderer loop to fix the crash");
     await tui.waitForText("MAIN_ANSWER_OK", 20000);
 
-    // The title task finishes right after the fake gateway responds, but there
-    // is no visible signal for a failed title, so retry while it is running.
     const deadline = Date.now() + 20_000;
     let report = "";
     while (Date.now() < deadline) {
@@ -293,13 +289,10 @@ test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes 
       },
     });
     await tui.waitForStableComposer(15000);
-    // No prompt before the relaunch: the session stays pristine and untitled.
     await tui.waitForText("update ready: ctrl+g to reload", 60_000);
     await tui.sendHexBytes(["07"]);
     await tui.waitForStableComposer(15000);
 
-    // Pin the resume leg: the relaunch must resume the same session, not start
-    // a fresh one (a fresh session would title on the first prompt anyway).
     const sessionId = readdirSync(join(root.home, ".fx", "sessions"))
       .filter(name => name !== "latest")[0]!;
     const relaunchArgv = readFileSync(argvLogPath, "utf8").trim().split("\n");

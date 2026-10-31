@@ -17,7 +17,6 @@ pub const Transport = struct {
     status_fn: *const fn (?*anyopaque, i32, *u16) i32,
     next_fn: *const fn (?*anyopaque, i32, []u8) i32,
     close_fn: *const fn (?*anyopaque, i32) void,
-    // Optional logical-completion signal, independent of HTTP EOF or close.
     consumed_fn: ?*const fn (?*anyopaque, i32) void = null,
 
     fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
@@ -166,8 +165,6 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     defer transport.close(opened.handle);
     if (opened.status != .ok) {
         const body = try readErrorBody(alloc, transport, opened.handle, request);
-        // Gateway reports the last provider it tried, so a provider's size
-        // rejection can arrive as a 400 from a later fallback.
         const kind = failureKind(opened.status);
         const size_rejected = kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body);
         return .{ .failed = .{
@@ -713,7 +710,6 @@ test "a key quoted in a gateway error never reaches the failure detail" {
             .credential = .{ .direct = .{ .secret_bytes = key } },
             .expected = "{\"detail\":\"bad credential Bearer *****************\"}",
         },
-        // An escaped copy decodes to the key, so it is masked once decoded.
         .{
             .body = "{\"detail\":\"\\u0067w-key-0123456789\"}",
             .credential = .{ .direct = .{ .secret_bytes = key } },
@@ -724,7 +720,6 @@ test "a key quoted in a gateway error never reaches the failure detail" {
             .credential = .{ .direct = .{ .secret_bytes = key } },
             .expected = "rejected *****************",
         },
-        // A host-managed request carries no key here; the host masks its own.
         .{
             .body = "{\"detail\":\"bad credential Bearer " ++ key ++ "\"}",
             .credential = .host_managed,

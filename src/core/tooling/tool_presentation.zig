@@ -106,7 +106,6 @@ fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
     var buffer: [124]u8 = undefined;
     var len: usize = 0;
     var pending_space = false;
-    // Bound scanning even when a large request contains only whitespace.
     const source = raw[0..text_utils.utf8BackwardBoundary(raw, @min(raw.len, 16 * 1024))];
     for (source) |byte| {
         if (std.ascii.isWhitespace(byte)) {
@@ -816,9 +815,6 @@ fn isCapturedCommandCall(
     call: ToolCall,
     args: std.json.ObjectMap,
 ) bool {
-    // Historical sessions retain their original tool name. Presentation may
-    // interpret those records, but execution remains unavailable because the
-    // registry no longer contains a `run_command` tool.
     if (std.mem.eql(u8, call.name, "run_command")) return true;
     const tool = registry.lookup(call.name) orelse return false;
     if (tool.executor_kind == .run_command) return true;

@@ -68,7 +68,6 @@ pub const Sink = struct {
 };
 
 pub const Observer = struct {
-    // One observer per worker execution, including a resumed execution.
     sink: Sink,
     /// Execution-local ordinals, never debug counters or durable operation IDs.
     step_index: std.atomic.Value(usize) = .init(0),

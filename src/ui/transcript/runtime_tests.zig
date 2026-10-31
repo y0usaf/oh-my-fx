@@ -1976,8 +1976,6 @@ test "semantic notice append and replacement preserve ownership identity and tim
     try std.testing.expectEqualStrings("replacement body with /tmp/output/path", runtime.entries.items[0].semantic_notice.body);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, runtime.entries.items[0].semantic_notice.visibility);
     try std.testing.expectEqualStrings("", runtime.transcript.items);
-    // The finished replacement clears the pending-replacement pin, making
-    // the entry immutable history: a second in-place replacement is refused.
     try std.testing.expect(!runtime.entries.items[0].semantic_notice.pending_replacement);
     try std.testing.expectError(
         error.MissingNoticeReplacementPin,
@@ -8705,8 +8703,6 @@ test "command output consolidation preserves committed prompt scrollback anchor"
         const text = try std.mem.print(&line, "assistant table row {d}\n", .{index + 1});
         try first_assistant.text.appendSlice(alloc, text);
     }
-    // The assistant content above is complete; report producer closure so
-    // the finality floor does not hold the tail.
     runtime.transcript_release = runtime.transcript_release.with_assistant_tail_writable(false);
 
     var live_source = try runtime.prepareTranscriptSource(alloc, null);
@@ -8779,8 +8775,6 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     defer compact_prepared.deinit(alloc);
     const facts = runtime.planTranscriptScroll(&compact_prepared);
     try std.testing.expect(facts.target_visual_offset > facts.source_visual_offset);
-    // The intervening recorded write rebases the committed prompt/assistant
-    // prefix before the new table is admitted, so release can start here.
     try std.testing.expect(facts.source_compatible);
     try std.testing.expect(!facts.recovery_rebase);
     try std.testing.expect(facts.semantic_rows > 0);
@@ -8793,7 +8787,6 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     try std.testing.expect(runtime.transcriptCommitDiagnostic().history_visual_offset > history_before_release);
     try std.testing.expect(runtime.transcriptCommitDiagnostic().history_visual_offset - history_before_release <= facts.semantic_rows);
 
-    // This fixture settles in that release; a repeated frame must be quiet.
     var settle_source = try runtime.prepareTranscriptSource(alloc, null);
     defer settle_source.deinit(alloc);
     var settle_prepared = try prepareTestSourceForCurrentArea(
@@ -10367,8 +10360,6 @@ test "recorded assistant stream slow path preserves a canonical anchor when rete
         committed_prepared.cursor.cursor_col,
         1,
     );
-    // The synthetic anchor helper does not seal a source. Supply the same
-    // entry identity as a real sealed frame before exercising retention.
     runtime.transcript_commit_state.stable.retention_identity = try @import("source_preparation.zig").RetentionIdentity.capture(&runtime, alloc, &committed_source);
     try committed_source.ensureLineIndex(alloc);
     const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
@@ -10793,7 +10784,6 @@ test "streamAssistantChunk opens a new assistant_turn after a user_turn" {
 
 test "appendUserTurnOwned frees text, images, and image slices when entries.append OOMs" {
     const base = testing_allocator.no_resize;
-    // Fail after all transferred slices exist, when the entries list first grows.
     var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = 4 });
     const alloc = failing.allocator();
 
@@ -14550,7 +14540,6 @@ test "visual epoch retains command output blocks and detail associations" {
             null,
         );
         defer alloc.free(full);
-        // The row renders styled; assert on the command text inside it.
         try std.testing.expect(std.mem.find(u8, full, "true") != null);
         try std.testing.expect(std.mem.find(u8, full, "retained command result") != null);
     }
@@ -14578,7 +14567,6 @@ test "transcript lifecycle identity updates are idempotent and atomic" {
         "read_file",
         runtime.toolActivityRecord(provisional_id).?.tool_name.?,
     );
-    // Force record-map growth so stale pointers fail deterministically.
     inline for ([_][]const u8{ "alias", "target", "fill-1", "fill-2", "fill-3" }) |call_id| {
         _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
             .id = lifecycleId(1, call_id),
@@ -14694,7 +14682,6 @@ test "authoritative lifecycle can place a provisional row after the latest trans
         null,
     );
     defer alloc.free(full);
-    // Tool rows style the command verb; compare against plain text.
     const plain = try plainTextForTest(alloc, full);
     defer alloc.free(plain);
     const notice_index = std.mem.find(u8, plain, "Auto agent approved").?;
@@ -16155,8 +16142,6 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     const held = runtime.transcript_commit_state.stable;
     try std.testing.expect(held.visual_offset > held.history_visual_offset);
 
-    // Quiet ticks over the unchanged flow release nothing: byte stability
-    // is not finality while the turn is unfenced.
     var quiet_source = try runtime.prepareTranscriptSource(alloc, null);
     defer quiet_source.deinit(alloc);
     var quiet_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &quiet_source);
@@ -16166,7 +16151,6 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try std.testing.expectEqual(@as(u32, 0), quiet_facts.semantic_rows);
     try std.testing.expect(quiet_facts.finality_hold);
 
-    // A later mutation of the same group still releases nothing.
     const late_call = types.ToolLifecycleId{ .turn_id = 2, .call_id = "t2-late" };
     _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = late_call,
@@ -16189,9 +16173,6 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try std.testing.expectEqual(@as(u16, 0), mutated_facts.planned_rows);
     try commitPreparedForTest(&runtime, alloc, &mutated_source, &mutated_prepared);
 
-    // The fence and the final mutation arrive in one batch: the first
-    // post-fence frame is byte-incompatible and must hold (zero release),
-    // re-anchoring on the final flow.
     _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
         .turn_id = 2,
         .outcome = .completed,
@@ -16199,9 +16180,6 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try runtime.finishLifecycleBatch(alloc);
     try std.testing.expectEqual(@as(u64, 2), runtime.finalizedToolTurnWatermark());
 
-    // The debt settles on the first eligible frame after the fence: the
-    // same frame when the fence publication changed no bytes, or the frame
-    // after a byte-incompatible publication re-anchors (Phase A then B).
     var released: u32 = 0;
     for (0..2) |frame_index| {
         var frame_source = try runtime.prepareTranscriptSource(alloc, null);
@@ -16210,7 +16188,6 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
         defer frame_prepared.deinit(alloc);
         const frame_facts = runtime.planTranscriptScroll(&frame_prepared);
         if (!frame_facts.source_compatible) {
-            // Phase A: zero release while the anchor is stale.
             try std.testing.expectEqual(@as(u32, 0), frame_facts.semantic_rows);
             try std.testing.expectEqual(@as(u16, 0), frame_facts.planned_rows);
             try std.testing.expect(frame_facts.finality_hold);
@@ -16462,7 +16439,6 @@ test "pending replacement notice holds release until the finished replacement se
     const held = runtime.transcript_commit_state.stable;
     try std.testing.expect(held.visual_offset > held.history_visual_offset);
 
-    // Quiet frames while the producer blocks release nothing.
     var quiet_source = try runtime.prepareTranscriptSource(alloc, null);
     defer quiet_source.deinit(alloc);
     var quiet_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &quiet_source);
@@ -16472,8 +16448,6 @@ test "pending replacement notice holds release until the finished replacement se
     try std.testing.expectEqual(@as(u32, 0), quiet_facts.semantic_rows);
     try std.testing.expect(quiet_facts.finality_hold);
 
-    // Finishing clears the pin and rebases its replacement before planning.
-    // Compatibility permits release; the frame receipt must still accept it.
     try std.testing.expect(try runtime.replaceSemanticNotice(alloc, notice_id, .{
         .topic = "feedback",
         .tone = .success,
@@ -16640,8 +16614,6 @@ test "finality candidates keep tool turn and replaceable tail offsets independen
     const group_floor = source.finality.tool_turn_floors[0];
     try std.testing.expectEqual(@as(u64, 5), group_floor.turn_id);
     try std.testing.expect(group_floor.start_byte < source.bytes.len);
-    // The replaceable-tail contract keeps its own offset; the finality
-    // boundary does not repurpose it.
     try std.testing.expect(source.replaceable_last_line);
     try std.testing.expect(source.replaceable_start > group_floor.start_byte);
     try std.testing.expect(source.replaceable_start < source.bytes.len);
@@ -16786,9 +16758,6 @@ test "grouped completed command rows shell-highlight quoted strings over the row
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
 
-    // The action label keeps the row's ambient style; the command verb and
-    // quoted string pick up syntax palette colors and return to the row base
-    // after their closes.
     try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
 }
@@ -16818,10 +16787,7 @@ test "multi-word command labels stay intact when a syntax token follows" {
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
 
-    // A first-space split would open the base style between "Timed" and
-    // "out"; the recorded label keeps both words ahead of the base open.
     try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;245m") != null);
-    // The command word colors; the bare number argument stays plain.
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252msleep\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") == null);
 }
@@ -16854,7 +16820,6 @@ test "retint rewrites custom theme colors on a variant flip" {
         "\x1b[38;5;202mKeyword row\x1b[39m\n",
         .subagent_status,
     );
-    // Terminal output is user content: never retinted.
     _ = try runtime.appendRawTranscriptEntryClassified(
         alloc,
         "\x1b[38;5;201muser output\x1b[39m\n",

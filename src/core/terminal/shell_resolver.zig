@@ -89,9 +89,6 @@ pub fn capturedSelfInvocation(
     clean_start: bool,
     command: []const u8,
 ) (ResolveError || Allocator.Error)!Invocation {
-    // pathForReexec consults the OS for the on-disk executable; on macOS the
-    // underlying query carries a wide error set, which collapses here so the
-    // public resolver error set stays small.
     const self_path = self_exe.pathForReexec(alloc) catch return error.UnsupportedShell;
     var invocation = try rushInvocation(self_path, clean_start);
     removeInteractiveFlag(&invocation);
@@ -221,8 +218,6 @@ pub fn snapshotInvocation(
             "if [[ -z ${__fx_snapshot_restored-} ]]; then \\builtin printf '%s' ",
     );
     try appendShellWord(&bootstrap, alloc, failure_marker);
-    // Re-raise the common termination signals so the supervisor reports a
-    // signal, as it does when the shell runs the command directly.
     try bootstrap.appendSlice(
         alloc,
         " >&2; \\builtin exit 125; fi; " ++

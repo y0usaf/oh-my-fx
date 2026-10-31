@@ -1134,9 +1134,6 @@ fn writeRecoveryCheckpointFrom(writer: *std.Io.Writer, checkpoint: RecoveryCheck
         if (checkpoint.requested_fast_mode) "true" else "false",
         if (checkpoint.fast_mode) "true" else "false",
     });
-    // Old readers exact-match the v2 checkpoint keys. Keep the optional pair
-    // absent at its all-false default, but preserve both values once either
-    // reports an Ultra selection.
     if (checkpoint.requested_ultrafast_mode or checkpoint.ultrafast_mode) {
         try writer.print(",\"requested_ultrafast_mode\":{s},\"ultrafast_mode\":{s}", .{
             if (checkpoint.requested_ultrafast_mode) "true" else "false",
@@ -1244,8 +1241,6 @@ fn decodeStateTail(
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
-            // Sessions saved before /usage read provider reports kept their
-            // own usage here. It is skipped, in the place it always had.
             if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             try json_reader.skipValue();
             usage_seen = true;
@@ -1562,8 +1557,6 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
         try writeSnapshotLocator(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try writeOptionalDurableBytes(writer, image.snapshot_sha256);
-        // Inline image bytes appear only for sessions without a filesystem
-        // snapshot backend, so durable sessions keep their exact format.
         if (image.inline_data) |inline_data| {
             if (collect_blobs) {
                 try writer.print(",\"inline_blob\":{d}", .{image_blobs.items.items.len});
@@ -1732,9 +1725,6 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
     errdefer alloc.free(tool_steps);
     for (execution.tool_steps, tool_steps) |step, *hash| {
         out.clearRetainingCapacity();
-        // The turn's execution is rebuilt before each progress, which stamps
-        // every result's creation time again, so the comparison leaves it
-        // out: a progress that extends another keeps the times it recorded.
         const results = try alloc.dupe(types.PersistedToolResult, step.tool_results);
         defer alloc.free(results);
         for (results) |*result| result.created_at_ms = 0;
@@ -2060,8 +2050,6 @@ fn writeExecutionFilePresentation(
     } else {
         try writer.writeAll("null");
     }
-    // Durable records omit an absent handle for compatibility with the
-    // shipped 9-key shape. Presentation JSON always includes the key.
     if (presentation.content_handle) |handle| {
         try writer.writeAll(",\"content_handle\":");
         try writeExecutionBytes(writer, handle, format);
@@ -2146,8 +2134,6 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
         } else null;
         errdefer if (source_ref) |source_bytes| alloc.free(source_bytes);
         if (inline_data) |inline_bytes| {
-            // Inline images carry their own bytes: no snapshot file, but the
-            // digest stays so request-time verification is unchanged.
             if (snapshot_path != null or snapshot_sha256 == null) return error.InvalidSessionFormat;
             try validateInlineImageBytes(inline_bytes, media_type);
         } else if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
@@ -3030,7 +3016,6 @@ fn parseCommittedFilePresentation(
         object.get("lifecycle_id") orelse return error.InvalidSessionFormat,
     );
     errdefer if (lifecycle_id) |id| mem_utils.free(alloc, id.call_id);
-    // Older records predate externalized diff snapshots and carry no key.
     const content_handle = if (object.get("content_handle")) |handle_value|
         try parseOptionalDurableBytes(alloc, handle_value)
     else
@@ -4304,8 +4289,6 @@ test "execution memory codec preserves feedback and reads v1 results without it"
 test "committed file presentation codec reads shipped and spilled shapes" {
     const alloc = std.testing.allocator;
 
-    // Shipped shape: every record written by released fx has exactly these
-    // nine keys, with the snapshots inline and no content_handle key.
     const shipped =
         "{\"path\":\"note.txt\",\"kind\":\"added\",\"lines\":[{\"kind\":\"addition\",\"old_line\":null,\"new_line\":1,\"text\":\"line\"}],\"additions\":1,\"deletions\":0,\"truncated\":false,\"previous_content\":null,\"after_content\":\"line\\n\",\"lifecycle_id\":{\"turn_id\":9,\"call_id\":\"call_write\"}}";
     var shipped_parsed = try std.json.parseFromSlice(std.json.Value, alloc, shipped, .{});
@@ -4316,8 +4299,6 @@ test "committed file presentation codec reads shipped and spilled shapes" {
     try std.testing.expectEqualStrings("line\n", shipped_presentation.after_content.?);
     try std.testing.expect(shipped_presentation.content_handle == null);
 
-    // Spilled shape: snapshots live in the result store and the record
-    // carries only the handle.
     const spilled =
         "{\"path\":\"note.txt\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"}";
     var spilled_parsed = try std.json.parseFromSlice(std.json.Value, alloc, spilled, .{});
@@ -4340,7 +4321,6 @@ test "committed file presentation codec reads shipped and spilled shapes" {
         parseCommittedFilePresentation(alloc, competing_parsed.value),
     );
 
-    // Unknown keys still fail closed.
     const unknown_key =
         "{\"path\":\"note.txt\",\"kind\":\"added\",\"lines\":[],\"additions\":1,\"deletions\":0,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"surprise\":true}";
     var unknown_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unknown_key, .{});
@@ -4350,8 +4330,6 @@ test "committed file presentation codec reads shipped and spilled shapes" {
         parseCommittedFilePresentation(alloc, unknown_parsed.value),
     );
 
-    // The writer omits content_handle for unspilled presentations, keeping
-    // the shipped 9-key shape readable by older builds.
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try writeExecutionFilePresentation(&out.writer, shipped_presentation, .durable);
@@ -4363,7 +4341,6 @@ test "committed file presentation codec reads shipped and spilled shapes" {
     try std.testing.expectEqualStrings("line\n", roundtrip.after_content.?);
     try std.testing.expect(roundtrip.content_handle == null);
 
-    // The writer emits the handle only when present, and it roundtrips.
     out.clearRetainingCapacity();
     try writeExecutionFilePresentation(&out.writer, spilled_presentation, .durable);
     try std.testing.expect(std.mem.find(
@@ -4504,7 +4481,6 @@ test "durable cancellation provenance roundtrips and cleans allocation failures"
             defer session.freeHistoryTurn(alloc, copy);
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
-            // This in-memory writer reports injected allocation failure as WriteFailed.
             writeHistoryTurn(&out.writer, copy) catch |err|
                 return if (err == error.WriteFailed) error.OutOfMemory else err;
             try std.testing.expectEqual(origin == .compaction, std.mem.find(u8, out.written(), "\"cancellation_origin\"") != null);
@@ -5102,15 +5078,10 @@ test "inline image parsing rejects missing digest and mismatched bytes" {
         bytes: []const u8,
     };
     const cases = [_]Template{
-        // Inline bytes without their digest cannot be verified at request time.
         .{ .snapshot_sha256 = null, .media_type = "image/png", .bytes = png },
-        // Bytes must sniff to the declared media type.
         .{ .snapshot_sha256 = &digest_hex, .media_type = "image/jpeg", .bytes = png },
-        // Empty and un sniffable payloads are not images.
         .{ .snapshot_sha256 = &digest_hex, .media_type = "image/png", .bytes = "" },
         .{ .snapshot_sha256 = &digest_hex, .media_type = "image/png", .bytes = "plain text" },
-        // A digest mismatch alone does not fail the codec parse (the payload
-        // envelope covers integrity), but the bytes must stay image-shaped.
         .{ .snapshot_sha256 = wrong_digest, .media_type = "image/png", .bytes = png },
     };
     const expect_failure = [_]bool{ true, true, true, true, false };
@@ -5484,7 +5455,6 @@ test "an old session's usage field is skipped in its place, and the rest loads" 
         }
     }.check, .{state_json});
 
-    // A new save leaves the field out.
     var source = std.Io.Reader.fixed(state_json);
     var decoded = try decodeState(alloc, &source, .{});
     defer decoded.deinit(alloc);
@@ -5493,7 +5463,6 @@ test "an old session's usage field is skipped in its place, and the rest loads" 
     _ = try encodeState(decoded, &saved.writer);
     try std.testing.expect(std.mem.find(u8, saved.written(), "\"usage\"") == null);
 
-    // The field still has to be where it always was.
     const misplaced = try std.mem.replaceOwned(u8, alloc, state_json, "\"last_subagent_work_id\":\"legacy-work\"}", "\"last_subagent_work_id\":\"legacy-work\",\"usage\":null}");
     defer alloc.free(misplaced);
     var misplaced_source = std.Io.Reader.fixed(misplaced);

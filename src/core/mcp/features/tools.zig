@@ -366,7 +366,7 @@ pub fn parseCallOutcome(
         if (value != .bool) return error.InvalidCallResult;
         break :blk value.bool;
     } else false;
-    _ = output_schema_json; // Tool semantics, including output assertions, belong to the server.
+    _ = output_schema_json;
     const serialization_limit = std.math.add(usize, max_result_bytes, 16 * 1024) catch
         return error.MetadataLimitExceeded;
     const result_json = try stringifyValueAlloc(alloc, result, serialization_limit);

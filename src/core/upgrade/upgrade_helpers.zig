@@ -225,7 +225,6 @@ test "transfer interrupt wakes a blocked socket read" {
             defer c.slot.clear();
             var buf: [16]u8 = undefined;
             var stream_reader = conn.reader(z, &buf);
-            // Blocks until the interrupt shuts the socket down.
             _ = stream_reader.interface.takeByte() catch {};
             c.woke_ms.store(io_mod.milliTimestamp(), .release);
         }
@@ -242,7 +241,6 @@ test "transfer interrupt wakes a blocked socket read" {
     try std.testing.expect(woke_ms != 0);
     try std.testing.expect(woke_ms - started_ms < 2000);
 
-    // Interrupting an idle slot is a no-op.
     slot.interrupt();
 }
 

@@ -73,7 +73,6 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         return usage(arena, null, "'{s}' isn't a {s} command.", .{ old, p });
     };
 
-    // Flags come before `--`; everything after it is a stdio server's command.
     const rest = args[1..];
     const dash = for (rest, 0..) |a, k| {
         if (std.mem.eql(u8, a, "--")) break k;
@@ -141,7 +140,6 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--header")) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
                 return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } } } } };
             }
-            // fx knows Slack's address, as `add slack` did before.
             const url = if (n.len == 1 and std.mem.eql(u8, name, "slack")) slack.server_url else url: {
                 if (n.len != 2) return usage(arena, verb, "{s} add needs a URL, or -- and a command.", .{p});
                 break :url n[1];
@@ -612,7 +610,6 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
     const host = try c.hosts.get(c.hosts.context, null);
     defer if (host) |h| c.hosts.release(c.hosts.context, h);
     const servers: []const @import("config.zig").Server = if (host) |h| h.runtime.servers() else &.{};
-    // The project servers this choice is about, so the user sees what they trust.
     var targets: std.ArrayList(@import("config.zig").Server) = .empty;
     for (servers) |s| {
         if (s.source != .workspace) continue;
@@ -662,7 +659,6 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     }
     const was = findStatus(try host.runtime.statuses(arena), name).?;
     host.runtime.logout(name) catch |err| switch (err) {
-        // A held server isn't in the engine; its saved login still goes.
         error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, name, server.url.?) catch false,
         else => return err,
     };
@@ -737,7 +733,6 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
         },
         else => return err,
     };
-    // The shell's host reports the address and the outcome in the transcript.
     if (c.surface == .shell) return 0;
     return waitForLogin(c, arena, host, &waiter, open);
 }
@@ -794,7 +789,6 @@ fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
     var buffer: [1024]u8 = undefined;
     const n = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return null;
     if (n == 0) {
-        // stdin closed: wait for the browser instead.
         io_mod.sleep(100 * std.time.ns_per_ms);
         return null;
     }
@@ -830,7 +824,6 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("X-Key", http.entry.http.headers[0].key);
     try testing.expectEqualStrings("${K}", http.entry.http.headers[0].value);
 
-    // Slack needs no URL; any other server does.
     try testing.expectEqualStrings("https://mcp.slack.com/mcp", (try parseCli(a, &.{ "add", "slack" })).command.add.entry.http.url);
     try testing.expectEqualStrings("https://slack.example/mcp", (try parseCli(a, &.{ "add", "slack", "https://slack.example/mcp" })).command.add.entry.http.url);
 

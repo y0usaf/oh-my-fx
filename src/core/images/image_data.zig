@@ -350,11 +350,8 @@ fn jpegDimensions(source: ImageBytes) ?Dimensions {
         if (segment.len < 2 or segment[0] != 0xff) return null;
         const marker = segment[1];
         switch (marker) {
-            // Fill byte before a marker.
             0xff => offset += 1,
-            // Standalone markers carry no length.
             0x01, 0xd0...0xd8 => offset += 2,
-            // End of image or scan data before any frame header.
             0xd9, 0xda => return null,
             else => {
                 if (segment.len < 4) return null;
@@ -384,8 +381,6 @@ pub fn testPngHeader(width: u32, height: u32) [24]u8 {
     return bytes;
 }
 
-// SOI, APP0, DHT, one fill byte, then a progressive frame header and EOI, so
-// the marker walk crosses variable-length, standalone, and fill markers.
 const test_jpeg_template = "\xff\xd8" ++
     "\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" ++
     "\xff\xc4\x00\x04\x00\x00" ++
@@ -550,11 +545,8 @@ test "image dimension parsing stays bounded on arbitrary bytes" {
             &testGif(1, 1),
             &testWebpExtended(2, 2),
             "\xff\xd8\xff\xff\xff\xff",
-            // JPEG segment length that runs past the input.
             "\xff\xd8\xff\xe0\xff\xff",
-            // PNG IHDR with a zero length and a maximal size.
             "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\xff\xff\xff\xff\xff\xff\xff\xff",
-            // RIFF header naming WebP with no chunk.
             "RIFF\x00\x00\x00\x00WEBP",
         },
     });

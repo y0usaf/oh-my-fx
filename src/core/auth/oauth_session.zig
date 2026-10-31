@@ -97,8 +97,6 @@ fn selectStorageBackend(os_tag: std.Target.Os.Tag, keychain_disabled: bool) Stor
 }
 
 fn storageBackend() StorageBackend {
-    // A temporary HOME does not isolate the host account's macOS Keychain.
-    // Keychain-specific tests inject their backend explicitly.
     if (comptime builtin.is_test) return .profile_file;
     return selectStorageBackend(builtin.target.os.tag, native_keychain.isDisabled());
 }
@@ -521,7 +519,6 @@ const HostMutation = struct {
     revision_len: usize = 0,
     exists: bool = false,
 
-    // Host storage validates writes through its revisioned save callback.
     pub fn requireWritable(_: *HostMutation) error{CredentialStorageUnavailable}!void {}
 
     fn init(store: js_host_auth.SessionStore) HostMutation {

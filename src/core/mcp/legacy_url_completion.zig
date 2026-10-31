@@ -452,8 +452,6 @@ pub const State = struct {
                 .runtime_generation = completion.runtime_generation,
                 .connection_generation = completion.connection_generation,
                 .client_generation = completion.client_generation,
-                // The notification has no catalog generation. The retained
-                // originating snapshot is revalidated before retrying.
                 .catalog_generation = waiter.binding.catalog_generation,
                 .auth_generation = completion.auth_generation,
             });

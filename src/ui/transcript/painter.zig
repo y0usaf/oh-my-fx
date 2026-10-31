@@ -1,16 +1,3 @@
-// Host contract:
-// - fields: shadow_vt, transcript, entries, layout, viewport_top_row,
-//   owned_top_row, pending_scroll_compact,
-//   min_visible_viewport_rows, reflow_clear_guard_rows,
-//   viewport_clear_pending,
-//   replaceable_last_line, replaceable_row, replaceable_start,
-//   last_rendered_cols, last_paint_bottom_reserved_rows,
-//   last_visible_transcript_*, last_viewport_selection,
-//   paint_trace, has_painted_transcript, resize_bottom_anchor_pending,
-//   footer_viewport, full_transcript, folded_command_blocks
-// - methods: ensurePaintReservation, beginPaint, endPaint,
-//   resetCursorTracking, advanceCursor,
-//   compactAfterCollapsedResize, footerTopRowForExtra
 
 const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
@@ -1127,9 +1114,6 @@ pub const PreparedTranscriptSurfacePaint = struct {
     measured_history_origin: ?MeasuredHistoryOrigin = null,
     measured_history_origin_consumed: bool = false,
     measured_resize_target_provenance: MeasuredResizeTargetProvenance = .none,
-    // Owned copy of the source's finality boundary candidates; the scroll
-    // planner selects the release floor from these against frame-fresh
-    // producer facts. Empty candidates mean the whole flow is final.
     finality_candidates: transcript_release.Candidates = .{},
     cursor: ViewportCursorResult = .{ .cursor_row = 1, .cursor_col = 1, .replaceable_row = 1 },
 
@@ -1802,8 +1786,6 @@ fn prepareTranscriptSurfacePaintInternal(
     prepared.projection_area = .{ .top = top_row, .bottom = bottom_row };
 
     const transcript_line_count = hard_lines.len();
-    // This count sizes the appendAssumeCapacity walk below, which expands
-    // folded blocks only through a source snapshot's summary indices.
     const expand_folded_summaries = !commit_runtime_state or
         source.recorded_entries_authoritative;
     const total_lines = if (expand_folded_summaries)

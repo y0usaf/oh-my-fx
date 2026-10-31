@@ -176,7 +176,6 @@ pub const Catalog = struct {
             },
             .invalidated => c.invalidate(),
             .expired => |generation| {
-                // A timer for an earlier list or generation is no step.
                 if (generation != c.generation or c.cache != .fresh or c.era != .modern) return;
                 c.cache = .stale;
             },
@@ -367,11 +366,9 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
         .send_page => |which| {
             if (which == .first) {
                 if (event == .need) {
-                    // OneListing: a listing starts only when none runs.
                     try testing.expect(!w.listing);
                     w.restarts = 0;
                 } else {
-                    // A restart after an invalid cursor, once.
                     try testing.expect(event == .invalid_cursor);
                     w.restarts += 1;
                     try testing.expect(w.restarts <= 1);
@@ -382,13 +379,11 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
                 w.min_ttl = std.math.maxInt(u32);
                 w.start_invalidations = w.invalidations;
             }
-            // PagesBounded.
             try testing.expect(w.pages < c.config.max_pages);
         },
         .discard_pages => try testing.expect(event == .invalid_cursor),
         .publish => |fresh| {
             try testing.expect(w.listing);
-            // CacheCurrent and ZeroTtlNotCached.
             if (fresh) {
                 try testing.expectEqual(w.start_invalidations, w.invalidations);
                 if (w.era == .modern) try testing.expect(!w.zero_seen);
@@ -403,7 +398,6 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
             w.waiters = 0;
         },
         .serve => {
-            // NoStaleServe.
             try testing.expect(w.fresh and !w.listing and event == .need);
             w.waiters -= 1;
         },
@@ -415,13 +409,10 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
             };
         },
     };
-    // A restart drops the pages gathered so far before asking again.
     if (event == .invalid_cursor and w.listing) try testing.expectEqual(Effect.discard_pages, out.effects()[0]);
-    // WaitingMeansListing.
     try testing.expectEqual(w.listing, c.waiting);
     try testing.expectEqual(c.waiting, c.listing);
     try testing.expect(!w.listing or w.waiters > 0);
-    // Where the model has no choice, the core must act.
     if (event == .need and !before.listing and before.cache != .fresh and w.era != null) try testing.expect(w.listing);
     if (event == .page_received and !event.page_received.more) try testing.expect(!w.listing);
     return true;
@@ -468,7 +459,6 @@ test "random long runs keep the invariants, and every need is answered (EveryNee
         var c: Catalog = .init(.{ .max_pages = 4 });
         var w: World = .{};
         for (0..random.uintLessThan(usize, 80)) |_| _ = try apply(&c, &w, moves[random.uintLessThan(usize, moves.len)]);
-        // The server answers every page, here with "more" each time.
         for (0..12) |_| {
             if (!c.waiting) break;
             _ = try apply(&c, &w, .{ .page_received = .{ .more = true, .ttl_ms = 50 } });
@@ -505,7 +495,6 @@ test "an invalidation during a listing keeps its answer out of the cache" {
     try c.step(.need, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send_page = .first }}, out.effects());
     try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0 } }, &out);
-    // A legacy list stays fresh until an invalidation.
     try testing.expectEqualSlices(Effect, &.{.{ .publish = true }}, out.effects());
     try c.step(.{ .expired = 2 }, &out);
     try testing.expect(out.transition == null);

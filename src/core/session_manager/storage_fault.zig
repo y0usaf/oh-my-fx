@@ -86,8 +86,6 @@ pub const Fault = struct {
         f.writers.deinit(f.gpa);
     }
 
-    // -- test controls ------------------------------------------------------
-
     /// Process crash: the kernel keeps every written byte; nothing else runs.
     pub fn kill(f: *Fault) void {
         f.dead = true;
@@ -140,8 +138,6 @@ pub const Fault = struct {
         }
         return false;
     }
-
-    // -- called by storage.zig ----------------------------------------------
 
     /// Counts one mutating call. Dies for real at `kill_at_step`; at
     /// `power_at_step` loses power and returns true: the call must fail.
@@ -260,8 +256,6 @@ pub const Fault = struct {
         }
     }
 
-    // -- helpers ----------------------------------------------------------------
-
     fn find(f: *Fault, inode: Io.File.INode) ?*Tracked {
         for (f.files.items) |*tracked| {
             if (tracked.inode == inode) return tracked;
@@ -348,9 +342,6 @@ pub fn flipBit(io: Io, dir: storage.Dir, name: []const u8, offset: u64, bit: u3)
     try file.writePositionalAll(io, &byte, offset);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 
 test "a power loss never loses a synced byte" {
@@ -368,7 +359,6 @@ test "a power loss never loses a synced byte" {
         defer written.deinit(testing.allocator);
         var synced: usize = 0;
         const file = try s.createFile(root, "log");
-        // Make the name durable so only the file's bytes are at risk.
         try s.syncDir(root);
         var random = std.Random.DefaultPrng.init(seed ^ 0x5eed);
         const steps = random.random().intRangeAtMost(u8, 1, 12);
@@ -390,7 +380,6 @@ test "a power loss never loses a synced byte" {
         const after = try tmp.dir.readFileAlloc(io, "log", testing.allocator, .limited(1 << 16));
         defer testing.allocator.free(after);
         try testing.expect(after.len >= synced);
-        // The kept bytes are a prefix of what was written, then maybe zeros.
         var i: usize = 0;
         while (i < after.len and i < written.items.len and after[i] == written.items[i]) i += 1;
         try testing.expect(i >= synced);
@@ -466,7 +455,6 @@ test "names are undone by a power loss only until their folder is synced" {
         try s.rename(root, "durable", root, "moved");
         _ = fault.powerLoss();
         fault.reboot();
-        // The synced create survives under one of its names; nothing else appears.
         const moved = s.stat(root, "moved") catch null;
         const original = s.stat(root, "durable") catch null;
         try testing.expect((moved == null) != (original == null));

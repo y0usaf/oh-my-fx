@@ -330,9 +330,7 @@ test "v1's logins are taken over once, and a sign-out isn't undone" {
     try testing.expectEqualStrings(
         \\{"access":"v1-access","refresh":"v1-refresh","expires_at_ms":null,"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"resource":"https://mcp.linear.app/mcp","client_id":"c1","client_secret":null,"method":"none"}
     , got);
-    // A token bound to a key isn't one MCP-v2 can send.
     try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "bound", "https://mcp.linear.app/mcp"));
-    // Signed out, it stays signed out: v1's copy isn't taken again.
     try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
     try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
 }

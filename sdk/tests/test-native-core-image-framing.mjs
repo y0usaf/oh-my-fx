@@ -76,7 +76,6 @@ try {
   assert.equal(toolCalls, 1);
   assert.equal(requests, 2);
 
-  // The retained images plus this prompt exceed the unchanged raw request budget.
   await assert.rejects(agent.prompt("x".repeat(2 * 1024 * 1024)).result, /HostStreamBackpressure/);
   assert.equal(requests, 2, "an oversized raw request must not reach host fetch");
   console.log("native image framing passed: accepted images survive base64 framing; oversized raw requests stay bounded");

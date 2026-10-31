@@ -73,8 +73,6 @@ describe("eval helpers", () => {
       );
       Object.assign(process.env, overrides);
       const homesBefore = evalHomes();
-      // Bun's 15s test timeout did not end this test when runEval never
-      // stopped fx, so the test keeps its own deadline.
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<never>((_, reject) => {
         deadlineTimer = setTimeout(

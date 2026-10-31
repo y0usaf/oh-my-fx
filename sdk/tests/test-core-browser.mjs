@@ -211,7 +211,6 @@ try {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });
 
-  // Exercise the public browser SDK without starting the demo's live transport.
   {
     const { targetId } = await command("Target.createTarget", { url: "about:blank" });
     try {

@@ -65,7 +65,6 @@ pub const Record = struct {
         } else if (self.entries.count() >= max_entries) return;
         const bytes = try self.serialize(alloc, name, identity);
         defer alloc.free(bytes);
-        // The stored record stays within what `load` accepts.
         if (bytes.len > max_bytes) return error.ToolIdentityRecordFull;
         switch (target) {
             .none => {},
@@ -75,7 +74,6 @@ pub const Record = struct {
             },
             .v2 => |session| try session.setToolIdentities(bytes),
         }
-        // Memory follows the stored copy, so a failed write changes neither.
         try self.put(alloc, name, identity);
     }
 
@@ -131,8 +129,6 @@ pub fn load(alloc: Allocator, capability: *session_child_store.SessionChildCapab
         else => return err,
     };
     defer file.deinit();
-    // The reader rejects a file that reaches its limit, so allow one byte
-    // more to accept a record of exactly `max_bytes`.
     const bytes = try file.readToEnd(alloc, max_bytes + 1);
     defer alloc.free(bytes);
     return parse(alloc, bytes);
@@ -255,7 +251,6 @@ test "tool identity record refuses names that would outgrow the stored record" {
         accepted += 1;
     } else return error.TestExpectedFullRecord;
 
-    // The refused name is not kept in memory either.
     try std.testing.expectEqual(accepted, record.entries.count());
     try std.testing.expect(!record.entries.contains(full));
     const bytes = try record.serialize(alloc, "mcp_s_tool_0", record.entries.get("mcp_s_tool_0").?);

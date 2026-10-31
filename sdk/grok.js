@@ -1,6 +1,3 @@
-// Grok (xAI subscription) credentials for libfx agents: the Grok endpoints,
-// how a Grok plan's credentials are checked and refreshed, and the headers
-// that carry them. `subscription.js` adds them at the fetch edge.
 import { normalizeCredentials } from "./subscription.js";
 
 export const grokIssuer = "https://auth.x.ai";

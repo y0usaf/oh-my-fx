@@ -124,7 +124,6 @@ def model_obs(request):
                 "dirty": o["dirty"],
                 "denied": denied,
                 "held": sorted(names[i] for i in held),
-                # An id the run does not know can never match the model's listing.
                 "listed": sorted({names[i] for i in listed if i in names} | ({"unknown"} if unknown else set())),
             })
         except KeyError as missing:

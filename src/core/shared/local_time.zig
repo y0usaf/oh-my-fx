@@ -167,9 +167,7 @@ fn expectReading(expected: []const u8, reading: ?Reading) !void {
 
 test "local time reads a timestamp in the given zone" {
     try expectReading("2024-01-02 03:04:05.006 UTC", inZone(1_704_164_645_006, .utc));
-    // East of UTC rolls the clock forward.
     try expectReading("2024-01-02 08:34:05.006 IST", inZone(1_704_164_645_006, ist));
-    // West of UTC crosses back into the previous day and year.
     try expectReading(
         "2023-12-31 22:04:05.006 EST",
         inZone(1_704_078_245_006, .{ .offset_s = -5 * 3600, .name = "EST" }),
@@ -177,7 +175,6 @@ test "local time reads a timestamp in the given zone" {
 }
 
 test "local time falls back to UTC when the zone cannot apply" {
-    // Shifting back from the epoch would leave the calendar range.
     try expectReading("1970-01-01 00:00:00.002 UTC", inZone(2, .{ .offset_s = -7 * 3600, .name = "PDT" }));
     try expectReading(
         "2024-01-02 03:04:05.006 UTC",

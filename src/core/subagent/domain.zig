@@ -102,8 +102,6 @@ pub fn captureAdmission(
     validateId(input.parent_id) catch return error.InvalidAdmissionItem;
     validateId(input.source_id) catch return error.InvalidAdmissionItem;
     validateBoundedText(input.model, max_model_bytes) catch return error.InvalidModel;
-    // Integration names mirror the parent's MCP catalog, which is already
-    // bounded per server by the MCP tool limits, so they carry no count cap.
     if (input.tool_names.len > max_admission_items or
         input.rules.rules.len > max_admission_items or
         input.grants.len > max_admission_items)

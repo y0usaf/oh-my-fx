@@ -1,11 +1,3 @@
-// Shared helpers for the Bun drivers under tests/tla/drivers/: find TLC and
-// Java the same way tests/tla/lib/tlc.sh does, run TLC on a model in a
-// scratch folder, and locate the fx binary under test.
-//
-// TLC comes from TLA2TOOLS_JAR or ~/.local/share/tla/tla2tools.jar. Java comes
-// from JAVA_HOME, Homebrew's OpenJDK, or PATH. The binary is FX_BIN, or
-// zig-out/bin/fx in this checkout. Output goes to FX_TLA_OUT, or a fresh folder
-// under the system temp directory.
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -55,7 +47,6 @@ export function tlcToolchain(): Toolchain {
   ];
   for (const java of candidates) {
     if (!java || !existsSync(java)) continue;
-    // /usr/bin/java on macOS is a stub that fails -version without a runtime.
     const probe = Bun.spawnSync([java, "-version"], { stdout: "pipe", stderr: "pipe" });
     if (probe.exitCode !== 0) continue;
     const javaVersion = new TextDecoder().decode(probe.stderr).split("\n")[0]?.trim() ?? "";
@@ -89,8 +80,6 @@ export async function runTlc(
   const { java, jar } = tlcToolchain();
   mkdirSync(dir, { recursive: true });
   for (const name of specs) copyFileSync(join(specDir, name), join(dir, name));
-  // A private java.io.tmpdir per run: TLC unpacks its standard modules there,
-  // and concurrent runs sharing one folder can lose them.
   const javaTmp = join(dir, ".tlc-tmp");
   mkdirSync(javaTmp, { recursive: true });
   const argv = [

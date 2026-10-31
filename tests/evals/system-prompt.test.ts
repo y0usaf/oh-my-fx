@@ -9,7 +9,6 @@ import {
 } from "./eval-helpers";
 
 const TIMEOUT = 120_000;
-// Format evals can spend a tool round inspecting before they answer.
 const FORMAT_TIMEOUT = 180_000;
 let workDir: string | null = null;
 
@@ -17,12 +16,9 @@ afterEach(() => {
   if (workDir) { cleanupWorkDir(workDir); workDir = null; }
 });
 
-// GFM accepts a single dash per delimiter cell, with optional alignment colons.
 const TABLE_DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/m;
 const HEADING = /^#{1,6}\s/m;
 
-// fx shows fenced content as a code block, so fenced tables and comment
-// lines are neither rendered tables nor headings.
 function withoutFencedCode(text: string): string {
   return text.replace(/^\s*(```|~~~)[\s\S]*?^\s*\1\s*$/gm, "");
 }

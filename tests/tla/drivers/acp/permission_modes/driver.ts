@@ -1,22 +1,9 @@
-// Runtime driver: runs the real `fx acp` binary from a worktree through
-// directed and seeded-random permission-mode plans, records what a client
-// observes (mode option and older modes field, JSON-RPC errors, the
-// profile's saved mode, and how each prompt's shell call was enforced), and
-// asks TLC whether each observed run is a behavior of
-// tests/tla/acp/AcpPermissionModes.tla.
-//
-//   bun tests/tla/drivers/acp/permission_modes/driver.ts --label main   # from the repository root, after zig build
-//
-// No model calls: completions and reviewer answers come from the fake
-// Gateway in tests/e2e/tmux-helpers.ts. --worktree runs another checkout's build.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Fixture, NO_VIEW, type Observation, loadHelpers, viewOf } from "./harness";
 import { REPO_ROOT, outDir } from "../../lib/tlc";
 import { sha256File, sha256Text, tlcToolchain, utcStamp, writeJson } from "./tlc";
 import { validate } from "./trace";
-
-// ------------------------------------------------------------------ plans --
 
 const MODES = ["auto", "ask", "full-access"];
 const UNKNOWN = ["code", "yolo"];
@@ -52,11 +39,8 @@ const DIRECTED: Plan[] = [
     ops: [P, set("ask"), P, R, P, F, P] },
   { name: "d5-legacy-only", profile: "unset",
     ops: [legacy("ask"), P, legacy("auto"), P, legacy("full-access"), P, R, P, F] },
-  // A warm process (like fx-plus's spare) must not start new sessions in a
-  // mode another process has since replaced.
   { name: "d6-other-process", profile: "full-access",
     ops: [P, other("ask"), P, N, P, other("full-access"), P, R, P, set("auto"), N, P] },
-  // fx status reports the next session's mode, which an open session may not share.
   { name: "d7-status", profile: "unset",
     ops: [S, set("full-access"), S, other("ask"), S, P, N, S, legacy("auto"), F, S] },
 ];
@@ -81,8 +65,6 @@ function randomPlans(count: number, steps: number, seed: number): Plan[] {
     () => other(pick(MODES)), () => N, () => S,
     () => P, () => P, () => P, () => R, () => F,
   ];
-  // fx saves a chat at its first turn, so resume only follows a prompt in
-  // the current session (an explicit assumption in the spec).
   return Array.from({ length: count }, (_, index) => {
     const name = `r${String(index + 1).padStart(2, "0")}-seed${seed}`;
     const profile = pick(PROFILES);
@@ -97,8 +79,6 @@ function randomPlans(count: number, steps: number, seed: number): Plan[] {
     return { name, profile, ops };
   });
 }
-
-// ------------------------------------------------------------------ runner --
 
 async function runPlan(plan: Plan, worktree: string, helpers: Awaited<ReturnType<typeof loadHelpers>>, dir: string) {
   mkdirSync(dir, { recursive: true });
@@ -197,8 +177,6 @@ async function runPlan(plan: Plan, worktree: string, helpers: Awaited<ReturnType
   return { observations, processes: fixture.processes, error };
 }
 
-// ---------------------------------------------------------------- controls --
-
 function syntheticTrace(): Observation[] {
   const session = (current: string) => ({
     current, legacy: current, listed: "auto,ask,full-access", legacyListed: "auto,ask,full-access",
@@ -240,8 +218,6 @@ function tamper(observations: Observation[]): Observation[] | null {
   }
   return null;
 }
-
-// -------------------------------------------------------------------- main --
 
 function argValue(name: string): string | undefined {
   const index = process.argv.indexOf(name);
@@ -302,7 +278,6 @@ async function main() {
     console.log(`${plan.name} [${plan.profile}]: ${verdict} (${run.observations.length} steps)${run.error ? ` ${run.error}` : where}`);
   }
 
-  // Controls show the bridge separates conforming from non-conforming runs.
   const controls = [];
   const synthetic = syntheticTrace();
   controls.push({ name: "synthetic-conforming", expect: "ACCEPTED", got: (await validate(synthetic, join(reportDir, "controls", "synthetic-conforming"), "unset")).verdict });

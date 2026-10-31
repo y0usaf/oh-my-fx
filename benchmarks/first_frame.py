@@ -36,7 +36,6 @@ import time
 
 DEFAULT_MARKER = "Run /help"
 
-# (pattern, reply). A None reply answers DECRQM for the captured mode.
 QUERY_REPLIES = [
     (re.compile(rb"\x1b\]11;\?(?:\x1b\\|\x07)"), b"\x1b]11;rgb:1d1d/1f1f/2121\x1b\\"),
     (re.compile(rb"\x1b\]10;\?(?:\x1b\\|\x07)"), b"\x1b]10;rgb:e5e5/e5e5/e5e5\x1b\\"),
@@ -214,7 +213,6 @@ def main():
 
     env = dict(os.environ)
     env.pop("TMUX", None)
-    # fx updates its own executable in place; a measured binary must not change.
     env.setdefault("FX_AUTO_UPGRADE", "0")
     env.setdefault("TERM_PROGRAM", "ghostty")
     env["TERM"] = "xterm-256color"

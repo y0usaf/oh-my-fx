@@ -658,8 +658,6 @@ async function expectQuestionSelection(
   expect(hasQuestionSelection(pane, ordinal, selectedLabel)).toBe(true);
 }
 
-// Polls with color so question selection (now signalled purely by the white
-// style, no caret) is observable — plain capture drops SGR.
 async function waitForQuestionPane(
   activeSession: TmuxSession,
   label: string,
@@ -700,8 +698,6 @@ function hasSelection(pane: string, ordinal: number, selectedLabel: string) {
   return visibleText(pane).includes(visibleText(`› ${ordinal}. ${selectedLabel}`));
 }
 
-// The selected option is the only row carrying the white (255) style; match
-// the ordinal/label on that row after stripping the interleaved escapes.
 function hasQuestionSelection(paneEscapes: string, ordinal: number, selectedLabel: string) {
   const needle = visibleText(`${ordinal}) ${selectedLabel}`);
   return paneEscapes.split(/\r?\n/).some((line) =>
@@ -2715,8 +2711,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         requestContainsExactString(ctx.gateway.requests[1]?.body ?? "", LONG_QUESTION_ANSWER),
       ).toBe(true);
 
-      // The resolved question and answer wrap into hanging continuation rows
-      // in the transcript instead of trailing off with an ellipsis.
       const resolvedRows = stripAnsi(await ctx.session.captureFullScrollbackEscapes()).split("\n");
       const resolvedQuestionRow = resolvedRows.find((line) =>
         line.includes("1) When you ask fx to ask a question"),

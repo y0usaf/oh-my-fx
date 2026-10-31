@@ -1,7 +1,3 @@
-// U04 version detection, step 6: the era core (src/mcp/core/era.zig) driven by
-// tests/tla/drivers/mcp/labs/stdio_lab.zig against the scripted fake server. Every scenario
-// checks the era, stdio, and request traces against their models, and what
-// the server actually received, from its own log.
 
 import type { Rule } from "../fakes/stdio";
 import { expectFinal, labScenario, outcomes, type LabCase, type Seen } from "../lab";
@@ -25,7 +21,6 @@ const initializeResult = (version = LEGACY): Rule => ({
   method: "initialize",
   result: { protocolVersion: version, capabilities: {}, serverInfo: { name: "fake", version: "1" } },
 });
-// A tools/list that answers only the given era: a version, or null for none sent.
 const toolsFor = (version: string | null): Rule => ({ method: "tools/list", version, result: { tools: [] } });
 
 interface Received {
@@ -33,7 +28,6 @@ interface Received {
   version: string | null;
 }
 
-// What the server received, in order: each message's method and 2026 _meta version.
 function received(log: { dir: string; line: string }[]): Received[] {
   return log
     .filter((l) => l.dir === "in")
@@ -50,7 +44,6 @@ function sameList(got: unknown[], want: unknown[], what: string): string | null 
   return JSON.stringify(got) === JSON.stringify(want) ? null : `${what} were ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`;
 }
 
-// Detection with one preferred version unless the case says otherwise.
 function eraScenario(c: Omit<LabCase, "unit" | "requestTrace" | "era"> & { preferred?: string[]; eraVerdict?: "ACCEPTED" | "REJECTED"; modelPreferred?: number }): Scenario {
   const preferred = c.preferred ?? [MODERN];
   return labScenario({

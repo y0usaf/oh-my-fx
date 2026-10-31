@@ -2,7 +2,6 @@ const std = @import("std");
 const text_utils = @import("text_utils.zig");
 
 pub const max_query_bytes: usize = 4 * 1024;
-// Distinct tokens require at least one byte each and a separator between them.
 pub const max_query_tokens: usize = (max_query_bytes + 1) / 2;
 
 pub const PrepareError = error{

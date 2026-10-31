@@ -357,8 +357,6 @@ fn parseCatalog(
             .has_tool_use = true,
             .has_reasoning = supports_reasoning,
             .reasoning_efforts = reasoning_efforts,
-            // xAI accepts service_tier "priority" endpoint-wide on the
-            // subscription proxy, so every catalog model offers Fast mode.
             .supports_fast_mode = true,
             .has_vision = has_vision,
             .has_file_input = has_vision,

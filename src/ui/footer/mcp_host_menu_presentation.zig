@@ -154,7 +154,6 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
         return row_text.composeTextRow(alloc, none, width, ui_render.dim_style, 2);
     }
     const selected = p.state.selectedIndex(rows) orelse 0;
-    // The window keeps the selection in view.
     const start = if (selected < body) 0 else selected + 1 - body;
     const i = start + (index - 1);
     if (i >= rows.len) return .empty;
@@ -245,7 +244,6 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (after == 0) return .empty;
     if (after == 1 and l.waiting > 0) return row_text.composeTextRow(alloc, "Waiting for the browser. Didn't open? Go to:", width, ui_render.dim_style, 2);
     if (after >= 2 and after < 2 + l.waiting) {
-        // The whole address, wrapped, never cut.
         const url = p.sign_in_url orelse return .empty;
         const w = addressWidth(width);
         const from = @min((after - 2) * w, url.len);
@@ -296,8 +294,6 @@ fn serverRow(alloc: Allocator, arena: Allocator, shown: Projection, index: u16, 
     const r = shown.openRow() orelse return .empty;
     if (index == 0) return title(alloc, r.status.name, try serverMeta(arena, r), width);
     const l = shown.screenLayout(r, width);
-    // A filter typed since the last key can leave fewer items than the
-    // selection's place; draw it on the last one left.
     var p = shown;
     p.state.cursor = @min(p.state.cursor, l.selectable() -| 1);
     const window: usize = row_count - 1;
@@ -372,7 +368,6 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
                     if (std.mem.findScalarLast(u8, rest[0..end], ' ')) |space| {
                         if (space > 0) end = space;
                     }
-                    // Never inside a character.
                     while (end > 1 and end < rest.len and rest[end] & 0xC0 == 0x80) end -= 1;
                 }
                 out.lines[n] = .{ .text = rest[0..end], .style = .target };
@@ -581,7 +576,6 @@ test "a server's screen: facts, choices with their commands, then tools" {
         \\  search_code           Search for code.
         \\
     , text);
-    // On a tool, Enter does nothing, so the hint doesn't offer it.
     p.state.cursor = 2;
     try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p, &test_hints)[0]);
 }
@@ -635,7 +629,6 @@ test "Remove asks on the server's own screen, in the hint line, at the same size
     var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &.{} } };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
-    // Log out, then Remove.
     p.state.cursor = 1;
     const server_rows = menuRowCount(p, 88, 40);
     _ = menu.press(&p.state, .{ .rows = &rows, .open = rows[0], .layout = p.layout(rows[0]) }, .enter);
@@ -644,7 +637,6 @@ test "Remove asks on the server's own screen, in the hint line, at the same size
     try testing.expectEqualStrings("Remove github and its login from ~/.fx/mcp.json?     enter yes     esc no", hintVariants(p, &test_hints)[0]);
     try testing.expectEqualStrings("Remove github?  enter yes  esc no", hintVariants(p, &test_hints)[1]);
 
-    // A name that isn't plain stays out of the hint line.
     const odd_rows = [_]menu.Row{.{ .status = testStatus("x\x1b[2Jy", .ready) }};
     var odd: Projection = .{ .rows = &odd_rows, .tools = .{ .ready = &.{} } };
     menu.open(&odd.state);
@@ -665,12 +657,9 @@ test "a sign-in that waits shows its whole address on the server's screen" {
     defer testing.allocator.free(text);
     try testing.expect(std.mem.find(u8, text, "Waiting for the browser. Didn't open? Go to:") != null);
     try testing.expect(std.mem.find(u8, text, "Its tools show here once you log in.") == null);
-    // 44 columns a line at width 48, every piece there, in order.
     const first = std.mem.find(u8, text, "    " ++ url[0..44]).?;
     try testing.expect(std.mem.find(u8, text[first..], "    " ++ url[44..]) != null);
-    // Title, two facts and a blank, two choices, a blank and the heading, two address lines.
     try testing.expectEqual(@as(u16, 10), menuRowCount(p, 48, 40));
-    // No address, no extra lines.
     p.sign_in_url = null;
     try testing.expectEqual(@as(u16, 8), menuRowCount(p, 48, 40));
 }

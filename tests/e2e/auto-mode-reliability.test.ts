@@ -287,8 +287,6 @@ describe("lean auto mode reliability", () => {
             action: "run", command, profile: "clean", tty: true,
             yield_time_ms: 1000, timeout_ms: 45_000,
           } }),
-          // Terminals end with the fx process that started them, so the
-          // receiver and every input to it share one run.
           (body) => {
             const result = JSON.parse(toolResultText(body, "start_receiver"));
             expect(result.state).toBe("running");
@@ -301,8 +299,6 @@ describe("lean auto mode reliability", () => {
           (body) => {
             expect(toolResultText(body, "cautioned_input", "execution-denied")).toContain("review_caution");
             acceptedBeforeClear = existsSync(join(root.workspace, "accepted.txt"));
-            // A caution holds the exact action for the rest of the turn, so
-            // the reviewed retry ends the line with a carriage return instead.
             return fakeGatewayToolCall("supply_key", "shell", { request: {
               action: "interact", session_id: handle, chars: key + "\r", yield_time_ms: 1000,
             } });
@@ -331,8 +327,6 @@ describe("lean auto mode reliability", () => {
         cwd: root.workspace, env, timeoutMs: TIMEOUT,
       });
       expect(result.code, result.stderr).toBe(0);
-      // The cautioned input never reached the receiver; the cleared one did,
-      // and the finished receiver took no review.
       expect(acceptedBeforeClear).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(3);
       expect(readFileSync(join(root.workspace, "accepted.txt"), "utf8")).toBe(String(key.length));
@@ -1884,7 +1878,6 @@ describe("lean auto mode reliability", () => {
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(existsSync(marker)).toBe(false);
-      // One review attempt: a first send plus one transport retry.
       expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.requests).toHaveLength(4);
       expect(JSON.parse(result.stdout).output).toContain("Unavailable review handled normally.");

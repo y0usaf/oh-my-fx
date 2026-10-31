@@ -173,10 +173,8 @@ pub fn toolsFor(row: Row, tools: Tools) Tools {
 pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) Layout {
     var buf: [max_choices]Choice = undefined;
     return .{
-        // http or runs, file, and error when there is one; then a blank.
         .lead = 2 + @as(usize, @intFromBool(showsError(row))) + 1,
         .choices = choices(row, &buf).len,
-        // A blank, then the heading or the reason there are no tools.
         .gap = 2,
         .tools = toolCount(tools, filter),
         .window = window,
@@ -350,13 +348,11 @@ pub fn press(s: *State, view: View, key: Key) Effect {
             keepVisible(s, l);
             return .none;
         },
-        // Nothing moves while a confirmation is open.
         .confirm => {
             const r = view.open orelse return settle(s, view);
             const c = s.confirm.?;
             switch (key) {
                 .enter => {
-                    // A removed server has no screen to come back to.
                     s.screen = if (c == .remove) .list else .server;
                     s.confirm = null;
                     if (c == .remove) {
@@ -477,7 +473,6 @@ test "the status line puts news first, then what needs the user, then a count" {
     try testing.expectEqualStrings("plain needs login · /mcp", statusLine(&buf, &.{ plain, ready, off }, null, null, 0));
     try testing.expectEqualStrings("2 MCP servers need you · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
     try testing.expectEqualStrings("MCP config has 2 problems · /mcp list", statusLine(&buf, &.{ready}, null, null, 2));
-    // Disabled servers aren't counted.
     try testing.expectEqualStrings("mcp 1/1", statusLine(&buf, &.{ ready, off }, null, null, 0));
     try testing.expectEqualStrings("", statusLine(&buf, &.{}, null, null, 0));
 }
@@ -531,7 +526,6 @@ test "the filter is a case-insensitive part of the name" {
     var buf: [2]Row = undefined;
     var s: State = .{ .active = true };
     try testing.expectEqual(@as(usize, 1), viewOf(&s, &rows, "LIN", .loading, &buf).rows.len);
-    // The open server is found among all servers, whatever the filter.
     s.select("context7");
     s.screen = .server;
     try testing.expectEqualStrings("context7", viewOf(&s, &rows, "lin", .loading, &buf).open.?.status.name);
@@ -546,10 +540,8 @@ test "the list keeps its selection by name, and Enter opens the server" {
     _ = press(&s, .{ .rows = &rows }, .down);
     _ = press(&s, .{ .rows = &rows }, .down);
     try testing.expectEqualStrings("docs", s.selectedName());
-    // A reload that drops a server above doesn't move the selection.
     const fewer = [_]Row{ rows[1], rows[2] };
     try testing.expectEqual(@as(?usize, 1), s.selectedIndex(&fewer));
-    // A filter that hides the selection falls back to the first match.
     const filtered = [_]Row{rows[0]};
     try testing.expectEqual(@as(?usize, 0), s.selectedIndex(&filtered));
     const effect = press(&s, .{ .rows = &filtered }, .enter);
@@ -570,7 +562,6 @@ test "on a server, the next step is selected, and asking actions confirm first" 
     _ = press(&s, view, .down);
     try testing.expectEqual(Effect.none, press(&s, view, .enter));
     try testing.expectEqual(Screen.confirm, s.screen);
-    // Nothing moves while the confirmation is open, and Esc cancels it.
     _ = press(&s, view, .up);
     try testing.expectEqual(@as(usize, 1), s.cursor);
     _ = press(&s, view, .escape);
@@ -578,7 +569,6 @@ test "on a server, the next step is selected, and asking actions confirm first" 
     _ = press(&s, view, .enter);
     const removed = press(&s, view, .enter);
     try testing.expectEqual(Choice.remove, removed.run.choice);
-    // Confirmed, Remove goes straight back to the list.
     try testing.expectEqual(Screen.list, s.screen);
     try testing.expectEqual(@as(usize, 0), s.cursor);
     try testing.expectEqual(Effect.close, press(&s, view, .escape));
@@ -596,10 +586,8 @@ test "the selection moves on from the choices through the tools, and the screen 
     const view: View = .{ .rows = &.{}, .open = r, .layout = layout };
     for (0..10) |_| _ = press(&s, view, .down);
     try testing.expectEqual(@as(usize, 10), s.cursor);
-    // The selected tool is in view, between the counts above and below.
     const at = layout.line(s.cursor);
     try testing.expect(at >= s.top and at < s.top + layout.shown());
-    // Enter on a tool does nothing.
     try testing.expectEqual(Effect.none, press(&s, view, .enter));
     for (0..40) |_| _ = press(&s, view, .down);
     try testing.expectEqual(@as(usize, 31), s.cursor);
@@ -616,15 +604,12 @@ test "typing on a server's screen narrows its tools; the list keeps its own filt
     };
     const r = testRow("datadog", .ready, .{ .signed_in = true });
     try testing.expectEqual(@as(usize, 3), toolCount(.{ .ready = &tools }, ""));
-    // By name or by description, in any case.
     try testing.expectEqual(@as(usize, 3), toolCount(.{ .ready = &tools }, "_"));
     try testing.expectEqual(@as(usize, 1), toolCount(.{ .ready = &tools }, "FIND"));
     try testing.expectEqualStrings("_dd_gff", nthTool(&tools, "flag", 0).?.name);
     try testing.expectEqual(@as(?Tool, null), nthTool(&tools, "flag", 1));
     try testing.expectEqual(@as(usize, 0), toolCount(.loading, ""));
 
-    // A filter selects the first tool it keeps, past the choices; none left,
-    // or none typed, goes back to the first choice.
     var s: State = .{ .active = true, .screen = .server, .cursor = 4 };
     var layout = serverLayout(r, .{ .ready = &tools }, "monitor", 8);
     try testing.expectEqual(@as(usize, 1), layout.tools);
@@ -637,11 +622,9 @@ test "typing on a server's screen narrows its tools; the list keeps its own filt
     var list: State = .{ .active = true };
     list.keepListFilter("dat");
     try testing.expectEqualStrings("dat", list.listFilter());
-    // Never cut inside a character.
     const long = text_utils.repeat("a", name_capacity - 1) ++ "é";
     list.keepListFilter(long);
     try testing.expectEqual(@as(usize, name_capacity - 1), list.listFilter().len);
-    // Off a server's screen a filter changes nothing.
     list.cursor = 0;
     filterChanged(&list, .{ .rows = &.{} }, true);
     try testing.expectEqual(@as(usize, 0), list.cursor);
@@ -652,7 +635,6 @@ test "a server that goes away takes its screen back to the list" {
     try testing.expectEqual(Effect.back, settle(&s, .{ .rows = &.{} }));
     try testing.expectEqual(Screen.list, s.screen);
     try testing.expect(s.confirm == null);
-    // Fewer choices after a login clamp the cursor.
     const r = testRow("linear", .ready, .{});
     s = .{ .active = true, .screen = .server, .cursor = 3 };
     _ = settle(&s, .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .loading, "", 9) });

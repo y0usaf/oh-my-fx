@@ -184,7 +184,6 @@ test "key field shows a placeholder when empty and one bullet per byte" {
     const typed = writeKeyField(&buf, 3);
     try std.testing.expectEqualStrings(key_field_prefix ++ "\u{2022}\u{2022}\u{2022}", typed);
 
-    // A long key must not run past the buffer the column renders from.
     const clamped = writeKeyField(&buf, max_key_mask_glyphs * 4);
     try std.testing.expect(clamped.len <= max_key_field_bytes);
 }

@@ -83,7 +83,6 @@ fn joinTextBlocks(alloc: Allocator, blocks: std.json.Value) ParseError![]u8 {
         if (kind != .string or !std.mem.eql(u8, kind.string, "text") or value != .string) {
             return error.UnsupportedSystemPromptBlock;
         }
-        // `text` never exceeds `max_bytes`, so the subtraction cannot wrap.
         const separator_len: usize = if (index == 0) 0 else block_separator.len;
         const added = value.string.len + separator_len;
         if (added > max_bytes - text.items.len) return error.SystemPromptTooLarge;
@@ -119,8 +118,6 @@ pub fn load(
         else => return err,
     };
     defer file.deinit();
-    // The reader rejects a file that reaches its limit, so allow one byte
-    // more to accept a prompt of exactly `max_bytes`.
     const text = try file.readToEnd(alloc, max_bytes + 1);
     errdefer alloc.free(text);
     if (text.len == 0 or !validText(text)) return error.InvalidSystemPromptText;
@@ -201,7 +198,6 @@ test "client system prompt of exactly the size limit survives a restore" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Session directories must be private for the child store to open them.
     try tmp.dir.createDir(std.testing.io, "session", std.Io.File.Permissions.fromMode(0o700));
     var session_dir = try tmp.dir.openDir(std.testing.io, "session", .{ .iterate = true, .follow_symlinks = false });
     defer session_dir.close(std.testing.io);

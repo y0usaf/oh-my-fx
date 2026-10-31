@@ -67,9 +67,6 @@ pub const ChangeTracker = struct {
                 }
 
                 std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), op.path) catch |err| {
-                    // An already-absent file has reached the requested state. Every
-                    // other failure leaves the file's state uncertain and must not
-                    // be reported as a successful deletion.
                     if (err != error.FileNotFound) {
                         traceUnavailable(op, "delete_created", err);
                         return .{ .unavailable = op.path };
@@ -418,7 +415,6 @@ test "undoLast pops before filesystem restore failures, reports them, and does n
     }
     try std.testing.expectEqual(@as(usize, 0), tracker.stack.items.len);
     try expectMissing(path);
-    // The stack is empty now, which is a different answer from a failed restore.
     try std.testing.expect(tracker.undoLast(alloc) == .empty);
 }
 
@@ -447,7 +443,6 @@ test "undoLast leaves the original file intact when the restore write fails" {
         .timestamp_ms = 1,
     });
 
-    // Fail every write past 4 KiB, without the file-size signal killing the test process.
     const file_size_guard = try limitFileSizeForTest(4096, false);
     defer file_size_guard.restore();
 
@@ -487,8 +482,6 @@ test "undo refuses a file whose directory denies writes and leaves it intact" {
         .timestamp_ms = 1,
     });
 
-    // The file cannot be replaced atomically here, and a direct overwrite could
-    // leave it half replaced, so undo reports that it could not act.
     switch (tracker.undoLast(alloc)) {
         .unavailable => |reported| alloc.free(reported),
         else => return error.ExpectedUnavailable,
@@ -548,8 +541,6 @@ test "a locked directory plus a failing write never leaves a half-replaced file"
     const current = "the bytes the user has right now";
     try writeAbsolute(path, current);
 
-    // Large enough that any direct overwrite would be cut short by the limit
-    // below, which is what would leave a prefix of preimage bytes behind.
     const preimage = try alloc.alloc(u8, 64 * 1024);
     defer alloc.free(preimage);
     @memset(preimage, 'R');
@@ -578,7 +569,6 @@ test "a locked directory plus a failing write never leaves a half-replaced file"
         else => return error.ExpectedUnavailable,
     }
 
-    // Not shortened, not partly rewritten: exactly the bytes that were there.
     const survived = try readAbsolute(alloc, path);
     defer alloc.free(survived);
     try std.testing.expectEqualStrings(current, survived);

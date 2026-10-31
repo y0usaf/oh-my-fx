@@ -144,7 +144,6 @@ pub fn annotations(schema: []const u8, out: *[max_annotations]Annotation) Invali
             .string, .number, .true, .false, .null, .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4, .partial_number => {
                 if (top == 0) return error.Malformed;
                 const frame = &frames[top - 1];
-                // A key written with escapes arrives in pieces; it matches nothing.
                 const whole = token == .string or token == .number or token == .true or token == .false or token == .null;
                 if (!frame.is_array and frame.key == null) {
                     frame.key = if (token == .string) token.string else "";
@@ -163,7 +162,6 @@ pub fn annotations(schema: []const u8, out: *[max_annotations]Annotation) Invali
                     frame.type = token.string;
                 }
                 if (!whole) {
-                    // An escaped x-mcp-header value is never a valid token.
                     if (std.mem.eql(u8, key, "x-mcp-header")) return error.NotToken;
                     try skipRest(&scanner);
                 }

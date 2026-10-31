@@ -1,4 +1,3 @@
-// `libfx/chatgpt` (chatgpt-sign-in.js): sign in with ChatGPT for a Codex agent.
 import type { FxProviderCredentials, FxFetch } from "./libfx.cjs";
 
 /** Options every network step accepts. */

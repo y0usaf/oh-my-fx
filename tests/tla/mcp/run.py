@@ -88,9 +88,6 @@ def classify(returncode, output, mode, mutant=None):
         caught = returncode == SAFETY_VIOLATION_EXIT and f"Invariant {mutant['invariant']} is violated" in output
         return 'CAUGHT' if caught else 'NOT_CAUGHT'
     if mutant and mutant.get('property'):
-        # TLC does not name the temporal property it violated, so the run's
-        # config keeps only that one property (keep_property). An action
-        # property ([][A]_v, U12's Isolation) is named when it breaks.
         caught = returncode == LIVENESS_VIOLATION_EXIT and (LIVENESS_MARKER in output or f"Action property {mutant['property']} is violated" in output)
         return 'CAUGHT' if caught else 'NOT_CAUGHT'
     if returncode != 0 or 'Error:' in output or 'Fatal errors' in output:
@@ -291,8 +288,6 @@ def main(argv=None):
     java, java_version = find_java()
     jar, pin = pinned_jar()
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]
-    # By default a new private folder (mkdtemp), so another user cannot plant
-    # a file or link where a log will be written.
     evidence = Path(args.evidence_dir or tempfile.mkdtemp(prefix='fx-tla-mcp-')).resolve()
     reports = {}
     for unit in sorted({e['unit'] for e, _, _, _ in runs}):

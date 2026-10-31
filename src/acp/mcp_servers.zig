@@ -132,7 +132,6 @@ fn prepareHost(
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
 ) Allocator.Error!Preparation {
     const home = io_mod.homeDir() orelse return .{ .failed = try alloc.dupe(u8, "MCP servers need HOME to be set.") };
-    // Read only while the host starts.
     var inherited = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failed = try alloc.print("MCP servers could not read the environment: {s}", .{@errorName(err)}) },
@@ -158,7 +157,6 @@ pub fn prepare(
     host_channel: ?message_carrier.Carrier,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .{ .ready = null };
-    // MCP-v2 starts each server when the model first needs it.
     if (mcp_host.selected()) return prepareHost(alloc, configs.items.items, elicitation_capabilities, legacy_url_completion_sink);
 
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
@@ -230,8 +228,6 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
     };
 }
 
-// Keep fallible config construction behind caller-owned storage so error
-// returns do not materialize the complete config payload.
 noinline fn parseServerInto(
     out: *mcp_contract.McpServerConfig,
     alloc: Allocator,

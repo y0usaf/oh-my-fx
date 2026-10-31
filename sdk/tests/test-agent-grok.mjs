@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-// A Grok (Grok plan) agent: the engine's requests reach xAI's subscription
-// proxy through the host fetch with the host's Grok credentials, refreshed
-// when needed, and never touch AI Gateway. No network: every request is
-// answered here.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -95,7 +91,6 @@ const assertNoSecrets = (value, secrets) => {
   for (const secret of secrets) assert.equal(text.includes(secret), false, "libfx diagnostics must not expose Grok credentials");
 };
 
-// 1. A Grok turn on the host's credentials, with no Gateway request.
 {
   const world = grokWorld({});
   const asked = [];
@@ -139,7 +134,6 @@ const assertNoSecrets = (value, secrets) => {
   assertNoSecrets(events, ["at-first", "rt-1"]);
 }
 
-// 2. A rejected token is refreshed once, checked against the account, and the request sent again.
 {
   const world = grokWorld({ rejectFirstReply: true, refreshedToken: "at-second" });
   const saved = [];
@@ -171,7 +165,6 @@ const assertNoSecrets = (value, secrets) => {
   assertNoSecrets(events, ["at-rejected", "at-second", "rt-1", "rt-2"]);
 }
 
-// 3. Credentials about to expire are refreshed before the request.
 {
   const world = grokWorld({ refreshedToken: "at-fresh" });
   const { result } = await runTurn({ fetch: world.fetch, credentials: () => credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 }) });
@@ -182,9 +175,7 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 4. A refresh that comes back for another account is never used or saved.
 {
-  // Every request on the user's own token is rejected, so only a refresh could finish the turn.
   const world = grokWorld({ rejectToken: "at-mine", refreshedToken: "at-other", refreshedAccount: "someone-else" });
   const saved = [];
   const outcome = await runTurn({
@@ -200,7 +191,6 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 5. A durable session asks for its own session's credentials.
 {
   const world = grokWorld({});
   const asked = [];
@@ -227,8 +217,6 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 6. One agent's sessions refresh an account once, and each session hears the
-// refreshed credentials, for a host that keeps them per session.
 {
   const world = grokWorld({ refreshedToken: "at-shared" });
   const saved = [];
@@ -257,8 +245,6 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 7. A rejection that arrives after another session refreshed retries on the
-// new token instead of spending the old refresh token again.
 {
   const world = grokWorld({ refreshedToken: "at-new" });
   let rejected = 0;
@@ -268,7 +254,6 @@ const assertNoSecrets = (value, secrets) => {
   const late = new Promise((resolve) => { releaseLate = resolve; });
   const fetch = async (input, init = {}) => {
     const url = String(input?.url ?? input);
-    // The refresh finishes only once both sessions have sent the old token.
     if (url === tokenUrl) await bothSent;
     if (url === responsesUrl) {
       const authorization = new Headers(init.headers).get("authorization");
@@ -276,7 +261,6 @@ const assertNoSecrets = (value, secrets) => {
         rejected += 1;
         if (rejected === 2) {
           secondSent();
-          // Rejected only after the first session's refresh has finished.
           await late;
         }
         return Response.json({ error: "token expired" }, { status: 401 });
@@ -307,13 +291,9 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 8. Two servers that share a lock refresh an account once: the second waits,
-// then uses the credentials the first saved.
 {
   const world = grokWorld({ refreshedToken: "at-renewed" });
   let stored = credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 });
-  // The refresh finishes only once both servers have asked for credentials, so
-  // without the lock each would spend the refresh token.
   const asked = new Set();
   let bothAsked;
   const ready = new Promise((resolve) => { bothAsked = resolve; });
@@ -355,8 +335,6 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// A lock that never runs the refresh fails the request instead of sending the
-// expiring credentials.
 {
   const world = grokWorld({ refreshedToken: "at-unused" });
   const outcome = await runTurn({
@@ -369,7 +347,6 @@ const assertNoSecrets = (value, secrets) => {
   assert.equal(replyRequests(world.log).length, 0, "nothing is sent on credentials the lock never refreshed");
 }
 
-// 9. Options are checked before anything starts.
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "grok", model: "grok-4.5" }), /provider "grok" needs a credentials\(\) function/);
 await assert.rejects(
   createFxEngine({ ...backendOptions, provider: "grok", model: "grok-4.5", credentials: () => credentialsFor("at-first"), refreshLock: "lock" }),

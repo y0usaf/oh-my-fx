@@ -184,8 +184,6 @@ pub fn compactIfNeeded(
             debug_trace.logf("session", "event=session_log_compaction_deferred id={s} spill_failures={d}; retrying on next resume", .{ session_id, stats.spill_failures });
             return .deferred;
         }
-        // Nothing spilled: pin the current log so later resumes skip the
-        // scan until the log changes.
         try writeMarkerBestEffort(alloc, dir, session_id, .{ .log_len = log_len, .tail_crc = tail_crc });
         debug_trace.logf(
             "session",
@@ -259,8 +257,6 @@ fn rewriteLog(
 
     while (true) {
         const line = readLogLine(alloc, &reader, log_len) catch |err| switch (err) {
-            // A torn tail is the open scan's truncation case: stop copying at
-            // the last complete frame and let the tmp end there.
             error.TruncatedEventFrame => break,
             else => return err,
         } orelse break;
@@ -272,8 +268,6 @@ fn rewriteLog(
             return err;
         };
         defer parsed.deinit();
-        // The frame boundary only advances past fully decoded frames; the tmp
-        // copy range never includes a torn tail.
         complete_end = line.next_offset;
 
         const spill = spillablePresentation(parsed.value.event) orelse continue;
@@ -317,17 +311,11 @@ fn rewriteLog(
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.DiffContentTooLarge => {
-                // A valid event frame can exceed the stricter artifact-pack
-                // limit. It must remain inline permanently, but it must not
-                // force every future resume to retry the impossible spill.
                 debug_trace.logf("session", "event=diff_content_spill_skipped call_id={s} reason=artifact_too_large inline_bytes={d}", .{ spill.result.call_id, spill.inline_bytes });
                 stats.intentionally_inline += 1;
                 continue;
             },
             else => {
-                // Store hiccups mirror the commit-time rule: keep this frame
-                // inline and continue with the rest of the log. Do not publish
-                // a freshness marker: the next resume must retry this spill.
                 debug_trace.logf("session", "event=diff_content_spill_failed call_id={s} err={s}; keeping presentation inline", .{ spill.result.call_id, @errorName(err) });
                 unresolved = true;
                 stats.spill_failures += 1;
@@ -563,9 +551,6 @@ fn renameCompactedLog(
     var current = try openRegularFile(dir, events_file, .read_only);
     current.close(zio);
 
-    // The durable pending fence survives a post-rename sync failure. A later
-    // writer must resolve it before opening events.jsonl, making whichever
-    // atomic rename state is visible durable before new events can append.
     try io_mod.durableReplaceVerified(alloc, dir, pending_file, "1\n");
     try dir.dir.rename(tmp_file, dir.dir, events_file, zio);
     test_controls.syncDir(dir.dir) catch |err| {
@@ -668,8 +653,6 @@ fn recoverPendingReplacement(dir: *io_mod.VerifiedDir, session_id: []const u8) !
         return error.SessionCompactionPersistenceUncertain;
     }
 
-    // First make the currently visible atomic-rename state durable. Only then
-    // may the fence and any pre-rename temp be removed.
     io_mod.syncVerifiedDir(dir.dir) catch |err| {
         debug_trace.logf("session", "event=session_log_compaction_recovery_uncertain id={s} err={s}", .{ session_id, @errorName(err) });
         return error.SessionCompactionPersistenceUncertain;
@@ -698,10 +681,6 @@ fn cleanupStaleArtifacts(dir: *io_mod.VerifiedDir, session_id: []const u8) !void
         debug_trace.logf("session", "event=session_log_compaction_cleanup id={s} stale_tmp_files={d}", .{ session_id, removed });
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const test_session_id = "0123456789abcdef0123456789abcdef";
 
@@ -770,8 +749,6 @@ fn writeFatSessionLog(alloc: Allocator, dir: *io_mod.VerifiedDir, fat: []const u
         .completeness = .complete,
         .committed_file_presentation = fixtureFatPresentation(fat),
     } });
-    // A second fat edit so the rewrite crosses multiple spills and the
-    // verbatim ranges between them.
     try appendFixtureFrame(alloc, &file, 4, .{ .tool_call = .{
         .call_id = "call-edit-2",
         .tool_name = "edit_file",
@@ -849,8 +826,6 @@ fn lineAt(text: []const u8, target: usize) ?[]const u8 {
 }
 
 fn fixtureFatContent() []const u8 {
-    // ~136 KB per copy: two copies push the fixture log past the 256 KB
-    // log-size gate so tests exercise the real (unforced) entry condition.
     return text_utils.repeat("FIXTURE_DIFF_LINE_0123456789abcdef\n", 4000);
 }
 
@@ -879,8 +854,6 @@ test "compaction spills inline snapshots and preserves every frame" {
         try std.testing.expectEqualStrings(lineAt(before, index).?, lineAt(after, index).?);
     }
 
-    // Every surviving frame decodes and replays in order; only the
-    // tool_result frame changed shape, by moving snapshots behind a handle.
     var frames: usize = 0;
     var saw_spilled_result = false;
     var handle_buf: []const u8 = "";
@@ -905,15 +878,11 @@ test "compaction spills inline snapshots and preserves every frame" {
     try std.testing.expectEqual(@as(usize, 7), frames);
     try std.testing.expect(saw_spilled_result);
 
-    // The marker pins the exact post-compaction log state: length and tail
-    // CRC must match the file on disk, or the next resume re-scans needlessly.
     const marker = (try readMarker(&dir)).?;
     try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, pending_file, .{}));
     try std.testing.expectEqual(@as(u64, after.len), marker.log_len);
     try std.testing.expectEqual(try tailPin(alloc, &dir, @intCast(after.len)), marker.tail_crc);
 
-    // The spilled artifact holds the exact contents; read it through the same
-    // digest-verifying path resume uses.
     const base = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
     defer alloc.free(base);
     const result_dir = try std.Io.Dir.path.join(alloc, &.{ base, "tool-results" });
@@ -922,8 +891,6 @@ test "compaction spills inline snapshots and preserves every frame" {
     defer alloc.free(artifact);
     try std.testing.expect(std.mem.find(u8, artifact, "FIXTURE_DIFF_LINE") != null);
 
-    // The compacted log is small, so the log-size gate makes a second pass a
-    // no-op before the marker is even consulted.
     const second = try compactIfNeeded(alloc, &dir, test_session_id, .{});
     try std.testing.expectEqual(Outcome.skipped_small_log, second);
 }
@@ -969,8 +936,6 @@ test "compaction keeps a clean log byte-identical and pins it" {
     const before = try readLogText(alloc, &dir);
     defer alloc.free(before);
 
-    // Force past the log-size gate to prove the no-spill path leaves the file
-    // untouched and records the marker.
     const outcome = try compactIfNeeded(alloc, &dir, test_session_id, .{ .force = true });
     try std.testing.expectEqual(Outcome.no_inline_payloads, outcome);
     const after = try readLogText(alloc, &dir);
@@ -992,8 +957,6 @@ test "compaction keeps the original log when the store cannot spill" {
     const before = try readLogText(alloc, &dir);
     defer alloc.free(before);
 
-    // A regular file named tool-results blocks artifact creation, forcing
-    // every spill to fail; the pass must keep the original bytes.
     const blocker = try dir.dir.createFile(std.testing.io, "tool-results", .{});
     blocker.close(std.testing.io);
 
@@ -1002,8 +965,6 @@ test "compaction keeps the original log when the store cannot spill" {
     const after = try readLogText(alloc, &dir);
     defer alloc.free(after);
     try std.testing.expectEqualStrings(before, after);
-    // No tmp file or freshness marker may survive a failed pass: once the
-    // transient blocker disappears, the next resume must retry.
     try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, tmp_file, .{}));
     try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, marker_file, .{}));
     try dir.dir.deleteFile(std.testing.io, "tool-results");
@@ -1115,8 +1076,6 @@ test "compaction reports persistence uncertainty after rename sync failure" {
     try dir.dir.access(std.testing.io, pending_file, .{});
     try std.testing.expectError(error.FileNotFound, dir.dir.access(std.testing.io, marker_file, .{}));
 
-    // A later writable resume resolves the durable fence before it can skip
-    // the now-small log or append any new event.
     try std.testing.expectEqual(
         Outcome.skipped_small_log,
         try compactIfNeeded(alloc, &dir, test_session_id, .{}),
@@ -1186,8 +1145,6 @@ test "compaction drops a torn tail the way the open scan truncates it" {
 
     const fat = fixtureFatContent();
     try writeFatSessionLog(alloc, &dir, fat);
-    // Append a torn partial frame: the open scan would truncate it, so the
-    // compacted log must end at the last complete frame.
     var file = try dir.dir.openFile(std.testing.io, events_file, .{ .mode = .write_only });
     {
         defer file.close(std.testing.io);
@@ -1216,7 +1173,6 @@ test "compaction validation rejects a corrupted rewrite" {
     var file = try dir.dir.createFile(std.testing.io, tmp_file, .{ .truncate = true });
     {
         defer file.close(std.testing.io);
-        // seq jumps 1 -> 3, which transition validation must reject.
         try appendFixtureFrame(alloc, &file, 1, .{ .user = .{ .text = "seed" } });
         try appendFixtureFrame(alloc, &file, 3, .{ .assistant = .{ .text = "jump" } });
     }
@@ -1230,8 +1186,6 @@ test "compaction skips a fresh log without parsing it" {
     var dir = try openTestDir(&tmp);
     defer dir.close();
 
-    // A big but clean log (no spillable payloads) is the case the freshness
-    // marker exists for: the first pass scans once, later passes skip.
     var file = try dir.dir.createFile(std.testing.io, events_file, .{ .truncate = true });
     {
         defer file.close(std.testing.io);
@@ -1255,8 +1209,6 @@ test "compaction skips a fresh log without parsing it" {
     const second = try compactIfNeeded(alloc, &dir, test_session_id, .{});
     try std.testing.expectEqual(Outcome.skipped_fresh, second);
 
-    // Corrupt the tail with equal length: the pin must change and the third
-    // pass must re-scan rather than trust a stale marker.
     var tampered = try alloc.dupe(u8, before);
     defer alloc.free(tampered);
     const tail_at = std.mem.findLast(u8, tampered, "STEERING_PAD_LINE").?;

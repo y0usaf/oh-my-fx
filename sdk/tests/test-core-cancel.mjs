@@ -101,7 +101,6 @@ for (const stage of ["headers", "body", "late-body", "close"]) {
           pull() { started(); },
         }, { highWaterMark: 0 }));
       }
-      // A host may settle after cancellation even when it receives the signal.
       return new Promise((resolveFetch) => {
         const response = new Response(new ReadableStream({
           start(body) { finishLateBody = () => { try { body.close(); } catch {} }; },

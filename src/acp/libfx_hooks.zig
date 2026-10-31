@@ -171,8 +171,6 @@ const Content = struct {
     }
 
     fn schema(self: *Content, alloc: std.mem.Allocator, value: anytype) !?[]const u8 {
-        // A schema is either complete JSON or null, never a JSON prefix posing
-        // as a usable schema. Bound its serialization before allocating a copy.
         var storage: [8192]u8 = undefined;
         var out = std.Io.Writer.fixed(&storage);
         const success = if (@TypeOf(value) == schemas.ObjectSchema) blk: {
@@ -205,7 +203,6 @@ const Content = struct {
     }
 
     fn planModel(self: *Content, alloc: std.mem.Allocator, value: anytype) !ModelAllotment {
-        // Reserve by relevance, then serialize in the original wire order.
         const messages_plan = try self.planMessages(alloc, value.request.messages, true);
         const instructions_plan = try self.planMessages(alloc, value.request.instructions, false);
         const tool_count = @min(max_entries, value.request.tools.advertised_functions.len + value.request.tools.additional_functions.len + value.request.tools.selected_dynamic.len);
@@ -462,7 +459,6 @@ test "libfx hook content is opt in bounded and excludes opaque provider state" {
     const alloc = std.testing.allocator;
     const secret_message = types.ChatMessage{ .role = .assistant, .content = "visible", .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture" }, .parts_json = "opaque-secret" } };
     var bridge: Bridge = undefined;
-    // Only the serialization fields are used by this test.
     bridge.session_id = "fixture-session";
     bridge.root_session_id = "fixture-session";
     bridge.parent_session_id = null;

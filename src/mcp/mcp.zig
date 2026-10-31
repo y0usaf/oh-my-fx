@@ -65,8 +65,6 @@ pub const core = struct {
 };
 
 test {
-    // Reference every file in the module here so `zig test src/mcp/mcp.zig`
-    // runs all of their inline tests.
     _ = wire;
     _ = tools;
     _ = mrtr;

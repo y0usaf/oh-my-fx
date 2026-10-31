@@ -39,14 +39,11 @@ const Allocator = std.mem.Allocator;
 
 pub const Size = window.Size;
 
-// Reaching the model; the caller hands in a `ModelCaller`.
 pub const ModelCaller = model.ModelCaller;
 pub const Call = model.Call;
 pub const CallError = model.CallError;
 pub const Reply = model.Reply;
 
-// Compaction notes: the `context_compaction` trace scope and the bounded
-// events `/trace` shows.
 pub const traceEvent = trace.info;
 pub const traceFailure = trace.failure;
 pub const traceEventIf = trace.infoIf;
@@ -56,17 +53,13 @@ pub const trace_ring_capacity = trace.ring_capacity;
 pub const snapshotTrace = trace.snapshot;
 pub const resetTrace = trace.reset;
 
-// The `auto_compact_percent` setting.
 pub const default_percent = settings.default_percent;
 pub const isValidPercent = settings.isValidPercent;
 pub const resolvePercent = settings.resolvePercent;
 
-// Saved checkpoints, read back when a session is loaded or shown.
 pub const modelText = checkpoint.modelText;
 pub const replacesPriorContext = checkpoint.replacesPriorContext;
 
-// Saved turns (M1, M2, ...), tool calls (T1, T2, ...) and earlier
-// compactions (L1, L2, ...).
 pub const Store = records.Store;
 pub const max_search_phrases = records.max_search_phrases;
 pub const RecordFileBuffer = [records.max_file_name_bytes]u8;
@@ -178,8 +171,6 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         alloc.destroy(arena);
         return null;
     };
-    // Cancellation is checked only after `.chosen`, so a caller showing
-    // progress always sees the compaction it cancelled.
     try Progress.report(request.progress, .chosen);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (!model_provider.authorizesCredential(caller.provider, caller.credential_source)) {
@@ -199,8 +190,6 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     if (turns.len == 0) return error.NothingToCompact;
     var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
     trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
-    // The caller's allocator, so the summary gives its working memory back
-    // when it is done instead of keeping it in this result.
     var summary = try summarize.compact(alloc, .{
         .model = caller.model,
         .earlier = earlier,
@@ -243,8 +232,6 @@ fn earlierFrom(arena: Allocator, store: ?Store, earlier: ?[]const u8) !?summariz
     const saved = earlier orelse return null;
     if (try checkpoint.parse(arena, saved)) |payload| return payload;
     if (try legacyEarlier(arena, store, saved)) |legacy| return legacy;
-    // An unreadable checkpoint may have saved turns, tool calls and ledgers
-    // already; numbering after them keeps the new ones from replacing them.
     const highest: records.Highest = if (store) |kept| try records.highestSaved(arena, kept) else .{};
     if (highest.turns > 0 or highest.tools > 0 or highest.ledgers > 0) trace.log(false, "earlier checkpoint unreadable; new records are numbered after the saved ones turns={d} tools={d} ledgers={d}", .{ highest.turns, highest.tools, highest.ledgers });
     return .{ .earlier = saved, .turn_count = highest.turns, .tool_count = highest.tools, .ledger_count = highest.ledgers };
@@ -336,11 +323,9 @@ test "a question's result gives the user's answers, not the questions" {
     try std.testing.expectEqual(@as(usize, 2), answers.len);
     try std.testing.expectEqualStrings("Block 6 before Block 5", answers[0]);
     try std.testing.expectEqualStrings("Legitimate, push", answers[1]);
-    // A result that lists no answers, like an error, gives none.
     try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "The user dismissed the question.")).len);
     try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "[{\"question\":\"Push it?\"}]")).len);
 
-    // Only the question tool's result carries answers into the turn.
     const result = "[{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]";
     var items: std.ArrayList(summarize.Item) = .empty;
     try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = question_tool, .content = result });
@@ -364,7 +349,6 @@ test "a clipped result keeps the handle of its saved whole output" {
     const handle = "result-read_tool_result-2.txt";
     const clipped_page: types.ToolResultMemory = .{ .output_handle = handle, .truncated = true };
     try std.testing.expectEqualStrings(handle, savedOutputHandle(clipped_page, "first page\n... [tool result truncated]"));
-    // The model saw the whole text, or the text names the handle already.
     try std.testing.expectEqualStrings("", savedOutputHandle(.{ .output_handle = handle }, "whole text"));
     try std.testing.expectEqualStrings("", savedOutputHandle(clipped_page, "preview; full result: " ++ handle));
     try std.testing.expectEqualStrings("", savedOutputHandle(null, "no memory"));
@@ -389,11 +373,8 @@ test "an unreadable checkpoint numbers new turns, tool calls and ledgers after t
     try std.testing.expectEqual(@as(usize, 3), earlier.turn_count);
     try std.testing.expectEqual(@as(usize, 7), earlier.tool_count);
     try std.testing.expectEqual(@as(usize, 2), earlier.ledger_count);
-    // Without a store nothing was saved, so numbering starts at one.
     try std.testing.expectEqual(@as(usize, 0), (try earlierFrom(arena, null, broken)).?.turn_count);
 
-    // A count no session reaches is damage too, as is a record numbered past
-    // it; numbering on from either would overflow.
     const impossible = std.fmt.comptimePrint("fx-compactor-v1\n{{\"tool_count\":{d}}}", .{std.math.maxInt(usize)});
     try store.write(arena, std.fmt.comptimePrint("compacted-T{d}.txt", .{std.math.maxInt(usize)}), "damaged");
     const recovered = (try earlierFrom(arena, store, impossible)).?;

@@ -169,7 +169,6 @@ fn matchPathname(pattern: *const Pattern, path: []const u8, base: []const u8, fo
         text = text[1..];
         literal_len -|= 1;
     }
-    // `base` ends in `/`, or is empty; `decide` already checked the prefix.
     var name = path[base.len..];
     if (literal_len > 0) {
         if (literal_len > name.len) return false;
@@ -256,9 +255,7 @@ test "gitignore precedence: deeper lists win, negation re-includes, excluded par
     try std.testing.expectEqual(Decision.excluded, decide(&lists, "x.tmp", false, false));
     try std.testing.expectEqual(Decision.included, decide(&lists, "important.out", false, false));
     try std.testing.expectEqual(Decision.excluded, decide(&lists, "sub/only-here", false, false));
-    // A sub list never applies to the directory that holds it.
     try std.testing.expectEqual(Decision.none, decide(&lists, "only-here", false, false));
-    // Re-including a file inside an excluded directory does not work in git.
     const reinclude = try testList(arena, "", "logs/\n!logs/keep.txt\n");
     const reinclude_lists = [_]*const PatternList{reinclude};
     try std.testing.expect(isPathExcluded(&reinclude_lists, "logs/keep.txt", false, false));
@@ -284,9 +281,6 @@ test "gitignore keeps git's literal-prefix split before double asterisks" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // Literal head `a`, remainder `**/b` matched as a leading `**/`, so the
-    // pattern crosses a slash that a plain wildmatch of `a**/b` would not.
-    // Verified against git 2.50: both paths below are ignored.
     const root = try testList(arena, "", "a**/b\nfoo/**\n");
     const lists = [_]*const PatternList{root};
     try std.testing.expectEqual(Decision.excluded, decide(&lists, "a/x/b", false, false));

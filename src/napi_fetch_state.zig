@@ -433,7 +433,6 @@ test "N-API fetch disposition replays completion between legacy boolean reads" {
     _ = trace.apply(.{ .consumed = 1 });
     try std.testing.expectEqual(Disposition.consumed, disposition(trace.phase, trace.last_consumed_handle, 1));
     _ = trace.apply(.{ .close = 1 });
-    // The old two-query observation loses completion while the single query preserves it.
     try std.testing.expect(!legacy_consumed and !is_active(trace.phase, 1));
     try std.testing.expectEqual(Disposition.consumed, disposition(trace.phase, trace.last_consumed_handle, 1));
     try std.testing.expectEqual(Disposition.retired, disposition(trace.phase, trace.last_consumed_handle, 2));
@@ -451,7 +450,6 @@ test "N-API fetch consumption replays model complete before HTTP EOF and normal 
     }
     try std.testing.expectEqual(Action.applied, trace.apply(.{ .consumed = 1 }).action);
     try std.testing.expectEqual(@as(?Handle, 1), trace.last_consumed_handle);
-    // The consumer's close precedes HTTP EOF in the legacy counterexample.
     _ = trace.apply(.{ .close = 1 });
     try std.testing.expectEqualDeep(Phase.idle, trace.phase);
     try std.testing.expect(!is_active(trace.phase, 1));

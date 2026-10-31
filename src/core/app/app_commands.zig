@@ -1022,7 +1022,6 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn writePermissionManagementUsage(app: *App) !void {
-            // Usage lines name the command; a topic tag would repeat it.
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
@@ -1122,8 +1121,6 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn installUsageSnapshot(app: *App) !void {
-            // Read the generation first, so a fetch finishing in between
-            // still triggers a redraw.
             const generation = app.usage_dashboard.generationCount();
             const snapshot = try app.usage_dashboard.snapshot(app.alloc);
             const menu = &app.input_runtime.usage_menu;
@@ -1203,8 +1200,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const command = std.mem.trim(u8, rest, " \t");
-            // MCP-v2: `/mcp` alone opens the menu, and `/mcp
-            // VERB` runs the verbs `fx mcp` has.
             if (comptime @hasDecl(App, "runMcpVerbs")) if (app.mcpHostSelected()) {
                 if (command.len > 0) return app.runMcpVerbs(command);
                 closeOtherMenusForMcp(app);
@@ -2626,7 +2621,6 @@ fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !voi
         if (event.failed) failed += 1;
     }
     try writer.print("last={d} failed={d}", .{ total, failed });
-    // Events evicted by the bounded ring are reported, not silently dropped.
     const overwritten = buf[0].sequence -| 1;
     if (overwritten > 0) try writer.print(" overwritten_before={d}", .{overwritten});
     try writer.writeAll(" (always recorded; does not require FX_TRACE)\n");
@@ -2647,8 +2641,6 @@ fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !voi
             try line.writer.writeAll(event.detail());
         }
         if (event.truncated) try line.writer.writeAll(" ...");
-        // Compaction events carry internal counters and enum names only, never
-        // user payloads, so they render unmasked like network-call telemetry.
         const raw = line.written();
         const visible = if (raw.len > trace_transcript_max_line_bytes)
             raw[0..trace_transcript_max_line_bytes]
@@ -3759,7 +3751,6 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const SessionRuntime = app_session_runtime.Runtime(App);
     SessionRuntime.renameActiveSession(app, rest) catch |err| {
         if (err == error.EmptyTitle) {
-            // Usage lines name the command; a topic tag would repeat it.
             try app.writeDomainNotice(
                 .{ .topic = "", .tone = .@"error", .body = "usage: /rename <title>" },
                 true,
@@ -3915,7 +3906,6 @@ fn parseSoundLevel(value: []const u8) ?SoundLevel {
 fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
     const current = app.notificationPreferences();
     const level: SoundLevel = switch (parseSoundCommand(rest)) {
-        // Bare /sound toggles sound on/off; max is only ever explicit.
         .toggle => if (current.turn_end) .off else .on,
         .set => |value| value,
         .invalid => {
@@ -3950,8 +3940,6 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
             failure.cleanup,
             runtime_changed,
         ),
-        // announce_commit=false drops the routine "saved" line (the state
-        // notice below covers it, matching /fast) but keeps warnings.
         .outcome => |outcome| _ = try session_commands.reportUserSettingsCommit(
             app,
             "sound",
@@ -5085,7 +5073,6 @@ test "trace network section reports session totals and window coverage" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    // More calls than the ring holds so the coverage line must admit eviction.
     var i: u64 = 0;
     while (i < diagnostics.network_ring_capacity + 2) : (i += 1) {
         var call: diagnostics.NetworkCall = .{
@@ -5134,7 +5121,6 @@ test "trace tool section reports session totals and window coverage" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    // More calls than the ring holds so the coverage line must admit eviction.
     var i: u64 = 0;
     while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
         var call: diagnostics.ToolCallMetric = .{
@@ -5162,7 +5148,6 @@ test "trace tool section reports session totals and window coverage" {
     try std.testing.expect(std.mem.find(u8, text, session_line) != null);
     try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
 
-    // Ring-complete sessions state full coverage instead.
     diagnostics.resetForTest();
     var ok_call: diagnostics.ToolCallMetric = .{ .started_at_ms = 9_000, .duration_ms = 5, .outcome = .succeeded };
     ok_call.setName("read_file");

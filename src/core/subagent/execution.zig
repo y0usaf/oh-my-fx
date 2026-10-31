@@ -322,7 +322,6 @@ pub const TurnContext = struct {
         self: *TurnContext,
         alloc: Allocator,
     ) CommitError!?session_codec.RecoveryCheckpoint {
-        // v2 keeps no paused-response checkpoint (D31).
         const loaded = switch (self.loaded) {
             .v1 => |value| value,
             .v2 => return null,
@@ -598,8 +597,6 @@ pub const TurnContext = struct {
         const loaded = switch (self.loaded) {
             .v1 => |value| value,
             .v2 => |child| {
-                // The work id rides on the turn; v2 keeps no token totals,
-                // and v1 reloads its own as zero.
                 child.prepareTurn(&prepared) catch |err| return commitFailed(child, work_id, "prepare", err);
                 child.commitTurn(prepared, self.runtime.languageSnapshot()) catch |err| return commitFailed(child, work_id, "commit", err);
                 self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
@@ -656,7 +653,6 @@ pub const TurnContext = struct {
                 retained_from,
                 timestamp_ms,
             ),
-            // The active prefix reaches the log with the turn's commit.
             .v2 => |child| try child.commitCompaction(summary, prefix != null, retained_from),
         }
         self.runtime.commitCompactedHistory(self.alloc, prepared);
@@ -676,8 +672,6 @@ pub const TurnContext = struct {
         bound.user.work_id = @constCast(work_id);
         const loaded = switch (self.loaded) {
             .v1 => |value| value,
-            // v2 keeps no paused-response checkpoint (D31), as the root
-            // hosts do not; the pause is not claimed as saved.
             .v2 => |child| {
                 debug_trace.logf("subagent", "child pause not kept child_id={s} work_id={s} cause={s} reason=sessions_v2", .{ child.id(), work_id, @tagName(checkpoint.cause) });
                 return error.SessionCommitFailed;

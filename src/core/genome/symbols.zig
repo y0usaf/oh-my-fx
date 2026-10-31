@@ -11,7 +11,6 @@ const c = @cImport({
     @cInclude("tree_sitter/api.h");
 });
 
-// Grammar entry points; not declared in any header, so declare here.
 extern fn tree_sitter_typescript() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_tsx() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_python() callconv(.c) *const c.TSLanguage;
@@ -72,8 +71,6 @@ const queries = std.enums.EnumMap(Language, QuerySpec).init(.{
     \\(type_alias_declaration name: (type_identifier) @type_alias_name)
     \\
     },
-    // tsx reuses the typescript grammar shape; tsx-specific node kinds are
-    // additive later. The typescript grammar parses .tsx fine for decls.
     .tsx = .{ .query =
     \\(function_declaration name: (identifier) @function_name)
     \\(method_definition name: (property_identifier) @method_name)
@@ -145,9 +142,6 @@ fn kindFromCapture(capture_name: []const u8) ?SymbolKind {
 }
 
 fn kindPriority(kind: SymbolKind) u8 {
-    // When one node carries several captures (a rust impl method is both
-    // function and method; a nix lambda binding is both binding and
-    // function), the more specific kind wins regardless of match order.
     return switch (kind) {
         .binding => 0,
         .function => 1,
@@ -187,7 +181,6 @@ pub fn extract(
     ) orelse return error.QueryInvalid;
     defer c.ts_query_delete(query);
 
-    // Map capture index -> kind once.
     const capture_count = c.ts_query_capture_count(query);
     const capture_kinds = try alloc.alloc(?SymbolKind, capture_count);
     defer alloc.free(capture_kinds);
@@ -218,9 +211,6 @@ pub fn extract(
             const start = c.ts_node_start_byte(node);
             const end = c.ts_node_end_byte(node);
             if (start > end or end > source.len) continue;
-            // A node can be captured by several patterns (a rust impl method
-            // = function + method; a nix lambda binding = binding + function);
-            // retain one entry and prefer the more specific kind.
             var duplicate = false;
             for (out.items) |*existing| {
                 if (existing.start_byte == start and existing.end_byte == end) {

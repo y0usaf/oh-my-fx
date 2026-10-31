@@ -1,14 +1,3 @@
-// Subscription credentials for libfx agents: Codex on a ChatGPT plan, Grok on
-// a Grok plan. The engine sends these providers' requests without credentials;
-// this module adds them at the fetch edge, from the host's `credentials`
-// callback, refreshing near expiry and once after a rejection. Credentials
-// never enter the engine or a session's saved records, and are masked in the
-// body of a failed response.
-//
-// A provider spec supplies what differs: which requests it authorizes, how its
-// credentials are checked and refreshed, and which headers carry them.
-//
-// TLA+ model: `tests/tla/sdk/ProviderAuth.tla`.
 
 const refreshSkewMs = 5 * 60 * 1000;
 const maxRememberedCredentials = 256;
@@ -150,9 +139,6 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
   if (refreshLock !== undefined && typeof refreshLock !== "function") {
     throw new TypeError("refreshLock must be a function");
   }
-  // Each access token the host supplied maps to the newest credentials refreshed
-  // from it, so a host that has not saved a rotation yet never spends the old
-  // refresh token twice. Engines that share `memory` share this.
   const { descendants, refreshing, saved } = memory;
   const keyOf = (spec, token) => `${spec.provider}\u0000${token}`;
 
@@ -163,8 +149,6 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
     if (descendants.size > maxRememberedCredentials) descendants.delete(descendants.keys().next().value);
   };
 
-  // A host that keeps credentials per session must also save a rotation that
-  // another session's request made.
   const savedBy = (next) => {
     let sessions = saved.get(next);
     if (!sessions) saved.set(next, (sessions = new Set()));
@@ -180,7 +164,6 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
 
   const redeem = async (spec, supplied, current, sessionId, signal) => {
     if (refreshLock) {
-      // Another server may have refreshed and saved them while this one waited.
       const latest = spec.normalize(await credentials({ provider: spec.provider, sessionId }));
       if (latest.accessToken !== current.accessToken && latest.accessToken !== supplied.accessToken && !needsRefresh(latest, now())) {
         remember(spec, supplied, latest);
@@ -194,8 +177,6 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
     return next;
   };
 
-  // With `refreshLock`, the host holds a lock on the account while the refresh
-  // runs, so its servers refresh one at a time.
   const locked = async (spec, supplied, current, sessionId, signal) => {
     let next;
     await refreshLock({ provider: spec.provider, sessionId }, async () => {
@@ -241,8 +222,6 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
       const response = await hostFetch(input, withCredentials(spec, endpoint, init, used));
       if (response.status !== 401 || used.refreshToken === undefined) return withoutCredentials(response, used);
       await response.body?.cancel().catch(() => {});
-      // Another request may have replaced these credentials while this one was
-      // out. Only a rejection of the newest ones spends a refresh token.
       const latest = await current(spec, sessionId, init.signal);
       const next = latest.used.accessToken !== used.accessToken
         ? latest.used

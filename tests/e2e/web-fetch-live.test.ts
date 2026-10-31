@@ -146,8 +146,6 @@ function fakeGatewayEnv(
 }
 
 describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public URL", () => {
-  // These mutable endpoints are operational probes, not deterministic HTTP
-  // framing proof. The transport/framing contract is covered by Zig fixtures.
   for (const probe of [
     { url: LIVE_ROBOTS_URL, domain: "vercel.com", label: "robots" },
     { url: LIVE_MODELS_URL, domain: "ai-gateway.vercel.sh", label: "models" },

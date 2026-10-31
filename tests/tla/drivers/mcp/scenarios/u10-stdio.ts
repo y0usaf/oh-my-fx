@@ -1,9 +1,3 @@
-// U10 subscriptions over stdio, step 6: the stdio lab's `listen` and
-// `unlisten` drive src/mcp/core/subscription.zig against the fake stdio
-// server, whose listen rules acknowledge and never answer. Every listen
-// shares the one channel, so notifications are told apart only by their
-// subscriptionId (SUBS-02). Detection takes request id 1, so listens get 2,
-// 3, and so on, and later rules can name them.
 
 import type { Rule } from "../fakes/stdio";
 import { labScenario, type LabCase, type Seen } from "../lab";

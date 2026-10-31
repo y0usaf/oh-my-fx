@@ -147,8 +147,6 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
     if (normalization.trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
     var record_buffer: compactor.RecordFileBuffer = undefined;
     if (compactor.recordFile(&record_buffer, normalization.trimmed)) |file| {
-        // A turn, tool call or earlier compaction saved by compaction, opened
-        // by its ID (M12, T12, L2).
         const owned = try ctx.allocator.dupe(u8, file);
         ctx.allocator.free(input.handle);
         input.handle = owned;

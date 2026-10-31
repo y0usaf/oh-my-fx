@@ -2143,7 +2143,6 @@ describe("MCP remote authentication lifecycle", () => {
       request.authorization === `Bearer ${ACCESS_REFRESHED}`
     );
     expect(initialResourceLists).toHaveLength(2);
-    // A later resource read may cross the failed-refresh backoff and retry once.
     expect(refreshedResourceLists.length).toBeGreaterThanOrEqual(1);
     expect(refreshedResourceLists.length).toBeLessThanOrEqual(2);
     expect(new Set(resourceListRequests.map((request) =>
@@ -4151,9 +4150,6 @@ describe("MCP remote authentication lifecycle", () => {
 });
 
 describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
-  // Without a display (Linux with no DISPLAY, an SSH session, or
-  // FX_NO_OPEN_BROWSER) fx offers paste-back instead of opening a browser.
-  // These tests drive the fake browser, so they declare one everywhere.
   const v2Env = (root: ReturnType<typeof createRoot>) => ({
     ...baseEnv(root),
     FX_MCP_ENGINE: "v2",
@@ -4199,8 +4195,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     const logoutMs = Date.now() - logoutStart;
     expect(logout.code).toBe(0);
     expect(logout.stdout).toBe("Signed out of fixture.\n");
-    // The refresh token is revoked, and fx waits for the answer before it
-    // exits: hanging up loses the revocation on a real network.
     expect(auth.revocations).toBe(1);
     expect(logoutMs).toBeGreaterThanOrEqual(500);
     expect(await statusOf(root)).toBe("not_started");
@@ -4212,9 +4206,7 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     const root = createRoot(auth);
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
     expect(login.code).toBe(1);
-    // The token endpoint's own error, not the stage's name.
     expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (invalid_grant).\n");
-    // The one exchange, refused.
     expect(auth.tokenExchanges).toBe(1);
     expect(await statusOf(root)).not.toBe("signed_in");
   }, 30_000);
@@ -4234,7 +4226,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     let stdout = "";
     const decoder = new TextDecoder();
     const deadline = Date.now() + 15_000;
-    // Wait for the whole line: a long address can arrive in pieces.
     while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -4242,7 +4233,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     }
     const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
     expect(address).toBeDefined();
-    // The user approves in some other browser, which ends on the loopback address.
     const approved = await fetch(address!, { redirect: "manual" });
     const back = approved.headers.get("location")!;
     expect(new URL(back).hostname).toBe("127.0.0.1");
@@ -4283,7 +4273,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     }
     const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
     expect(address).toBeDefined();
-    // The user says no; the browser ends on the loopback address with the refusal.
     const approved = await fetch(address!, { redirect: "manual" });
     const back = new URL(approved.headers.get("location")!);
     back.searchParams.delete("code");
@@ -4311,7 +4300,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp login fixture");
     await tui.waitForText("Sign in to fixture in your browser.", 10_000);
-    // The fake browser approves on its own; the shell says so without a keypress.
     await tui.waitForText("Signed in to fixture.", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     await tui.sendText("/mcp list");
@@ -4326,7 +4314,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     const root = createRoot(auth);
     const traceDir = join(root.home, "tmp");
     mkdirSync(traceDir, { recursive: true });
-    // /trace writes a report to $TMPDIR; read the newest once it is complete.
     const captureTrace = async (): Promise<string> => {
       const reports = () => readdirSync(traceDir).filter(name => name.startsWith("fx-trace-") && name.endsWith(".md")).sort();
       const before = new Set(reports());
@@ -4348,17 +4335,14 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
       env: { ...v2Env(root), TMPDIR: traceDir, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
-    // Started on its own, it wants a login; the status line says so, not the transcript.
     await tui.waitForText("fixture needs login · /mcp", 15_000);
     expect(await tui.captureFullScrollback()).not.toContain("needs login: /mcp login fixture");
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  1", 10_000);
-    // Opening it shows the login as the next step.
     await tui.sendKeys("Enter");
     await tui.waitForText("Its tools show here once you log in.", 15_000);
     await tui.waitForText("› Log in        /mcp login fixture", 5_000);
 
-    // /trace reports MCP-v2's servers, and the one that waits for a login.
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     const waiting = await captureTrace();
@@ -4372,18 +4356,14 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
     await tui.sendKeys("Enter");
-    // Signed in, the screen loads the tools it couldn't before.
     await tui.waitForText("Echo text through the modern HTTP fixture", 15_000);
     await tui.waitForText("› Log out       /mcp logout fixture", 5_000);
-    // Up and signed in, the failure that asked for the login is gone.
     expect(await tui.capturePane()).not.toContain("it needs a login");
     expect(auth.tokenExchanges).toBe(1);
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("esc back"), 5_000);
-    // The news waits on the status line for a few seconds, then the count returns.
     await tui.waitForText("Signed in to fixture.", 3_000);
     await tui.waitForText("mcp 1/1", 10_000);
-    // Gone with the news: it was never printed in the transcript.
     expect(await tui.capturePane()).not.toContain("Signed in to fixture.");
     const ready = await captureTrace();
     expect(ready).toMatch(/- fixture state=ready transport=http tools=\d+ signed_in=true needs_login=false\n(?! {4}error:)/);
@@ -4405,7 +4385,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     await tui.waitForText("MCP servers  1", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
-    // No browser opens, so the sign-in waits, and the screen says what for.
     await tui.sendKeys("Enter");
     await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 10_000);
     const pane = await tui.capturePane();
@@ -4426,7 +4405,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(show.stdout).toMatch(/status +ready/);
     expect(auth.tokenExchanges).toBe(0);
     expect(existsSync(root.openLog)).toBe(false);
-    // Signed out here, it stays signed out, though v1's copy is still there.
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(logout.code).toBe(0);
     expect(await statusOf(root)).not.toBe("signed_in");
@@ -4440,7 +4418,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     const bridgeOrigin = new URL(auth.url).origin;
     const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin };
     const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    // The browser opens fx.sh's start, which goes on to Slack's page.
     expect(await waitForFileText(root.openLog, "/api/slack/auth?", 10_000)).toBe(true);
     const start = new URL(readFileSync(root.openLog, "utf8").trim());
     expect(start.origin).toBe(bridgeOrigin);
@@ -4449,7 +4426,6 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(start.searchParams.get("challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(start.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
     expect(start.searchParams.get("scope")!.split(" ").sort()).toEqual([...FX_SLACK_SCOPES, "groups:history", "im:history", "mpim:history"].sort());
-    // fx.sh's page posts what Slack sent back; only its origin is taken.
     const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
     const body = await authorizePersonalFixture(auth, start);
     const post = (fields: URLSearchParams, origin: string) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });

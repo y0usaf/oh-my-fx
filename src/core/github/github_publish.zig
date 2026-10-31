@@ -157,7 +157,6 @@ test "parse draft rejects whitespace-only input" {
 }
 
 test "parse draft rejects text without a body" {
-    // "Done." is what fx records when the model's final reply is empty.
     for ([_][]const u8{ "Title only", "Done.", "Title only \r\n\t " }) |text| {
         try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, text));
     }

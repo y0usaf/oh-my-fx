@@ -18,8 +18,6 @@ pub fn write_compact(writer: *std.Io.Writer, json: []const u8) !void {
             continue;
         }
         if (byte < 0x20) {
-            // Raw control bytes are invalid JSON inside a string; escaping
-            // them keeps malformed model output inside its NDJSON frame.
             try writer.print("\\u{x:0>4}", .{byte});
             escape_pending = false;
             continue;

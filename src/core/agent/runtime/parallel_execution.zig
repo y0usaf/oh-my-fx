@@ -678,8 +678,6 @@ test "host calls run together until a writer, which runs alone" {
 
     const expected_first: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 2 };
     try std.testing.expectEqual(expected_first, leadingParallelGroup(registry, &calls));
-    // The writer is a fence: no group includes it, and the call after it
-    // starts a new group.
     try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(registry, calls[2..]));
     const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
     try std.testing.expectEqual(expected_last, leadingParallelGroup(registry, calls[3..]));

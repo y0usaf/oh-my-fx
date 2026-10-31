@@ -1,7 +1,3 @@
-// ChatGPT (Codex) credentials for libfx agents: the Codex endpoints, how a
-// ChatGPT plan's credentials are checked and refreshed, and the headers that
-// carry them. `subscription.js` adds them at the fetch edge. TLA+ model:
-// `tests/tla/sdk/ProviderAuth.tla`.
 import { normalizeCredentials } from "./subscription.js";
 
 export const chatgptIssuer = "https://auth.openai.com";

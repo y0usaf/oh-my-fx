@@ -430,17 +430,17 @@ const source_punctuation_ranges = [_]SourceRange{
 const punctuation_ranges = packRanges(&source_punctuation_ranges);
 
 test "flanking classes follow Unicode general categories" {
-    try std.testing.expect(isPunctuationOrSymbol(0x2014)); // em dash, Pd
-    try std.testing.expect(isPunctuationOrSymbol(0x201C)); // left double quote, Pi
-    try std.testing.expect(isPunctuationOrSymbol(0x00D7)); // multiplication sign, Sm
-    try std.testing.expect(isPunctuationOrSymbol(0xFF0C)); // fullwidth comma, Po
-    try std.testing.expect(isPunctuationOrSymbol(0x1F600)); // grinning face, So
-    try std.testing.expect(isPunctuationOrSymbol(0x1F979)); // face holding back tears, So, Unicode 14
-    try std.testing.expect(!isPunctuationOrSymbol(0x00B5)); // micro sign, Ll
-    try std.testing.expect(!isPunctuationOrSymbol(0x00AA)); // feminine ordinal, Lo
-    try std.testing.expect(!isPunctuationOrSymbol(0x3031)); // vertical kana repeat mark, Lm
-    try std.testing.expect(!isPunctuationOrSymbol(0x4E2D)); // CJK ideograph, Lo
-    try std.testing.expect(!isPunctuationOrSymbol(0x2460)); // circled digit one, No
+    try std.testing.expect(isPunctuationOrSymbol(0x2014));
+    try std.testing.expect(isPunctuationOrSymbol(0x201C));
+    try std.testing.expect(isPunctuationOrSymbol(0x00D7));
+    try std.testing.expect(isPunctuationOrSymbol(0xFF0C));
+    try std.testing.expect(isPunctuationOrSymbol(0x1F600));
+    try std.testing.expect(isPunctuationOrSymbol(0x1F979));
+    try std.testing.expect(!isPunctuationOrSymbol(0x00B5));
+    try std.testing.expect(!isPunctuationOrSymbol(0x00AA));
+    try std.testing.expect(!isPunctuationOrSymbol(0x3031));
+    try std.testing.expect(!isPunctuationOrSymbol(0x4E2D));
+    try std.testing.expect(!isPunctuationOrSymbol(0x2460));
     try std.testing.expect(isPunctuationOrSymbol('*') and !isPunctuationOrSymbol('a'));
     try std.testing.expect(isWhitespace(0x00A0) and isWhitespace(0x3000) and isWhitespace(0x2003));
     try std.testing.expect(isWhitespace(' ') and isWhitespace('\t') and !isWhitespace(0x200B));

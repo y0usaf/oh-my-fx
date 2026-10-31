@@ -97,8 +97,6 @@ const FileListingWait = struct {
     const hold_ms: i64 = 8;
 
     started_ms: ?i64 = null,
-    // The previous listing outlasted the wait, so the next keystroke paints at
-    // once instead of paying the wait again on a slow folder.
     last_outlasted_hold: bool = false,
 
     /// Returns true while the next frame should wait for an in-flight listing.
@@ -125,7 +123,6 @@ const FileListingWait = struct {
     }
 
     fn withinHold(started_ms: i64, now_ms: i64) bool {
-        // A clock that steps backwards ends the wait instead of extending it.
         return now_ms >= started_ms and now_ms - started_ms < hold_ms;
     }
 };
@@ -157,7 +154,6 @@ pub const State = struct {
     key_source_column_index: usize = 0,
     key_source_column_window_start: usize = 0,
     file_completion: file_completion_state.State = .{},
-    // The ordinal is meaningful only within file_completion's presented rows.
     file_completion_index: usize = 0,
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
@@ -179,7 +175,6 @@ pub const State = struct {
         self.provider_picker_pending_method.deinit(alloc);
         const state_info = @typeInfo(State).@"struct";
         inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
-            // The child's owner already restored its defaults.
             if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
             @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
@@ -402,8 +397,6 @@ pub const State = struct {
         self.provider_picker_pending_method.clearRetainingCapacity();
         self.provider_picker_pending_method.appendSliceAssumeCapacity(stable_method);
         self.provider_picker_stage = stage;
-        // A column is entered with nothing typed, so a highlight left over from
-        // an earlier visit would point at an unrelated row.
         self.resetActiveProviderPickerIndex();
     }
 
@@ -974,8 +967,6 @@ test "provider picker columns anchor under the argument they belong to" {
     try std.testing.expectEqual("/provider vercel account ".len, team.token_start);
     try std.testing.expectEqualStrings("acme", team.query);
 
-    // Editing away the committed token retires the column instead of anchoring
-    // the list under text that no longer names the choice.
     try editor.setText(alloc, "/provider codex account acme");
     try std.testing.expect(state.activeProviderPickerQuery(&editor) == null);
 }
@@ -1037,8 +1028,6 @@ test "editing a committed token degrades the provider picker to the provider col
     try std.testing.expectEqual(ProviderPickerStage.provider, query.stage);
     try std.testing.expectEqualStrings("verc", query.query);
 
-    // Unrelated text leaves the flow alone; clearing the composer resets it
-    // through clearCurrent instead.
     try state.beginProviderPickerFlow(alloc, "vercel", "", .method);
     try editor.setText(alloc, "hello world");
     state.reconcileInlinePickerAfterEdit(&editor);
@@ -1063,26 +1052,20 @@ test "committed tokens only match at word boundaries" {
 test "folder listing wait spans one tick and is skipped after a slow listing" {
     var wait: FileListingWait = .{};
     try std.testing.expect(!wait.hold(false, 100));
-    // Keystrokes during one listing share the first keystroke's wait.
     try std.testing.expect(wait.hold(true, 100));
     try std.testing.expect(wait.hold(true, 100 + FileListingWait.hold_ms - 1));
     try std.testing.expect(wait.active(100 + FileListingWait.hold_ms - 1));
-    // A listing that outlasts the wait paints at once from then on.
     try std.testing.expect(!wait.hold(true, 100 + FileListingWait.hold_ms));
     try std.testing.expect(!wait.hold(true, 140));
     try std.testing.expect(!wait.active(140));
     try std.testing.expect(!wait.hold(false, 141));
-    // The folder was slow, so the next keystroke does not wait for it, but
-    // the listing is still watched for its first tick.
     try std.testing.expect(!wait.hold(true, 200));
     try std.testing.expect(!wait.active(200));
     try std.testing.expect(wait.measuring(200 + FileListingWait.hold_ms - 1));
     try std.testing.expect(!wait.measuring(200 + FileListingWait.hold_ms));
-    // A listing that finishes within the wait turns waiting back on.
     try std.testing.expect(!wait.hold(false, 202));
     try std.testing.expect(wait.hold(true, 300));
     try std.testing.expect(!wait.hold(false, 301));
     try std.testing.expect(wait.hold(true, 400));
-    // A clock that steps backwards ends the wait.
     try std.testing.expect(!wait.hold(true, 350));
 }

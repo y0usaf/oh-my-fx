@@ -87,8 +87,6 @@ if (!second.events.some((event) => event.type === "history.restore" && event.cou
 }
 second.runtime.write("\x1b[A");
 await waitFor(second.terminal, () => grid(second.terminal).includes("/exit"), "restored Up-arrow slash command");
-// A recalled entry lands with the cursor at the end of the line: the next Up
-// moves to the draft start, and only the one after walks further back.
 second.runtime.write("\x1b[A");
 second.runtime.write("\x1b[A");
 await waitFor(second.terminal, () => grid(second.terminal).includes("remember this prompt"), "restored Up-arrow prompt");

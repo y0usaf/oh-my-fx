@@ -13,7 +13,6 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
-// The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
 const version_lookup = @import("provider_versions.zig");
 const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
@@ -102,8 +101,6 @@ pub fn buildRequest(
         try std.json.Stringify.value(effort.label(), .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
-    // xAI exposes Fast mode as its priority service tier; the subscription
-    // proxy accepts the parameter endpoint-wide, independent of the model.
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
     if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');

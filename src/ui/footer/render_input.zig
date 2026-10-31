@@ -418,7 +418,6 @@ pub const RenderContext = struct {
     compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
     pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
-    // Pacer emitting visible text, including the post-finish tail drain.
     writing_response: bool = false,
     has_api_key: bool,
     model: []const u8,
@@ -790,8 +789,6 @@ fn appendConnectedToolLabel(
     const marker_bytes = label[marker_start..marker_end];
     const line_end = std.mem.findScalar(u8, label[marker_end..], '\n') orelse label[marker_end..].len;
 
-    // The live label arrives with the formatter's bold styling; the connected
-    // row belongs to the dimmed group block, so restyle it plain gray.
     var connected: std.ArrayList(u8) = .empty;
     defer connected.deinit(alloc);
     try connected.appendSlice(alloc, ui_render.statusline_style);
@@ -1223,8 +1220,6 @@ test "frame-owned activity shows live streaming token progress" {
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // Pacer caught up mid-response and is waiting on the next chunk: the
-    // Generating phase holds instead of flipping inside every gap.
     var drained_ctx = ctx;
     drained_ctx.writing_response = false;
     var drained_buf: [256]u8 = undefined;
@@ -1236,8 +1231,6 @@ test "frame-owned activity shows live streaming token progress" {
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // The model moved on to a tool payload that prints nothing: only the phase
-    // word changes while the marker, turn clock, and token totals remain.
     var composing_ctx = drained_ctx;
     composing_ctx.stream.phase = .running;
     composing_ctx.stream.turn_started_ms = 1_000;

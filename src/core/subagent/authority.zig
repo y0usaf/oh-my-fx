@@ -224,7 +224,6 @@ pub const Resolver = struct {
             break :blk child.work_generation;
         };
 
-        // Host resolution may connect MCP servers; parent state observation must remain available.
         var host = try self.host.resolve(alloc, self.root_id);
         defer host.deinit(alloc);
 

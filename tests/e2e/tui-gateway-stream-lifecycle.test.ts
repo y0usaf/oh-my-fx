@@ -1560,7 +1560,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       ],
     );
     await session!.sendText("Read the notes and continue after a connection failure.");
-    // No pause: the interrupted stream and the nine 503s recover on their own.
     await session!.waitForText("AFTER_NETWORK_RECOVERY", TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(11);
@@ -1622,8 +1621,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     await session.waitForText("Unable to verify image support for this model", TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(0);
 
-    // The notice text wraps unpredictably across terminal widths, so wait for
-    // the report file itself instead of a pane string.
     await session.sendText("/trace");
     const rootDir = root;
     await waitForCondition(
@@ -1744,8 +1741,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
 
     await session.kill();
-    // The first launch stored the configured model with Fast mode off; the
-    // resume leg's flags must win over those stored preferences for this launch.
     session = await TmuxSession.create({
       cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume-last`,
       cwd: workspace,
@@ -2056,8 +2051,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const hold: ToolPayloadHoldState = { started: false, cancelled: false };
       const nextStep: HoldState = { started: false, cancelled: false };
       const payloadPath = "payload-progress.md";
-      // Preserve two substantial streamed input chunks for the live
-      // activity-row assertions.
       const payloadContent = "staged tool payload content\n".repeat(64);
       const assistantText = "I will write the staged payload now.";
       const finalSentinel = "FX_TOOL_PAYLOAD_PROGRESS_COMPLETE";
@@ -2268,8 +2261,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           return fakeGatewayToolCall("list_1", "glob_files", { pattern: "*", path: "." });
         }
         if (responseIndex >= 2 && responseIndex <= 11) {
-          // A 1s hint keeps the ten-failure chain inside the test budget now
-          // that a zero hint falls back to real backoff.
           return new Response(
             JSON.stringify({ error: { message: "route temporarily unavailable" } }),
             {
@@ -2325,8 +2316,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("List the current directory, then summarize it.");
-      // The ten 503s retry autonomously; the follow-up request happens on its
-      // own with no pause and no slash command.
       await waitForCondition(
         () => queuedGateway.requests.length === 12,
         "autonomous recovery follow-up request",
@@ -2414,9 +2403,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 2,
         "silent-head retry request",
       );
-      // While the retry is in flight the countdown segment stays visible
-      // (frozen at the elapsed wait) instead of vanishing; a disappearing
-      // segment dragged right-aligned footer content around.
       await session.waitForPane(
         (pane) => pane.includes("retrying request in 4s"),
         TIMEOUT,
@@ -2503,13 +2489,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText(originalPrompt);
-      // The ten 503s burn through instantly and the eleventh request starts on
-      // its own; there is no pause and no /continue.
       await waitForCondition(() => continued.started, "autonomous continued response");
       expect(queuedGateway.requests).toHaveLength(11);
 
-      // The admitted retry keeps the recovery status instead of a fresh
-      // Thinking phase.
       await session!.waitForText("retrying request", TIMEOUT);
       continued.release?.();
       try {
@@ -2620,8 +2602,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         });
         await session.waitForComposer(TIMEOUT);
-        // The kill left the owner marker behind, so resume reports the
-        // unclean exit and waits instead of restarting the turn on its own.
         await session.waitForText(/quit unexpectedly/, TIMEOUT);
         await Bun.sleep(1_000);
         expect(resumed.started).toBe(false);
@@ -2670,9 +2650,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(root!, "workspace", "after.txt"), "after\n");
 
       await session!.sendText("Read both fixture files across recovery.");
-      // Exact-equality polling races the burst at the end of the retry chain
-      // (requests 11-13 can land inside one poll interval), so wait for the
-      // chain to pass the tenth failure instead.
       await waitForCondition(
         () => queuedGateway.requests.length >= 11,
         "autonomous retries after the confirmed tool",
@@ -2681,8 +2658,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(13);
-      // Both reads render inside one uninterrupted tool group now that the
-      // turn no longer pauses between them.
       expect(scrollback).toContain("├ Read before.txt");
       expect(scrollback).toContain("└ Read after.txt");
       expect(scrollback).toContain(finalText);
@@ -2716,8 +2691,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Preserve the Fast recovery budget.");
-      // The old ten-attempt budget no longer pauses the turn: the eleventh
-      // request runs on its own and recovers.
       await session!.waitForText(finalText, TIMEOUT);
       await session!.waitForStableComposer(TIMEOUT);
 
@@ -2798,7 +2771,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         },
       });
       await session.waitForComposer(TIMEOUT);
-      // The unclean-exit gate asks before the recovering turn retries.
       await session.waitForText(/quit unexpectedly/, TIMEOUT);
       expect(queuedGateway.requests).toHaveLength(1);
       await session.sendText("continue");
@@ -2817,9 +2789,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   test(
     "Escape during provider recovery backoff cancels without ModelError",
     async () => {
-      // Three identical provider errors would now stop as a no-progress stall,
-      // so the middle failure carries partial output to keep progress moving;
-      // the Escape pair then lands inside the third failure's 2s backoff.
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-recovery-backoff-cancel-",
         [
@@ -2880,8 +2849,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Recover the interrupted response without duplication.");
-      // The interrupted stream and the nine 503s recover without a pause; the
-      // eleventh request is the automatic continuation.
       await session!.waitForText(finalText, TIMEOUT);
       await session!.waitForStableComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
@@ -2909,8 +2876,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText(prompt);
-      // Three identical interruptions at the same progress point stop the turn
-      // terminally instead of pausing for /continue.
       const scrollback = await waitForScrollback(
         session!,
         (value) => /kept failing at the same\s+point · stopped/.test(value),
@@ -2942,8 +2907,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText(prompt);
-      // Occupy the composer while the doomed turn is still retrying; the
-      // stall-stop prompt restore must never clobber an in-progress draft.
       await session!.sendLiteral(draft);
       await waitForScrollback(
         session!,
@@ -2951,10 +2914,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "no-progress stall stop",
       );
       expect(queuedGateway.requests).toHaveLength(3);
-      // Give a wrongful restore a beat to clobber the draft before asserting.
       await Bun.sleep(500);
-      // The transcript echo also starts with the composer glyph, so only the
-      // LAST composer line is the live input buffer.
       const pane = await session!.capturePane();
       const composerLines = pane.split("\n").filter((line) => isComposerLine(line));
       const liveComposer = composerLines[composerLines.length - 1] ?? "";
@@ -2972,8 +2932,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-disable-fast-",
         [
-          // Two failures, not three: a third identical provider error would
-          // stop the turn as a no-progress stall instead of recovering.
           providerErrorResponse("fast route failed once"),
           providerErrorResponse("fast route failed twice"),
           fakeGatewayFinalText(finalText),
@@ -3462,7 +3420,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-tall-idle-submit-key",
           VERCEL_OIDC_TOKEN: undefined,
-          // A recording notice would add transcript rows above the prompt.
           FX_DEBUG_RECORD: undefined,
           FX_RECORD: undefined,
           FX_AUTO_UPGRADE: "0",
@@ -3481,7 +3438,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "held tall idle prompt stream",
       );
       await session.waitForText("Thinking", TIMEOUT);
-      // The preview already shows the tail, so wait for the head too.
       const scrollback = await waitForScrollback(
         session,
         (value) => value.includes(promptLines[0]!) && value.includes(promptLines.at(-1)!),
@@ -3567,7 +3523,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => heldGateway.requests.length === 2 && continued.started,
         "held continuation after tall steering",
       );
-      // The preview already shows the tail, so wait for the head too.
       const scrollback = await waitForScrollback(
         session,
         (value) => value.includes(steeringLines[0]!) && value.includes(steeringLines.at(-1)!),
@@ -5813,8 +5768,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(trace).toContain(
         `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=shell`,
       );
-      // The startup-file snapshot must capture while fx owns the terminal;
-      // a capture that shares the terminal stops on job control.
       expect(trace).toContain("shell snapshot ready");
       expect(existsSync(tapePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -6399,8 +6352,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("fx docs", TIMEOUT);
       const escapes = await session.captureFullScrollbackEscapes();
       const line = escapes.split("\n").find((l) => l.includes("fx docs")) ?? "";
-      // The default dark theme's link color must survive the row-start
-      // restore when the link is the row's first content.
       expect(line).toContain("\x1b[38;5;75m");
       expect(line).toContain("\x1b[4m");
     },
@@ -6446,8 +6397,6 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("run the reclip probe");
 
-    // While the command runs, the active row reclips to the live width
-    // instead of keeping the frozen compact-bound marker.
     await session.waitForPane((pane) => pane.includes("Running printf"), TIMEOUT);
     const runningRow = stripSgr(await session.capturePane()).split("\n")
       .find((line) => line.includes("Running printf"));
@@ -6455,7 +6404,6 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
     expect(runningRow!).toContain(tail);
     expect(runningRow!).not.toContain("...");
 
-    // After settling, the completed row keeps the full command too.
     await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE"), TIMEOUT);
     const ranRow = stripSgr(await session.captureFullScrollback()).split("\n")
       .find((line) => line.includes("Ran printf"));

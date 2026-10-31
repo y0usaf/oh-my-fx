@@ -438,10 +438,6 @@ pub fn resolvePreferring(
     if (try loadSource(alloc, transport, secret_store, .vercel_oidc_token)) |credential| return .{ .credential = credential };
     if (try loadSource(alloc, transport, secret_store, .ai_gateway_api_key)) |credential| return .{ .credential = credential };
 
-    // A login that cannot be loaded or refreshed is one silent source, not a
-    // reason to abandon resolution: the sources on either side of it already
-    // fall through on failure, and a rejected refresh token must not hide a
-    // stored key that works. OutOfMemory stays fatal, as it does for them.
     var fx_login_status: FxLoginReadStatus = .absent;
     var failure: ?LoadFailure = null;
     const fx_login = loadFxLoginForPrecedence(alloc, transport, mode) catch |err| blk: {
@@ -1260,9 +1256,6 @@ test "a remembered fx login never refreshes in stored mode" {
     const env = try CredentialTestEnv.install(alloc, &.{});
     defer env.deinit();
 
-    // No session exists, so both modes resolve to nothing. What matters is the
-    // route taken: `.stored` must reach loadStoredFxLoginCredential, which never
-    // performs the network refresh that a diagnostic is forbidden from making.
     for ([_]LoadMode{ .stored, .refresh_if_needed }) |mode| {
         var resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, mode, .fx_login);
         defer if (resolution.credential) |*credential| credential.deinit(alloc);
@@ -1279,8 +1272,6 @@ test "a remembered choice that no longer resolves never crosses to precedence" {
     });
     defer env.deinit();
 
-    // fx_login is an explicit authority choice. Its absence must not authorize
-    // an environment key from a different billing or team boundary.
     var resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .fx_login);
     defer if (resolution.credential) |*credential| credential.deinit(alloc);
     try std.testing.expect(resolution.credential == null);
@@ -1424,7 +1415,6 @@ test "a failed fx-login refresh falls through to the stored key" {
     defer fixture.deinit();
     var store_fixture = SecretStoreFixture{ .value = "stored-key-that-works" };
 
-    // The refresh cannot succeed, but a working stored key is right behind it.
     var resolution = try resolve(
         alloc,
         oauth_transport.unavailable_provider,
@@ -1446,8 +1436,6 @@ test "a failed fx-login refresh is still reported when nothing else resolves" {
     defer fixture.deinit();
     var store_fixture = SecretStoreFixture{};
 
-    // Falling through must not erase why the login was silent: an unrepairable
-    // session is a different problem from never having logged in.
     var resolution = try resolve(
         alloc,
         oauth_transport.unavailable_provider,
@@ -1644,8 +1632,6 @@ test "a disabled store still reports why the fx login was silent" {
     defer fixture.deinit();
     var store_fixture = SecretStoreFixture{ .disabled = true };
 
-    // The store is switched off, so resolution ends at the login. Its failure is
-    // still the useful diagnostic and must survive the early return.
     var resolution = try resolve(
         alloc,
         oauth_transport.unavailable_provider,

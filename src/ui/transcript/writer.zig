@@ -1,13 +1,3 @@
-// Host contract:
-// - fields: transcript, entries, max_transcript_bytes, replaceable_last_line,
-//   replaceable_start, cursor_row, cursor_col, layout, viewport_top_row,
-//   owned_top_row, pending_scroll_compact,
-//   has_painted_transcript, transcript_band_dirty, last_rendered_cols,
-//   transcript_cache_origin_untrimmed
-// - methods: forgetShimmer, assertCanMutateTranscript, advanceCursor,
-//   ensurePaintReservation, rebuildTranscriptCacheFromEntries,
-//   recomputeCursorFromTranscript
-// This module owns transcript writes plus scroll coordination during writes.
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -73,9 +63,6 @@ fn writeTranscriptBytesInternal(
     _ = metrics;
     self.forgetShimmer();
 
-    // `record` gates transcript-buffer and replaceable-state
-    // bookkeeping only. Cursor geometry still advances so frame
-    // preparation sees the same pending layout as recorded writes.
     if (record) {
         try self.assertCanMutateTranscript();
         self.transcript_cache_origin_untrimmed = false;
@@ -94,15 +81,10 @@ fn writeTranscriptBytesInternal(
         self.replaceable_start = 0;
     }
 
-    // Cursor tracking stays so the pre-paint heuristics in main.zig
-    // (e.g. the `cursor_col != 1` leading-newline test) still see
-    // sensible values between ticks. The paint pass will
-    // authoritatively overwrite these when it runs.
     const cursor_row_before: u32 = @as(u32, self.cursor_row);
     const walk = self.advanceCursor(text);
     std.debug.assert(walk.end_row >= cursor_row_before);
 
-    // Viewport selection converts overflow into frame-owned scroll.
     const content_bottom_u32: u32 = @as(u32, self.layout.content_bottom);
     if (walk.end_row > content_bottom_u32) {
         const total_scroll_u32 = walk.end_row - content_bottom_u32;

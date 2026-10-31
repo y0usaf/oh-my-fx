@@ -1,12 +1,4 @@
 #!/bin/sh
-# Check that an implementation trace is a behavior of a spec.
-#
-# usage: ./validate.sh SPEC trace.ndjson
-#   SPEC is a spec with a trace wrapper here, for example SessionLog.
-#   Needs ../SPEC.tla, ./SPECTrace.tla and ./SPECTrace.cfg.
-#
-# Exit codes: 0 accepted, 1 rejected (prints the first step the spec does
-# not allow), 2 tool or usage error.
 set -u
 
 if [ "$#" -ne 2 ]; then
@@ -36,15 +28,10 @@ cp "$here/../$spec.tla" "$here/${spec}Trace.tla" "$here/${spec}Trace.cfg" "$work
 python3 "$here/to_tla.py" "$trace" "$work/TraceData.tla" || exit 2
 steps=$(grep -c . "$trace" || true)
 
-# One worker: the progress register (TLCSet/TLCGet) is per worker. TLC
-# unpacks its standard modules into java.io.tmpdir; a private one lets
-# several checks run at once.
 mkdir "$work/java-tmp"
 out=$(cd "$work" && "$java" -Djava.io.tmpdir="$work/java-tmp" -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
     -metadir "$work/states" -config "${spec}Trace.cfg" "${spec}Trace.tla" 2>&1)
 
-# Match with case, not a pipe into grep -q: grep exits at the first match
-# and a large TLC output then fails printf with a broken pipe.
 case $out in
     *'Invariant TraceIncomplete is violated'*) verdict=accepted ;;
     *'No error has been found'*) verdict=rejected ;;

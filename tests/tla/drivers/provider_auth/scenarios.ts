@@ -1,6 +1,3 @@
-// Scenarios that drive the real credential edge through the interleavings
-// ProviderAuth models. Each names the model setup it runs under, so its trace
-// replays against exactly those constants.
 import type { Setup } from "./tlc";
 import type { World } from "./driver";
 

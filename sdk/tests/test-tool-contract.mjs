@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// The host tool contract: tools as an object, the writes declaration, the
-// turn and call ids a tool receives, non-empty error results, and calls that
-// run together until a writer, with results in the model's order.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -15,8 +12,6 @@ const addon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 
-// The prompt names the calls of the first response: "call a b c" calls the
-// tools a, b and c in that order. The next request is answered with text.
 const textOf = (message) => typeof message.content === "string"
   ? message.content
   : message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
@@ -78,7 +73,6 @@ async function run(agent, input) {
   return turn.result;
 }
 
-// A tool that records when each of its calls ran.
 const spans = [];
 const timed = (name, extra = {}) => ({
   description: `Records when ${name} runs.`,
@@ -124,7 +118,6 @@ test("calls run together until a writer, and results keep the model's order", as
   } else {
     assert.ok(!overlap(span.first, span.second), "a build without threads runs calls one at a time");
   }
-  // The writer starts after every earlier call ends, and nothing passes it.
   assert.ok(span.save.start >= Math.max(span.first.end, span.second.end));
   assert.ok(span.after.start >= span.save.end);
   const results = toolResults(requests.at(-1)).map((part) => part.toolName);

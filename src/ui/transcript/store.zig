@@ -1,20 +1,3 @@
-// Host contract:
-// - fields: transcript, entries, next_entry_id, last_rendered_cols,
-//   transcript_cache_origin_untrimmed,
-//   max_transcript_bytes, max_retained_transcript_bytes,
-//   folded_command_blocks, command_output_blocks, command_output_display,
-//   tool_details,
-//   full_transcript, replaceable_last_line, replaceable_start,
-//   replaceable_row, transcript_band_dirty, layout, cursor_row, cursor_col,
-//   owned_top_row, viewport_top_row, pending_scroll_compact,
-//   has_painted_transcript, last_viewport_selection,
-//   last_visible_transcript_top_row, last_visible_transcript_start_line,
-//   last_visible_transcript_partial_skip_rows, last_visible_transcript_split_active,
-//   last_visible_transcript_split_prefix_lines,
-//   last_visible_transcript_split_suffix_start_line
-// - methods: assertCanMutateTranscript, advanceCursor, invalidateTranscriptAnchor,
-//   recomputeCursorFromTranscript, writeTranscriptBytes,
-//   writeTranscriptClassified
 
 const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
@@ -1146,8 +1129,6 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     errdefer replacement_entries.deinit(alloc);
     try replacement_entries.ensureTotalCapacity(alloc, self.entries.items.len + 1);
 
-    // Staging borrows retained payloads until publication; only the new welcome
-    // belongs to this scope on failure.
     const welcome_copy = try alloc.dupe(u8, welcome);
     errdefer alloc.free(welcome_copy);
     var replaced_welcome = false;
@@ -1412,9 +1393,6 @@ pub fn replaceSemanticNoticeAtomic(
     }
     defer shadow.deinit(alloc);
     const entry_index = semanticNoticeIndex(&shadow, entry_id) orelse return false;
-    // In-place replacement requires the producer-owned pin, mirroring the
-    // raw-bytes lifecycle pin: an unpinned notice is immutable history and
-    // may already be released into terminal scrollback.
     if (!shadow.entries.items[entry_index].semantic_notice.pending_replacement) {
         return error.MissingNoticeReplacementPin;
     }
@@ -2071,8 +2049,6 @@ fn replacePinnedToolStatusFast(
     replacement_owned = false;
     alloc.free(old_bytes);
     if (!previous_origin_untrimmed or start != 0) {
-        // Recorded entries retain their authoritative source beyond the
-        // capped cache, so a capped rewrite stays in the same visual epoch.
         reconcileTranscriptAnchorAfterSourceChangeUsingSource(
             self,
             rendered,
@@ -2757,9 +2733,6 @@ pub fn updateRawBytesEntry(
     var committed = false;
     errdefer if (!committed) alloc.free(new_dup);
 
-    // Swap the pointer so renderEntriesToBytes sees the new content.
-    // The paired errdefer restores the pointer on any later failure so
-    // the entry keeps owning `old_bytes` (still alive until commit).
     const old_bytes = self.entries.items[idx].raw_bytes.bytes;
     self.entries.items[idx].raw_bytes.bytes = new_dup;
     errdefer if (!committed) {
@@ -2777,7 +2750,6 @@ pub fn updateRawBytesEntry(
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, new_buffer, "updateRawBytesEntry");
 
-    // Commit: entry now owns new_dup; old_bytes is unreferenced.
     alloc.free(old_bytes);
     committed = true;
 
@@ -2876,8 +2848,6 @@ pub fn writeUserPromptCard(
     );
     if (committed_source) |source| {
         if (comptime reuses_source) {
-            // The frame that shows the card can reuse this source instead of
-            // rendering every entry again.
             self.adoptCommittedTranscriptSource(alloc, source, revision_before);
         } else {
             var unused = source;
@@ -3502,8 +3472,6 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
     var before = (try self.prepareCommittedRetentionSourceInterruptible(alloc, checkpoint)) orelse return false;
     defer before.deinit(alloc);
 
-    // Project only surviving committed entries. An empty intersection must not
-    // fall back to the new mutation's cache and admit unpainted append bytes.
     try build_checkpoint.poll(checkpoint);
     var retained = try cloneMutationState(next, alloc);
     defer retained.deinit(alloc);
@@ -3545,8 +3513,6 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
         for (prefix_trims) |trim| if (trim.entry_id == entry.id()) {
             removed += trim.bytes;
         };
-        // Lifecycle status replaces an existing presentation. Other raw entries
-        // may have grown since the last frame and must retain its byte extent.
         if (entry.* == .raw_bytes and entry.raw_bytes.class != .tool_status) {
             const committed = committed_texts.get(entry.id()) orelse continue;
             const old_index = committed.index orelse continue;
@@ -3885,8 +3851,6 @@ fn appendTokenPair(buf: *[theme_retint_field_count]ThemeToken, n: usize, from: [
 
 fn sortThemeTokensLongestFirst(tokens: []ThemeToken) void {
     if (tokens.len < 2) return;
-    // The list is bounded by the theme's fields; a local insertion sort avoids
-    // pulling a general block-sort implementation into this cold path.
     for (tokens[1..], 1..) |token, index| {
         var insert_at = index;
         while (insert_at > 0 and token.from.len > tokens[insert_at - 1].from.len) : (insert_at -= 1) {
@@ -3934,11 +3898,6 @@ pub fn appendReplaceableTranscriptLine(self: anytype, alloc: Allocator, metrics:
     debug_trace.logf("replace", "append start_row={d} text_bytes={d} transcript_len_before={d} cols={d}", .{ start_row, text.len, self.transcript.items.len, self.layout.cols });
 
     const entry_id = try appendReplaceableTranscriptLineSilent(self, alloc, text);
-    // Buffer-only — no terminal emit here, so no natural scroll
-    // to track. `advanceCursor` still updates `self.cursor_row`
-    // (capped) and `self.cursor_col` for between-tick heuristics
-    // in `main.zig`; the paint pass owns the authoritative cursor
-    // state after the next render.
     _ = self.advanceCursor(text);
     self.replaceable_row = start_row;
     requestTranscriptPaint(self);
@@ -3987,11 +3946,6 @@ pub fn appendReplaceableTranscriptLineSilent(self: anytype, alloc: Allocator, te
     self.replaceable_start = self.transcript.items.len - appended;
     self.replaceable_last_line = true;
 
-    // Mirror the replaceable line into the entries list as its own
-    // raw_bytes entry. Subsequent replaces target this trailing
-    // entry via `replaceTrailingTranscriptLineSilent` so spinners
-    // stay a single entry rather than accumulating historical
-    // ticks in the entries list.
     const dup = try alloc.dupe(u8, text);
     var handed_off = false;
     errdefer if (!handed_off) alloc.free(dup);
@@ -4023,10 +3977,6 @@ pub fn replaceTrailingTranscriptLineSilent(self: anytype, alloc: Allocator, text
         &self.replaceable_start,
     );
 
-    // Mirror: while replaceable is active, the trailing raw_bytes
-    // entry represents the replaceable content. Swap its bytes in
-    // place so the entry count stays stable across ticks and the
-    // spinner remains a single logical entry.
     if (self.entries.items.len > 0) {
         const tail = &self.entries.items[self.entries.items.len - 1];
         if (tail.* == .raw_bytes) {

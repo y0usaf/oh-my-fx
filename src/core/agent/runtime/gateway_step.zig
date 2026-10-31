@@ -66,8 +66,6 @@ pub fn streamModelCompletion(
     var request = request_value;
     if (observed != null) request.events = .{ .context = &observed_events, .emit_fn = ObservedEvents.emit };
     request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
-    // Only the owned result escapes. HTTP and parser scratch is released after
-    // every attempt, including transport failure and cancellation.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer scratch.deinit();
     const request_alloc = scratch.allocator();

@@ -63,9 +63,6 @@ pub const Reporter = struct {
         self.settle(switch (outcome) {
             .completed => .done,
             .failed => .@"error",
-            // A cancelled or paused turn, usually paused by the user during a
-            // recovery, waits for the next instruction. The protocol reports
-            // that as idle.
             .interrupted, .paused => .idle,
         });
     }
@@ -90,7 +87,6 @@ pub const Reporter = struct {
             .succeeded => self.settle(.done),
             .failed => self.settle(.@"error"),
             .cancelled => self.settle(.idle),
-            // Nothing ran, so there is no result to report.
             .no_op, .busy => {},
         }
     }
@@ -106,8 +102,6 @@ pub const Reporter = struct {
     /// Returns the report to write when it differs from the last one. The
     /// slice borrows `self` until the next call.
     pub fn update(self: *Reporter, activity: Activity) ?[]const u8 {
-        // A new result is news even when it matches the last report, such as
-        // a second failure in a row.
         var new_result = false;
         switch (activity) {
             .settled => {
@@ -147,7 +141,6 @@ fn writeReport(w: *std.Io.Writer, activity: Activity, settled: Settled) std.Io.W
         .working => try w.writeAll("working"),
         .settled => try w.writeAll(@tagName(settled)),
     }
-    // Each report replaces its record, so every report repeats `app`.
     try w.writeAll(":app=" ++ app_name);
     if (activity == .blocked) {
         var message_buffer: [max_message_bytes]u8 = undefined;
@@ -244,7 +237,6 @@ test "program status follows a turn from idle to its outcome" {
     reporter.noteTurnStarted();
     reporter.noteTurnFinished(.failed);
     try expectReport(&reporter, .settled, "\x1b]7501;state=error:app=fx\x1b\\");
-    // A second failure in a row is reported again.
     reporter.noteTurnStarted();
     reporter.noteTurnFinished(.failed);
     try expectReport(&reporter, .settled, "\x1b]7501;state=error:app=fx\x1b\\");
@@ -277,14 +269,12 @@ test "program status does not repeat a result the user already saw" {
     reporter.noteTurnStarted();
     reporter.noteTurnFinished(.failed);
     try expectReport(&reporter, .settled, "\x1b]7501;state=error:app=fx\x1b\\");
-    // `/compact` runs without starting a turn.
     try expectReport(&reporter, .working, working);
     try expectReport(&reporter, .settled, idle);
 
     reporter.noteTurnStarted();
     reporter.noteTurnFinished(.completed);
     try expectReport(&reporter, .settled, done);
-    // `/permissions remember` asks for confirmation outside a turn.
     try expectReport(&reporter, .{ .blocked = .{ .kind = .permission, .message = "" } }, "\x1b]7501;state=blocked:kind=permission:app=fx\x1b\\");
     try expectReport(&reporter, .settled, idle);
 
@@ -298,7 +288,6 @@ test "program status does not repeat a result the user already saw" {
 test "program status keeps an outcome noted before the turn was seen running" {
     var reporter = Reporter{};
     try expectReport(&reporter, .settled, "\x1b]7501;state=idle:app=fx\x1b\\");
-    // A turn can start and fail within one drain of worker events.
     reporter.noteTurnStarted();
     reporter.noteTurnFinished(.failed);
     try expectReport(&reporter, .working, "\x1b]7501;state=working:app=fx\x1b\\");
@@ -315,7 +304,6 @@ test "program status reports each manual compaction result once" {
     state.settle(failed, compaction_activity.failure(error.ConnectionRefused, .summary, false), 1);
     reporter.noteCompaction(state.snapshot);
     try expectReport(&reporter, .settled, "\x1b]7501;state=error:app=fx\x1b\\");
-    // The snapshot keeps the failed operation after later work settles.
     try expectReport(&reporter, .working, working);
     reporter.noteCompaction(state.snapshot);
     try expectReport(&reporter, .settled, "\x1b]7501;state=idle:app=fx\x1b\\");
@@ -326,7 +314,6 @@ test "program status reports each manual compaction result once" {
     reporter.noteCompaction(state.snapshot);
     try expectReport(&reporter, .settled, "\x1b]7501;state=done:app=fx\x1b\\");
 
-    // Compaction inside a turn belongs to that turn's outcome.
     reporter.noteTurnStarted();
     const automatic = state.begin(.automatic, 7, 4);
     state.settle(automatic, compaction_activity.failure(error.ConnectionRefused, .summary, false), 5);
@@ -343,7 +330,6 @@ test "program status messages are one bounded line without control characters" {
     const hostile = "  Run\n\ttests?\x1b]2;owned\x07 \xc2\x9b now\xff\xe2 ok  ";
     const report = reporter.update(.{ .blocked = .{ .kind = .question, .message = hostile } }).?;
     try std.testing.expectEqualStrings("Run tests? ]2;owned now ok", try decodedMessage(report, &decoded));
-    // Only the OSC introducer and the string terminator carry ESC.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, report, "\x1b"));
     try std.testing.expect(std.mem.endsWith(u8, report, terminator));
 

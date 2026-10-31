@@ -1,7 +1,3 @@
-// Reads the behaviors TLC writes with `-simulate file=...`: each file is a
-// TLA+ module of `STATE_n == /\ var = value ...` definitions. Values are the
-// few forms LeanUsage uses: numbers, TRUE/FALSE, model values (None reads as
-// null), records `[k |-> v]` and functions `(k :> v @@ ...)`.
 
 export type Value = number | boolean | string | null | { [key: string]: Value };
 export type State = Record<string, Value>;
@@ -54,7 +50,6 @@ function parseValue(tokens: string[]): Value {
       }
     }
     if (token === "(") {
-      // `(k :> v @@ ...)` is a function; anything else is a parenthesized value.
       if (tokens[at + 1] !== ":>") {
         const inner = value();
         expect(")");

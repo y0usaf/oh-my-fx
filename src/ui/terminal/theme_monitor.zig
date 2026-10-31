@@ -2,8 +2,6 @@ const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const theme_protocol = @import("theme_protocol.zig");
 
-// OSC 11 shares Escape's prefix: allow fragmented replies without imposing
-// the cursor probe's full 100 ms delay on a standalone Escape key.
 pub const response_idle_timeout_ms: i64 = 75;
 pub const background_response_timeout_ms: i64 = 200;
 
@@ -120,8 +118,6 @@ pub const Monitor = struct {
             .invalid => {},
         }
 
-        // While enabled, own complete parseable OSC 11 replies. Retain only
-        // samples bracketed by response fences; discard every other reply.
         if (std.mem.startsWith(u8, osc11_prefix, candidate)) return .pending;
         if (std.mem.startsWith(u8, candidate, osc11_prefix)) {
             if (!std.mem.endsWith(u8, candidate, "\x07") and
@@ -431,7 +427,6 @@ test "theme monitor consumes OSC 11 long after query timeout without forwarding"
     monitor.poll(background_response_timeout_ms + 2);
     try std.testing.expect(!monitor.takeSettledUpdate().?.light);
 
-    // Far past any former late-ownership window; still must not forward.
     const late_ms = background_response_timeout_ms * 5;
     for ("\x1b]11;rgb:0000/0000/0000\x07") |byte| {
         try std.testing.expect(switch (monitor.feed(byte, late_ms)) {

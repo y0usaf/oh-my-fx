@@ -47,8 +47,6 @@ def main():
     body = ",\n  ".join(records)
     with open(sys.argv[2], "w") as out:
         out.write("---- MODULE TraceData ----\n")
-        # Integers gives negative literals (for example a seq of -1 for a
-        # line the implementation could not parse).
         out.write("EXTENDS Integers\n")
         out.write(f"Trace == <<\n  {body}\n>>\n" if records else "Trace == <<>>\n")
         out.write("====\n")

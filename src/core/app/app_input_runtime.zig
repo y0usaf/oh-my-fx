@@ -282,11 +282,6 @@ pub fn Runtime(comptime App: type) type {
                         },
                         .character_right => {
                             app.input_runtime.vertical_navigation.reset();
-                            // In the provider picker the arrows walk columns:
-                            // Left reopens the previous one, Right acts as
-                            // Enter on the highlighted row. Only from the end
-                            // of the text, so Right keeps moving the cursor
-                            // while editing.
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null and
                                 !app.stream.active and
@@ -614,7 +609,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             defer completion_rt.reconcileFilePicker(app);
-            // Runs first so the file picker reconciles against a restored draft.
             defer settleModelPickerDraft(app);
 
             const paste_was_active = terminalPasteActive(app);
@@ -949,14 +943,12 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             const byte = raw.byte;
             const max_input_len = input_limits.composer_bytes;
-            // Fire the max-level cue only when the slash menu becomes visible.
             const slash_menu_was_visible = slashMenuVisibleForCue(app);
             defer announceSlashMenuOpened(app, slash_menu_was_visible);
             if (try routeActivePasteByte(app, byte)) return;
 
             if (byte != 3 and byte != 0x1b) disarmCtrlCExit(app, "raw_input");
 
-            // Non-escape input disarms the pending double-Escape clear.
             if (byte != 0x1b) {
                 if (disarmEscapeClear(app)) {
                     app.shell.render_requests.request(.footer);
@@ -964,7 +956,6 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeInterrupt(app, "raw_input");
             }
 
-            // Ctrl-Z arrives as raw byte 26 (ISIG disabled); kitty remaps here too.
             if (byte == 26) {
                 try app.suspendToJobControl();
                 return;
@@ -1011,7 +1002,6 @@ pub fn Runtime(comptime App: type) type {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
                 else => disarmCtrlCExit(app, "semantic_action"),
             }
-            // Any other semantic key stands down an armed interrupt.
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore, .escape => {},
                 else => _ = disarmEscapeInterrupt(app, "semantic_action"),
@@ -1199,8 +1189,6 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .open_model_catalog => {
                     if (comptime @hasField(App, "model_cache")) {
-                        // A second Ctrl+P backs out of the shortcut's flow
-                        // from the catalog or its inline effort and fast stages.
                         if (exitModelPickerShortcutIfActive(app)) return .done;
                         if (modelMenuActive(app)) {
                             _ = closeModelMenu(app, true);
@@ -1604,9 +1592,6 @@ pub fn Runtime(comptime App: type) type {
                         app,
                         resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
                     )) return;
-                    // A Ctrl+P flow's borrowed composer holds only a picker
-                    // query. Submitting it as a prompt or command would act
-                    // on the stashed draft's pending images.
                     if (app.input_runtime.model_picker_draft != null) {
                         debug_trace.logf("input", "submit skipped reason=model_picker_borrows_composer", .{});
                         app.shell.render_requests.request(.footer);
@@ -1788,7 +1773,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn activeCatalogMenuOwnsByte(app: *App, byte: u8) bool {
             if (settingsMenuActive(app)) return true;
-            // Typing filters its list.
             if (mcpHostMenuActive(app)) return true;
             if (helpMenuActive(app)) return true;
             if (modelMenuActive(app)) return true;
@@ -2372,8 +2356,6 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        // A space never extends a mention token, so it ends the mention and
-        // inserts through the normal composer path.
         fn dismissMentionSkillsMenuForSpace(app: *App) void {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
@@ -2437,9 +2419,6 @@ pub fn Runtime(comptime App: type) type {
         fn openModelPickerShortcut(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (app.input_runtime.model_picker_draft != null) {
-                // Unreachable through the keyboard (Ctrl+P backs out of an
-                // active flow first); recover a stranded draft rather than
-                // overwrite it.
                 debug_trace.logf("input", "model picker draft stashed with menu closed; restoring before reopen", .{});
                 restoreModelPickerDraft(app);
             }
@@ -2454,8 +2433,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn restoreModelPickerDraft(app: *App) void {
             if (app.input_runtime.model_picker_draft) |*draft| {
-                // The flow's picker stage and query belong to the borrowed
-                // composer, not to the draft coming back.
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 draft.restore(app.alloc, app.input_runtime.composerStashView());
                 app.input_runtime.model_picker_draft = null;
@@ -2503,7 +2480,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            // The fork menu reads no query from the composer, so an edit closes it.
             const fork_menu_closed = cancelForkMenu(app);
             return dismissAuthPickerForComposerEdit(app) or fork_menu_closed;
         }
@@ -2517,8 +2493,6 @@ pub fn Runtime(comptime App: type) type {
         fn submitSkillsMenuSelection(app: *App, max_input_len: usize) !bool {
             if (comptime !@hasField(App, "skills")) return false;
             if (!app.skills.menu.active) return false;
-            // Captured before the sync: a stale $ anchor makes the sync close
-            // the menu, and close() resets origin to .command.
             const origin = app.skills.menu.origin;
             syncSkillsMenu(app);
             const skill = app.skills.selectedMenuSkill() orelse {
@@ -2830,10 +2804,6 @@ pub fn Runtime(comptime App: type) type {
             };
             defer app.alloc.free(selected);
 
-            // Ctrl+P and `/model` both continue into the inline effort and
-            // fast stages. A Ctrl+P draft stays stashed while those stages
-            // borrow the composer; settleModelPickerDraft hands it back once
-            // the flow ends, and a failure here hands it back immediately.
             errdefer restoreModelPickerDraft(app);
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -2899,8 +2869,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn nonSlashPickerOwnsEnter(app: *App) bool {
             if (completion_rt.filePickerOwnsSurface(app)) return true;
-            // Bare `/model` and `/model …` own Enter over slash/skill bind. Mid-turn
-            // commit is gated separately when the model list stays hidden.
             if (app.input_runtime.picker.isModelShapedInput(&app.input_runtime.edit_state)) return true;
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) return false;
@@ -3097,9 +3065,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn expireEscapeInterruptArm(app: *App, now: i64) void {
-            // An armed interrupt guards one active operation. When that
-            // operation settles on its own, the arm must not carry into
-            // whatever work starts next.
             if (app.input_runtime.gestures.escapeInterruptArmed() and
                 !interrupt_rt.hasActiveOperation(app))
             {
@@ -3180,10 +3145,6 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
             if (was_cancel_pending) {
                 if (app.question_prompt.isActive()) {
-                    // Freeform answers mirror the composer's Esc contract:
-                    // Esc on a non-empty draft arms, a second press within
-                    // the window clears it, and only an empty field lets
-                    // Esc cancel the batch.
                     _ = disarmEscapeInterrupt(app, "question_prompt");
                     if (app.question_prompt.freeformDraftLen() > 0) {
                         const transition = gesture_state.pressEscapeClear(
@@ -3229,8 +3190,6 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "recovery_pause");
                     return;
                 }
-                // Interrupting active work requires a confirming second Esc
-                // within the gesture window. The first press only arms.
                 const transition = gesture_state.pressEscapeInterrupt(
                     app.input_runtime.gestures,
                     now,
@@ -3311,7 +3270,6 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (app.input_runtime.usage_menu.active) {
-                // Esc on a model's detail screen goes back to the tables.
                 if (app.input_runtime.usage_menu.closeDetail()) {
                     app.shell.render_requests.request(.footer);
                 } else {
@@ -3332,7 +3290,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelMcpMenu(app: *App) !bool {
             if (comptime @hasDecl(App, "mcpHostMenuKey")) if (mcpHostMenuActive(app)) {
-                // Back a screen; closing the list clears its filter too.
                 try app.mcpHostMenuKey(.escape);
                 if (!mcpHostMenuActive(app)) {
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -4722,7 +4679,6 @@ test "workspace menu whole replacement preserves the prior draft when staging fa
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "existing draft");
     app.input_runtime.workspace_menu.open();
-    // The command writer owns the first allocation; fail replacement staging.
     failing.fail_index = failing.alloc_index + 1;
 
     try std.testing.expectError(
@@ -4974,13 +4930,11 @@ test "app_input_runtime double Escape interrupts an active operation with arm, e
     defer app.deinit();
     app.stream.active = true;
 
-    // First press arms the gesture without cancelling.
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 100);
     try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
     try std.testing.expect(!app.worker.cancel_requested);
     try std.testing.expect(app.stream.active);
 
-    // A press outside the window re-arms instead of cancelling.
     Runtime(RoutingFakeApp).expireTerminalInputGestures(
         &app,
         101 + gesture_state.escape_interrupt_window_ms,
@@ -4990,12 +4944,10 @@ test "app_input_runtime double Escape interrupts an active operation with arm, e
     try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    // Non-escape input disarms the pending interrupt.
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 103 + gesture_state.escape_interrupt_window_ms);
     try std.testing.expect(!app.input_runtime.gestures.escapeInterruptArmed());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    // Two presses inside the window cancel the active operation.
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 200);
     try std.testing.expect(app.input_runtime.gestures.escapeInterruptArmed());
     try Runtime(RoutingFakeApp).resolveEscape(&app, true, 201);
@@ -5094,8 +5046,6 @@ test "app_input_runtime skills menu navigation clamps before prompt history" {
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
 
-    // At the last skill, down clamps (stays on the last) and does not fall
-    // through to prompt history.
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
 }
@@ -5273,8 +5223,6 @@ test "app_input_runtime command skills menu keeps its query on ctrl+p and ctrl-c
     try app.input_runtime.composer_history.installTextEntries(alloc, &.{"older"});
     app.skills.openMenu();
 
-    // Ctrl+P owns the model picker now; while the skills menu owns the
-    // composer it is a no-op instead of a history recall.
     try feedRoutingBytes(&app, "\x10");
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expect(!app.model_cache.menu.active);
@@ -6089,7 +6037,6 @@ test "app_input_runtime enter on tab-filtered empty dollar menu submits raw" {
     try feedRoutingBytes(&app, "$man");
     try std.testing.expect(app.skills.selectedMenuSkill() != null);
 
-    // .all -> .fx: the codex-sourced skill vanishes, nothing is selectable.
     try feedRoutingBytes(&app, "\t");
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expect(app.skills.selectedMenuSkill() == null);
@@ -6115,8 +6062,6 @@ test "app_input_runtime enter submits after delete-forward removes the dollar an
     try feedRoutingBytes(&app, "$x");
     try std.testing.expect(app.skills.menu.active);
 
-    // Delete-forward removes the $ and synchronizes the tracked menu
-    // immediately, so Enter proceeds through normal prompt submission.
     app.input_runtime.edit_state.cursor = 0;
     try feedRoutingBytes(&app, "\x04");
     try std.testing.expect(!app.skills.menu.active);
@@ -6378,8 +6323,6 @@ test "app_input_runtime session picker navigation clamps before prompt history" 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     try std.testing.expectEqual(@as(usize, 1), picker.selected);
 
-    // At the last session, down clamps (stays on the last) and does not fall
-    // through to prompt history.
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     try std.testing.expectEqual(@as(usize, 1), picker.selected);
 }
@@ -6966,8 +6909,6 @@ test "app_input_runtime bare model Tab opens on current scrolled selection befor
 
     try std.testing.expectEqual(ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings(current_model, app.input_runtime.picker.model_picker_pending_model.items);
-    // The effort stage lands on the product default rather
-    // than the session's current effort.
     try std.testing.expectEqual(
         0,
         app.input_runtime.picker.model_picker_effort_index,
@@ -7752,8 +7693,6 @@ test "app_input_runtime model picker preserves staged selections and backs out s
         "/model anthropic/claude-opus-4.7 medium ",
         app.input_runtime.edit_state.input.items,
     );
-    // The fast stage lands on the recommended fast default; navigation
-    // still reaches normal and back.
     try std.testing.expect(app.input_runtime.picker.selectedModelPickerFast());
     Runtime(RoutingFakeApp).navigateModelPicker(&app, 1);
     try std.testing.expect(!app.input_runtime.picker.selectedModelPickerFast());
@@ -8995,8 +8934,6 @@ test "app_input_runtime ctrl+n navigates prompt history directly" {
     try app.input_runtime.textReplacementState().replace(alloc, "draft");
     armCtrlCExitForTest(&app.input_runtime, 123);
 
-    // Enter history at the oldest entry, then ctrl+n steps newer and past the
-    // end back to the draft.
     try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
     try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
     try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
@@ -9066,8 +9003,6 @@ test "app_input_runtime ctrl+p catalog enter offers the effort and fast stages b
     defer app.deinit();
     try enterRoutingShortcutEffortStage(&app, "draft survives", 3);
 
-    // The shortcut continues into the same effort stage `/model` offers,
-    // keeping the draft stashed while the stages borrow the composer.
     try std.testing.expect(!app.model_cache.menu.active);
     try std.testing.expectEqualStrings("/model " ++ routing_staged_model ++ " ", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
@@ -9080,7 +9015,6 @@ test "app_input_runtime ctrl+p catalog enter offers the effort and fast stages b
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 
-    // Fast is preselected; choosing normal proves the stage decides.
     try feedRoutingBytes(&app, "normal");
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
@@ -9111,7 +9045,6 @@ test "app_input_runtime ctrl+p inline stages back out to the draft without chang
             },
             .ctrl_p => try feedRoutingBytes(&app, "\x10"),
             .clear_line => try feedRoutingBytes(&app, "\x15"),
-            // The paste completes at the delivery epoch, after ingress.
             .paste_before_query => {
                 try feedRoutingBytes(&app, "\x01");
                 try feedRoutingBytes(&app, "\x1b[200~x\x1b[201~");
@@ -9140,9 +9073,6 @@ test "app_input_runtime ctrl+p model stage never submits the borrowed composer" 
     });
     try enterRoutingShortcutEffortStage(&app, "draft [Image #1]", "draft [Image #1]".len);
 
-    // Left steps back to the inline model stage. Enter on a query that
-    // matches no model must not run it as a `/model` command, which would
-    // clear the stashed draft's pending image.
     try feedRoutingBytes(&app, "\x1b[D");
     try feedRoutingBytes(&app, "zz");
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
@@ -9170,10 +9100,8 @@ test "app_input_runtime ctrl+p catalog enter failure restores the draft without 
 
     try feedRoutingBytes(&app, "\x10");
     try setRoutingModelMenuReady(&app, &.{routing_staged_model});
-    // The selection copy owns the first allocation; fail the stage setup.
     failing.fail_index = failing.alloc_index + 1;
 
-    // Called directly, so no ingress settle runs after the failure.
     try std.testing.expectError(
         error.OutOfMemory,
         Runtime(RoutingFakeApp).submitModelMenuSelection(&app),
@@ -9216,7 +9144,6 @@ test "app_input_runtime ctrl+p model catalog keeps history navigation position" 
     try std.testing.expectEqualStrings("history entry", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(?usize, 0), app.input_runtime.composer_history.activeIndex());
 
-    // Navigation resumes where it left off: down returns to the pending draft.
     try feedRoutingBytes(&app, "\x0e");
     try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
 }
@@ -9255,8 +9182,6 @@ test "app_input_runtime ctrl+c while the picker borrows the composer keeps the s
 
     try Runtime(RoutingFakeApp).handleByte(&app, 3, 4096, 100);
 
-    // The picker backs out instead of clearing draft state: the pending image
-    // payload and the draft text both survive, and no exit gesture was armed.
     try std.testing.expect(!app.model_cache.menu.active);
     try std.testing.expectEqualStrings("draft [Image #1]", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
@@ -9291,7 +9216,6 @@ test "app_input_runtime ctrl+p catalog enter failure still closes and restores t
 
     try feedRoutingBytes(&app, "\x10");
     try setRoutingModelMenuReady(&app, &.{"alpha/one"});
-    // The selection copy owns the first allocation; fail the apply itself.
     failing.fail_index = failing.alloc_index + 1;
 
     try std.testing.expectError(
@@ -9330,7 +9254,6 @@ test "app_input_runtime image attach is skipped while ctrl+p inline stages borro
 
     try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
 
-    // Skipped before the clipboard is read: no image and no clipboard notice.
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
     try std.testing.expectEqual(notices_before, app.notice_write_count);
     try std.testing.expectEqualStrings("/model " ++ routing_staged_model ++ " ", app.input_runtime.edit_state.input.items);
@@ -9355,7 +9278,6 @@ test "app_input_runtime image path paste stays text while ctrl+p inline stages b
 
     try feedRoutingBytes(&app, paste);
 
-    // An attachment here would outlive the query once the draft returns.
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
 
@@ -9407,13 +9329,10 @@ test "app_input_runtime up arrow retracts a queued steer into an empty composer"
     app.worker.queued_steer_text = "steer text";
 
     try feedRoutingBytes(&app, "\x1b[A");
-    // The restored text matches no history entry, proving restore over recall.
     try std.testing.expectEqualStrings("steer text", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.worker.queued_steer_text == null);
     try std.testing.expect(app.input_runtime.composer_history.activeIndex() == null);
 
-    // With the steer back in the composer, up and down cycle history normally:
-    // up jumps to the draft start, then recalls the newest history entry.
     try feedRoutingBytes(&app, "\x1b[A");
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
     try feedRoutingBytes(&app, "\x1b[A");
@@ -9431,19 +9350,16 @@ test "app_input_runtime up arrow during a history episode keeps the queued steer
     try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "newer" });
     app.worker.queued_steer_text = "steer text";
 
-    // Enter history with a stashed draft, then clear the recalled entry to empty.
     try app.input_runtime.textReplacementState().replace(alloc, "unsent draft");
     try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
     try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
     try app.input_runtime.textReplacementState().replace(alloc, "");
     try std.testing.expect(app.input_runtime.composer_history.activeIndex() != null);
 
-    // Up must not retract the steer or drop the stashed draft; it navigates history.
     try feedRoutingBytes(&app, "\x1b[A");
     try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.worker.queued_steer_text != null);
 
-    // Down past the newest entry restores the stashed draft intact.
     try feedRoutingBytes(&app, "\x1b[B");
     try std.testing.expectEqualStrings("newer", app.input_runtime.edit_state.input.items);
     try feedRoutingBytes(&app, "\x1b[B");
@@ -12661,8 +12577,6 @@ const FakeSubmitApp = struct {
             self.clearPendingImages();
             if (self.fail_command_after_pending_clear) return error.InjectedCommandFailure;
         }
-        // Attach through the production handler so routing tests observe real placeholder
-        // insertion, id allocation, and snapshot capture rather than a stub.
         const attach_prefix: ?[]const u8 = if (std.mem.startsWith(u8, text, "/image "))
             "/image "
         else if (std.mem.startsWith(u8, text, "/img "))

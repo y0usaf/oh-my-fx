@@ -92,8 +92,6 @@ export function buildShardPlan(
   return { shards, totals };
 }
 
-// Narrows a shard plan to a listed subset of the discovered files, such as the
-// macOS platform list, while keeping each file's checked-in weight.
 export function restrictToFiles(
   discoveredFiles: string[],
   manifestValue: unknown,

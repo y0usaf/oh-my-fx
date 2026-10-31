@@ -50,15 +50,10 @@ fn readWith(
     };
     defer file.close(io_mod.getIo());
     if (try readSized(alloc, file, max_bytes)) |outcome| return outcome;
-    // The file holds more than its stat said: it grew, or its file system
-    // reports no size, as Linux does for /proc. A positional reader would stop
-    // at the stat size, so read it as a stream, which never trusts one.
     var read_buffer: [8192]u8 = undefined;
     var reader = file.readerStreaming(io_mod.getIo(), &read_buffer);
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
-    // A stream that fills its limit reads as too long, so allow one extra byte
-    // to accept a file of exactly `max_bytes`.
     reader.interface.appendRemaining(alloc, &content, .limited(max_bytes +| 1)) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.StreamTooLong => .{ .unavailable = "too_large" },
@@ -74,9 +69,7 @@ fn readSized(alloc: Allocator, file: std.Io.File, max_bytes: usize) Allocator.Er
     const io = io_mod.getIo();
     const stat = file.stat(io) catch |err| return .{ .unavailable = @errorName(err) };
     if (stat.size > max_bytes) return .{ .unavailable = "too_large" };
-    // `stat.size <= max_bytes`, so it fits in a usize.
     const size: usize = @intCast(stat.size);
-    // One byte past the size shows whether the file grew since the stat.
     const buffer = try alloc.alloc(u8, size + 1);
     const read = file.readPositionalAll(io, buffer, 0) catch |err| {
         alloc.free(buffer);
@@ -127,7 +120,6 @@ test "bounded reads allocate the file's size, not a stream buffer" {
 }
 
 test "bounded reads stream a regular file whose stat reports no size" {
-    // Linux reports 0 bytes for the regular files under /proc.
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const status = try readUserAbsolute(alloc, "/proc/self/status", 1024 * 1024);
@@ -151,7 +143,6 @@ test "user reads follow a final symlink to a regular file and still refuse the r
     const followed = try readUserAbsolute(alloc, linked, 16);
     defer alloc.free(followed.content);
     try std.testing.expectEqualStrings("[core]\n", followed.content);
-    // A repository-named path still refuses the same link.
     try std.testing.expect(try readAbsolute(alloc, linked, 16) == .unavailable);
 
     const linked_dir = try std.Io.Dir.path.join(alloc, &.{ root, "linked-dir" });
@@ -160,7 +151,6 @@ test "user reads follow a final symlink to a regular file and still refuse the r
     try std.testing.expectEqualStrings("too_large", (try readUserAbsolute(alloc, linked, 2)).unavailable);
     try std.testing.expect(try readUserAbsolute(alloc, "relative", 16) == .unavailable);
 
-    // A link to a FIFO is refused without waiting for a writer.
     const fifo = try std.Io.Dir.path.joinZ(alloc, &.{ root, "fifo" });
     defer alloc.free(fifo);
     if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;

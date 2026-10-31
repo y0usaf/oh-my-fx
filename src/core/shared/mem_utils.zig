@@ -1,8 +1,5 @@
 const std = @import("std");
 
-// Centralize generic free paths that Zig would otherwise duplicate at each
-// error exit, reducing generated code to one call per cleanup site.
-
 /// Drop-in replacement for `alloc.free(slice)`.
 pub fn free(alloc: std.mem.Allocator, memory: anytype) void {
     const info = @typeInfo(@TypeOf(memory)).pointer;

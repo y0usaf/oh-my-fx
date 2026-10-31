@@ -76,7 +76,6 @@ def generate(home: Path, workspace: Path, count: int, log_size: int, deny_event_
                 "total_output_tokens": 0,
                 "last_event_seq": 1,
                 "event_log_bytes": log_size,
-                # fx decides staleness by log size and reads no stat identity.
                 "event_log_stat_fingerprint": "00" * 32,
                 "generation_base_seq": 1,
                 "generation_base_bytes": log_size,

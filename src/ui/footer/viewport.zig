@@ -186,10 +186,6 @@ pub const FooterViewport = struct {
             .{ self.geometry.top, shell.layout.rows },
         );
         self.invalidateAfterExternalClear();
-        // Keep has_frame set so shutdownCleanupRow still targets the footer
-        // top (clearing it here made exit wipe from cursor_row and erase
-        // transcript like "cancelled"). requestTerminalReset clears frame
-        // state when a full reanchor follows job-control resume.
         recordFooterBandInvalidation(shell, self.geometry.top, shell.layout.rows, .external_clear);
     }
 };

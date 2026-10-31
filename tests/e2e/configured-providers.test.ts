@@ -288,8 +288,6 @@ describe("configured providers", () => {
     let parentTurns = 0;
     const f = fixture(body => {
       if (body.model === "child-model") {
-        // Context pressure comes from the child's own replies. Compaction keeps
-        // them word for word, shortening the longest, so it needs no model call.
         return completion(body.model, "child reply " + "detail ".repeat(2000), Math.ceil(JSON.stringify(body).length / 4));
       }
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
@@ -309,7 +307,6 @@ describe("configured providers", () => {
         expect(JSON.parse(returned).ok).toBe(true);
       }
       const childRequests = f.requests.filter(request => request.body.model === "child-model");
-      // Only the child model's own small context window makes the child compact.
       expect(childRequests.some(request => JSON.stringify(request.body.messages).includes("<compacted_conversation>"))).toBe(true);
       expect(childRequests.every(request => request.body.max_tokens > 0 && request.body.max_tokens <= 512)).toBe(true);
       expect(f.requests.every(request => request.path === "/v1/chat/completions" && request.authorization === null)).toBe(true);

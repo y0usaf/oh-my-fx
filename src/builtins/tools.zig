@@ -1396,7 +1396,6 @@ test "built-in subagent owns product metadata schema and callbacks" {
         try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
     }
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
-    // Creation-time routing overrides are advertised on both actions.
     try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"effort\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "Inherits the parent's model when omitted") != null);

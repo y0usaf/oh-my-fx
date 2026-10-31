@@ -1,5 +1,3 @@
-// Observations of host-owned effects. Helpers call the effect exactly once,
-// preserve its value/error, and never await an instrumentation callback.
 export function toolObservation(scope, callId, hooks, emit, signal) {
   const report = (error) => {
     try {

@@ -72,8 +72,6 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
         }
         switch (p_ch) {
             '\\' => {
-                // Literal match with the following character, which git does
-                // not case-fold.
                 p += 1;
                 if (t_ch != at(pattern, p)) return .no_match;
             },
@@ -90,7 +88,6 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
                     if (prev_is_boundary and (next == 0 or next == '/' or
                         (next == '\\' and at(pattern, p + 1) == '/')))
                     {
-                        // `**/` may match no directories at all.
                         if (next == '/' and doWild(pattern, p + 1, text, t, flags, budget) == .match) return .match;
                         match_slash = true;
                     } else {
@@ -102,21 +99,15 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
 
                 const next = at(pattern, p);
                 if (next == 0) {
-                    // A trailing `**` matches everything; a trailing `*` only
-                    // when no slash remains.
                     if (!match_slash and hasSlashFrom(text, t) != null) return .no_match;
                     return .match;
                 } else if (!match_slash and next == '/') {
-                    // One `*` followed by a slash matches the next directory;
-                    // the loop's increment consumes both slashes.
                     t = hasSlashFrom(text, t) orelse return .no_match;
                     continue :outer;
                 }
 
                 while (true) {
                     if (t_ch == 0) break;
-                    // Skip ahead to the next occurrence of a literal that
-                    // follows the asterisk.
                     if (!isGlobSpecial(at(pattern, p))) {
                         var literal = at(pattern, p);
                         if (flags.casefold) literal = lower(literal);
@@ -152,7 +143,6 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
                 }
                 var prev_ch: u8 = 0;
                 var matched = false;
-                // Mirrors git's do-while: the first member may be `]`.
                 while (true) {
                     if (p_ch == 0) return .abort_all;
                     if (p_ch == '\\') {
@@ -182,7 +172,6 @@ fn doWild(pattern: []const u8, p_start: usize, text: []const u8, t_start: usize,
                         p_ch = at(pattern, p);
                         if (p_ch == 0) return .abort_all;
                         if (p < class_start + 1 or pattern[p - 1] != ':') {
-                            // No closing `:]`: treat `[` as a plain member.
                             p = class_start - 2;
                             p_ch = '[';
                             if (t_ch == p_ch) matched = true;
@@ -308,7 +297,6 @@ test "wildmatch case folding is ASCII-only and keeps git's escape quirk" {
         .{ .pattern = "f*O", .text = "Foo", .expected = true },
         .{ .pattern = "[a-c]x", .text = "Bx", .expected = true },
         .{ .pattern = "[[:upper:]]x", .text = "bx", .expected = true },
-        // git compares an escaped character without folding it.
         .{ .pattern = "\\Ax", .text = "ax", .expected = false },
         .{ .pattern = "\xc3\x89", .text = "\xc3\xa9", .expected = false },
     }, .{ .pathname = true, .casefold = true });
@@ -318,8 +306,6 @@ test "wildmatch stops at a NUL byte like git's C strings" {
     try std.testing.expect(match("ab\x00zz", "ab", .{ .pathname = true }));
 }
 
-// The indexer imports nothing outside its boundary, so it keeps its own copy of
-// `text_utils.repeat` for tests.
 inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
     return comptime blk: {
         var bytes: [text.len * count:0]u8 = @splat(0);
@@ -336,7 +322,6 @@ test "hostile patterns stop at the step budget instead of backtracking forever" 
         try std.testing.expect(!match(pattern, long_text, .{ .pathname = true }));
         try std.testing.expect(!match(pattern, long_text, .{}));
     }
-    // Ordinary patterns on a long path still match.
     try std.testing.expect(match("**/b", long_text, .{ .pathname = true }));
     try std.testing.expect(match("a/**/a/b", long_text, .{ .pathname = true }));
 }

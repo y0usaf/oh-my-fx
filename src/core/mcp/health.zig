@@ -726,8 +726,6 @@ test "startupDecision keeps blocking required servers that need authentication" 
     var ready_servers = [_]ServerSnapshot{ ready_server, optional_auth };
     try std.testing.expectEqual(StartupDecision.degraded, startupDecision(&ready_servers));
 
-    // A ready server with a freshly observed auth challenge classifies as
-    // needs_auth, so a required one still blocks and an optional one degrades.
     var ready_challenged = emptyServerSnapshot();
     ready_challenged.required = true;
     ready_challenged.connection = .ready;

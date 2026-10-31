@@ -213,8 +213,6 @@ function fakeGatewayEnv(
   };
 }
 
-// The session backends a test runs on. v2 sits behind FX_SESSIONS_V2 and
-// keeps a session in one folder, ~/.fx/sessions/v2/{id} (D48).
 const SESSION_BACKENDS = [
   { suffix: "", env: { FX_SESSIONS_V2: undefined }, v2: false },
   { suffix: " on sessions v2", env: { FX_SESSIONS_V2: "1" }, v2: true },
@@ -1263,7 +1261,7 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
 async function startAutoSession(client: AcpClient, hooks = false) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   const created = await client.request("session/new", { mcpServers: [], ...(hooks ? { _meta: { fx: { hooks: { captureContent: true } } } } : {}) }, 2) as any;
-  await client.readLine(); // consume session/update notification
+  await client.readLine();
   await client.request("session/set_mode", { modeId: "auto" }, 3);
   return created.result.sessionId as string;
 }
@@ -1610,7 +1608,6 @@ describe("acp: model-independent", () => {
         });
         await startAutoSession(client);
 
-        // The turn retries on its own: no pause, no explicit continuation.
         const result = await runPrompt(
           client,
           "Preserve this ACP prompt through recovery.",
@@ -1621,12 +1618,8 @@ describe("acp: model-independent", () => {
         expect(gateway.requests).toHaveLength(4);
         const allUpdates = JSON.stringify(result.messages);
         expect(allUpdates).not.toContain('"state":"paused"');
-        // The partial streamed once, then the full replacement (which carries
-        // the partial as its prefix) streamed once.
         expect(occurrenceCount(allUpdates, partialText)).toBe(2);
         expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
-        // In-turn retries never inject a synthetic restart message and never
-        // parrot the partial back to the model.
         expect(gateway.requests[3]!.body).toContain(
           "Preserve this ACP prompt through recovery.",
         );
@@ -2081,14 +2074,10 @@ describe("acp: model-independent", () => {
   test(
     "ACP compacts automatically at the configured percent",
     async () => {
-      // Replies without provider usage, so fx sizes the conversation by its
-      // own estimate.
       const reply = (text: string) => fakeGatewaySse([
         { type: "text-delta", id: "answer_1", delta: text },
         { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
       ]);
-      // About 30,000 estimated tokens: past 20 percent of the model's input,
-      // well short of the default 80 percent.
       const large = "ACP_LARGE_REPLY\n" + "historical reference line, not new completed work.\n".repeat(2_400);
       for (const percent of [undefined, "20"]) {
         const root = createIsolatedRoot("fx-acp-compact-percent-");
@@ -2103,7 +2092,6 @@ describe("acp: model-independent", () => {
           await startAutoSession(client);
           expect((await runPrompt(client, "Write the large reply.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
           expect((await runPrompt(client, "Continue.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
-          // A plain turn has nothing to note, so compacting it needs no model call.
           expect(gateway.requests).toHaveLength(2);
           expect(gateway.requests[1]!.body.includes("compacted_conversation"), `percent ${percent ?? "default"}`).toBe(percent !== undefined);
           expect(client.stderr).toBe("");
@@ -2215,7 +2203,7 @@ describe("acp: model-independent", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
         await client.request("session/set_mode", { modeId: "auto" }, 3);
         const sessionId = created.result.sessionId as string;
 
@@ -2285,8 +2273,6 @@ describe("acp: model-independent", () => {
           path: "recovery-fixture.txt",
         }),
         partialEofResponse(partialText),
-        // The retry parks on this held request; the process dies while it is
-        // in flight.
         held.response,
         finalText(replacementText),
       ]);
@@ -2348,8 +2334,6 @@ describe("acp: model-independent", () => {
         const resumed = await continueRecovery(client, TIMEOUT, sessionId);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        // Three requests before the kill; the continued turn's retry consumes
-        // the scripted success.
         expect(gateway.requests).toHaveLength(4);
         expect(gateway.requests[3]!.body).toContain(toolEvidence);
         const restartedUpdates = JSON.stringify([
@@ -2570,7 +2554,6 @@ describe("acp: model-independent", () => {
         expect(toolResult).not.toContain("proof");
         expect(client.stderr).toBe("");
         await client.close();
-        // The ACP process owned the terminal itself: no host daemon state.
         expect(existsSync(join(root.root, "home", ".fx", "terminal-host-v7"))).toBe(false);
       } finally {
         await client?.close();
@@ -2585,8 +2568,6 @@ describe("acp: model-independent", () => {
     "ACP reports a shell snapshot fallback once on the triggering shell call",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-snapshot-");
-      // A 9 MB alias exceeds the 8 MiB capture limit, while full startup still
-      // works. Both login shells read these files.
       const startup =
         "alias fxbig=\"$(head -c 9000000 /dev/zero | tr '\\0' x)\"\n" +
         "alias fxsmall='printf ACP_FULL_STARTUP_ALIAS'\n";
@@ -3098,7 +3079,6 @@ describe("acp: model-independent", () => {
           env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
         });
         const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
-        // Only what ACP v1 defines and MCP-v2 speaks: no HTTP+SSE, no "type": "acp".
         expect(initialized.result.agentCapabilities.mcpCapabilities).toEqual({ http: true, sse: false, acp: false });
         const created = await client.request(
           "session/new",
@@ -3116,7 +3096,6 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(created.error).toBeUndefined();
         await client.readLine();
-        // MCP-v2 starts a server when the model first needs it.
         expect(httpFixture.requests).toHaveLength(0);
         await client.request("session/set_mode", { modeId: "auto" }, 3);
         const requestStart = gateway.requests.length;
@@ -3170,7 +3149,6 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
-          // A short description limit, so the search truncates the tool's.
           args: ["--context-limit", "mcp_description_bytes=8", "acp"],
         });
         await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
@@ -3231,7 +3209,6 @@ describe("acp: model-independent", () => {
         let start = gateway.requests.length;
         const loaded = await runPrompt(client, "Call the supplied MCP echo tool.", TIMEOUT);
         expect(loaded.promptResult.result.stopReason).toBe("end_turn");
-        // Offered on the first request: no capability_search, no select.
         expect(gateway.requests).toHaveLength(start + 2);
         expect(offered(start)).toBe(true);
         expect(acpToolResultText(gateway.requests[start + 1]!.body, "call_loaded")).toContain(MODERN_HTTP_TOOL_RESULT + ":acp");
@@ -3424,7 +3401,6 @@ describe("acp: model-independent", () => {
           .join("");
         expect(agentText).toContain("Summarized the other tab.");
 
-        // A steering prompt with no running turn starts an ordinary turn.
         sendSteeringPrompt(client, 103, "idle steer");
         const idle = (await readUntilResponses(client, [103])).responses.get(103)!;
         expect(idle.error).toBeUndefined();
@@ -3582,15 +3558,12 @@ describe("acp: model-independent", () => {
           expect(second.promptResult.result.stopReason).toBe("end_turn");
           const secondSystem = systemText(gateway.requests[1]!.body);
           expect(secondSystem).toContain(`<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}`);
-          // This client did not opt out of the terminal prompt.
           expect(secondSystem).toContain("which fx renders in the terminal");
 
           expect(client.stderr).toBe("");
           await client.close();
 
           if (backend.v2) {
-            // v2 keeps the prompt as one setting in the session's own log
-            // (D46): nothing beside the log can go bad on its own.
             const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
             const prompts = log.trimEnd().split("\n").map((line) => JSON.parse(line))
               .filter((line) => line.kind === "set" && line.key === "client_prompt");
@@ -3598,9 +3571,6 @@ describe("acp: model-independent", () => {
             expect(JSON.stringify(prompts[0].value)).toContain(marker);
             expect(existsSync(join(root.home, ".fx", "session-files"))).toBe(false);
           } else {
-            // A stored prompt that cannot be read fails the load instead of
-            // running the session without the client's instructions. A fresh
-            // process reads it from disk; an already active session keeps its own.
             writeFileSync(
               join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.txt"),
               "corrupt\u0000prompt",
@@ -3620,7 +3590,6 @@ describe("acp: model-independent", () => {
             }, 12) as any;
             expect(unreadable.error.code).toBe(-32603);
             expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
-            // The session that was active before the failed load still runs.
             const third = await runPrompt(client, "Still there?", TIMEOUT);
             expect(third.promptResult.result.stopReason).toBe("end_turn");
             expect(gateway.requests).toHaveLength(3);
@@ -3829,7 +3798,6 @@ describe("acp: model-independent", () => {
           mcpServers: [{ type: "acp", name: "mini", serverId: "mini-browser:7a72" }],
         }, 3) as any;
         expect(created.error).toBeUndefined();
-        // Discovery waits for the first turn, off the connection reader.
         expect(served).toEqual([]);
         await client.readLine();
         client.setPermissionOption("allow_once");
@@ -3898,7 +3866,7 @@ describe("acp: model-independent", () => {
               },
             };
           }
-          return undefined; // Leave tools/call unanswered.
+          return undefined;
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request("session/new", {
@@ -4044,7 +4012,6 @@ describe("acp: model-independent", () => {
           client.setPermissionOption("allow_once");
 
           sendPrompt(client, 10, "Read the page.");
-          // The client answers discovery only while it reads.
           while (client.mcpMessages.length < 2) await client.readLine();
           await firstRequest.promise;
           sendSteeringPrompt(client, 11, "Just the title.");
@@ -4081,7 +4048,6 @@ describe("acp: model-independent", () => {
           );
           expect(steerIndex).toBeGreaterThan(readIndex);
           expect(updates[steerIndex]._meta.fx.steering).toEqual({ requestId: null });
-          // Replay needs no connection to the client MCP server.
           expect(client.mcpMessages).toHaveLength(0);
           expect(client.stderr).toBe("");
         } finally {
@@ -4113,7 +4079,7 @@ describe("acp: model-independent", () => {
         client.setMcpMessageHandler((params) => {
           if (params.method === "server/discover") {
             discoverCount += 1;
-            if (discoverCount === 1) return undefined; // Hold the first attempt.
+            if (discoverCount === 1) return undefined;
             return {
               result: {
                 resultType: "complete",
@@ -4270,7 +4236,6 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-project-cwd-v2-");
       const pidPath = join(root.root, "project-cwd.pid");
-      // A path relative to the project: it only resolves when the server starts there.
       mkdirSync(join(root.workspace, "tools"), { recursive: true });
       writeFileSync(join(root.workspace, "tools", "server.mjs"), `import ${JSON.stringify(MCP_STDIO_FIXTURE)};\n`);
       writeFileSync(
@@ -4294,7 +4259,6 @@ describe("acp: model-independent", () => {
       try {
         const approved = await runFx(["mcp", "approve", "fixture"], { cwd: root.workspace, env });
         expect(approved.code).toBe(0);
-        // fx itself runs elsewhere; the session names the project.
         client = await AcpClient.create({ cwd: root.root, env });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
@@ -4878,8 +4842,6 @@ describe("acp: model-independent", () => {
           "call_http_auth",
           `${MODERN_HTTP_TOOL_RESULT}:authenticated`,
         );
-        // Every saved file, on either session backend: the scan must see the
-        // saved tool result, and nothing may hold the credential.
         const fxDir = join(root.home, ".fx");
         const saved = (readdirSync(fxDir, { recursive: true }) as string[])
           .map((name) => join(fxDir, name))
@@ -6017,7 +5979,6 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.inputResponses).toEqual({
           confirm: { action: "accept" },
         });
-        // MCP-v2 sends the spec's opaque string back as it came.
         expect(calls[1]?.params?.requestState).toEqual(engine === "v2" ? "opaque" : { fixture: "opaque" });
         expect(calls[1]?.params?.name).toBe(calls[0]?.params?.name);
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);
@@ -9755,9 +9716,6 @@ describe("acp: model-independent", () => {
         expect(firstWire).not.toContain("\\u001b");
         expect(readFileSync(target, "utf8")).toBe("first\n");
 
-        // The session grant recorded by allow_always must satisfy the second
-        // write without another round-trip, even though the client would now
-        // reject one.
         client.setPermissionOption("reject_once");
         const second = await runPrompt(client, "Repeat the approved external write.", TIMEOUT);
         expect(
@@ -10266,7 +10224,7 @@ describe("acp: model catalog authentication", () => {
         expect(modelOpt).toBeDefined();
         expect(modelOpt.currentValue).toBe("provider/fast-override");
 
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
         const prompt = await runPrompt(client, "Confirm the model override.");
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(1);
@@ -10299,7 +10257,7 @@ describe("acp: model catalog authentication", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
 
         const changed = await client.request("session/set_config_option", {
           configId: "provider",
@@ -10588,8 +10546,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         const notification = await client.readLine() as any;
         expect(notification.method).toBe("session/update");
 
-        // The fake model advertises no effort levels, so the selector is
-        // omitted and setting effort is rejected.
         expect(resp.result.configOptions.find((o: any) => o.id === "effort")).toBeUndefined();
         const rejected = await client.request(
           "session/set_config_option",
@@ -10642,7 +10598,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
         const resp = await client.request("session/set_mode", { modeId: "auto" }, 3) as any;
         expect(resp.result).toBeDefined();
       } finally {
@@ -10666,7 +10622,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const newResp = await client.request("session/new", { mcpServers: [] }, 2) as any;
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
         const sessionId = newResp.result.sessionId;
 
         const loadResp = await client.request(
@@ -10785,7 +10741,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         await client.readLine();
         expect(next.result.modes.currentModeId).toBe("full-access");
 
-        // Another fx process, such as the CLI's /permissions, saves a mode.
         writeFileSync(settingsPath, JSON.stringify({ ...JSON.parse(readFileSync(settingsPath, "utf8")), permission_mode: "ask" }));
         const afterOther = await client.request("session/new", { mcpServers: [] }, 9) as any;
         await client.readLine();
@@ -10848,7 +10803,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
 
         const resp = await client.request("session/set_config_option", {
           configId: "model",
@@ -10881,7 +10836,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
 
         const promptId = 10;
         client.send({
@@ -10926,7 +10881,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
 
         client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
         await new Promise((r) => setTimeout(r, 300));
@@ -10984,7 +10939,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
+        await client.readLine();
         await client.request("session/list", {}, 3);
         expect(client.stderr).toBe("");
       } finally {
@@ -11031,8 +10986,6 @@ test.skipIf(!tmuxAvailable())(
       const beforeCompaction = readFileSync(eventsPath);
       expect(checkpointFrames()).toHaveLength(0);
       await tui.sendText("/compact");
-      // Success is silent: the committed checkpoint, not a transcript notice,
-      // establishes that compaction finished before testing ACP replay.
       await waitForCondition("persisted compaction checkpoint", () => checkpointFrames().length === 1, TIMEOUT);
       await tui.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Thinking|Preparing compaction/.test(pane), TIMEOUT);
       expect(checkpointFrames()).toHaveLength(1);

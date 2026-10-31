@@ -115,9 +115,6 @@ fn costDescending(_: void, a: report.ModelRow, b: report.ModelRow) bool {
     return std.mem.lessThan(u8, a.model, b.model);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-
 const testing = std.testing;
 const day_ms = std.time.ms_per_day;
 

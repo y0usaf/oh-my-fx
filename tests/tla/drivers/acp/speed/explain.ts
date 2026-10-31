@@ -1,8 +1,3 @@
-// Diagnostic only: prints each observed step beside the state the spec
-// predicts, to explain a TLC rejection. TLC remains the oracle; this mirrors
-// tests/tla/acp/AcpSpeed.tla for readability and assumes a deterministic start.
-//
-//   bun tests/tla/drivers/acp/speed/explain.ts <report>/traces/<name>
 import { join } from "node:path";
 
 const SUP_FAST = new Set(["openai/gpt-6-astra", "openai/gpt-5.6-priority"]);

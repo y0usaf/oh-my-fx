@@ -88,8 +88,6 @@ pub fn eventf(scope: []const u8, event: []const u8, ctx: TraceContext, comptime 
     line.end();
 }
 
-// Keep generic trace wrappers small by centralizing line assembly here.
-// Failed lines accept remaining writes but emit nothing.
 const TraceLine = struct {
     out: std.Io.Writer.Allocating,
     failed: bool,

@@ -88,16 +88,10 @@ pub const Runtime = struct {
 
             const description_value = entry.object.get("description") orelse return error.InvalidHostTool;
             const schema_value = entry.object.get("inputSchema") orelse return error.InvalidHostTool;
-            // A tool whose calls are safe to run twice says so. Its calls may
-            // run again after a crash, and only its calls run beside others
-            // unless it declares otherwise.
             const idempotent = if (entry.object.get("idempotent")) |value_| switch (value_) {
                 .bool => |declared| declared,
                 else => return error.InvalidHostTool,
             } else false;
-            // A tool that writes is a fence: earlier calls finish before it
-            // starts, and later calls wait for it. A tool that does not say
-            // writes unless it is idempotent.
             const writes = if (entry.object.get("writes")) |value_| switch (value_) {
                 .bool => |declared| declared,
                 else => return error.InvalidHostTool,

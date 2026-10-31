@@ -21,12 +21,6 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 
-// A repository's own git config can name programs: fsmonitor, hooks, clean
-// and smudge filters, diff drivers and the pager. Opening a repository in fx
-// must never run them. A control first proves the fixture's programs run
-// under plain git; every fx path below must then leave the sentinel log
-// empty while still answering from the repository's real contents.
-
 const TIMEOUT = 60_000;
 const MODEL = "openai/gpt-5";
 const tmuxTest = test.skipIf(!tmuxAvailable());
@@ -201,7 +195,6 @@ describe("poisoned repository", () => {
         { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
       );
       expect(result.code, result.stderr).toBe(0);
-      // `fx ask` reports each tool's activity on stderr.
       expect(result.stderr).toContain("Running git status --short");
       expect(result.stderr).not.toMatch(/panic|error/i);
       expect(sentinelRuns(fixture)).toEqual([]);
@@ -225,8 +218,6 @@ describe("poisoned repository", () => {
     "auto mode holds a git command whose repository config fx cannot read",
     async () => {
       const fixture = poisonedRepository();
-      // fx reads repository config only through regular files, so an include
-      // that is a symlink leaves the config unread and safe git refuses.
       writeFileSync(join(fixture.base, "real.inc"), `[core]\n\tfsmonitor = ${join(fixture.base, "sentinel.sh")}\n`);
       symlinkSync(join(fixture.base, "real.inc"), join(fixture.workspace, ".git", "linked.inc"));
       git(fixture, ["config", "include.path", "linked.inc"]);
@@ -278,8 +269,6 @@ describe("poisoned repository", () => {
   );
 });
 
-// Dotfile managers often make `~/.gitconfig` a symlink. Files the user's own
-// excludes file ignores must stay out of glob and grep through it, as in git.
 describe("user git config through a symlink", () => {
   test(
     "glob and grep honor an excludes file named by a symlinked ~/.gitconfig",

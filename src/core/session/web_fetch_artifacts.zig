@@ -453,7 +453,6 @@ test "web_fetch on a v2 session keeps a download as a blob the model opens by pa
     try std.testing.expectEqualStrings("application/pdf", artifact.mime_type);
     try std.testing.expectEqual(@as(usize, 1), memory.count());
 
-    // The path is the blob's own read-only file.
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), artifact.display_path, .{});
     defer file.close(io_mod.getIo());
     var buffer: [64]u8 = undefined;
@@ -467,7 +466,6 @@ test "web_fetch on a v2 session keeps a download as a blob the model opens by pa
     try std.testing.expect(!try store.contains("artifact-" ++ text_utils.repeat("0", 64) ++ ".pdf"));
     try std.testing.expectError(error.ArtifactNotFound, store.read(alloc, "artifact-" ++ text_utils.repeat("0", 64) ++ ".pdf", 1024));
 
-    // The same download is the same blob; the limits still count.
     var again = try store.write(alloc, "application/pdf", bytes);
     defer again.deinit(alloc);
     try std.testing.expectEqualStrings(artifact.handle, again.handle);

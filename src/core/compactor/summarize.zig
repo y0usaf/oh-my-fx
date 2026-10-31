@@ -171,10 +171,6 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
     if (request.turns.len == 0) return error.NothingToCompact;
     const users = try userMessages(alloc, request);
     defer alloc.free(users);
-    // The previous compaction is saved whole as the next ledger, and only a
-    // summary and its rules, status and open entries still in force stay, so
-    // the turns of earlier compactions leave the view however many there
-    // are. Without a store it cannot be saved, so it stays.
     var fold_state: std.heap.ArenaAllocator = .init(alloc);
     defer fold_state.deinit();
     var earlier = request.earlier;
@@ -184,21 +180,16 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
         earlier = folded.earlier;
         fold = folded.fold;
     };
-    // Turns too large for one request go oldest first. Each part adds its
-    // turns and entries to what the one before it kept.
     var previous: ?Result = null;
     defer if (previous) |*part| part.deinit();
     var start: usize = 0;
     while (true) {
-        // Only the first part summarizes the previous compaction.
         const part_fold = if (start == 0) fold else null;
         const end = partEnd(request, earlier, part_fold, start);
         var part = request;
         part.earlier = earlier;
         part.turns = request.turns[start..end];
         part.last_turn_open = request.last_turn_open and end == request.turns.len;
-        // The conversation holds every turn, so it serves only a request for
-        // all of them.
         if (start > 0 or end < request.turns.len) part.conversation_room = null;
         var next = try compactPart(alloc, part, users, model, store, part_fold);
         if (end == request.turns.len) {
@@ -244,8 +235,6 @@ fn foldPrevious(arena: Allocator, previous: Compacted, store: compacted_records.
     var kept: std.ArrayList(checkpoint.Entry) = .empty;
     var unreadable: usize = 0;
     for (previous.entries) |entry| {
-        // A saved entry whose ID is damaged would fail every later check of
-        // the compacted conversation; it stays only in the saved ledger.
         if (!checkpoint.isEntryId(entry.id)) {
             unreadable += 1;
             continue;
@@ -367,8 +356,6 @@ fn turnTokens(turn: Turn) usize {
         }
     }
     const text = std.math.cast(usize, estimator.estimate()) orelse std.math.maxInt(usize);
-    // A label for every item and the turn's heading, and one for the turn's
-    // line in the request's list of headings.
     return text +| (turn.items.len +| 2) *| item_label_tokens;
 }
 
@@ -437,8 +424,6 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
     };
     const highest = checkpoint.highestIds(earlier);
 
-    // Every turn and tool call word for word: saved as its record, and what
-    // the model's notes are checked against.
     var turn_records: std.ArrayList(lint.Record) = .empty;
     var tool_records: std.ArrayList(lint.Record) = .empty;
     for (turns) |turn| {
@@ -452,7 +437,6 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
         if (turn.number > 0) if (store) |saved| try saveRecord(scratch, saved, .{ .kind = .turn, .number = turn.number }, text);
         try turn_records.append(scratch, .{ .number = turn.number, .text = text, .first_tool = turn.first_tool, .last_tool = turn.last_tool });
     }
-    // The turn in progress is turn zero, so it goes first.
     std.mem.sort(lint.Record, turn_records.items, {}, byNumber);
 
     var written: ledger.Written = .{};
@@ -462,16 +446,11 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
             error.Cancelled, error.OutOfMemory => |fatal| return fatal,
             else => {
                 if (plan.needsNotes()) return err;
-                // Only the summary of the folded compaction was asked for;
-                // the summary before it stands in, and it stays saved whole.
                 trace.log(true, "compaction summary of L{d} failed err={s}; keeping the summary before it", .{ plan.fold.?.ledger, @errorName(err) });
                 break :notes;
             },
         };
         var read = first.asked.written;
-        // A reply that skips turns with work, or the summary of the folded
-        // compaction, is asked once more for just those. Everything before
-        // the request is the same, so the provider has it cached.
         const missing = try plan.headings(scratch, .{ .noted = read.noted, .findable = first.prompt.after_conversation });
         const turns_missing = missing.len > 0;
         const summary_missing = plan.fold != null and read.earlier.len == 0;
@@ -513,8 +492,6 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
         }
     }
 
-    // What the previous compaction kept stays as it is; the new turns and
-    // entries follow it.
     const shown = try out.alloc(checkpoint.Turn, earlier.turns.len + complete_end);
     for (shown[0..earlier.turns.len], earlier.turns) |*slot, turn| slot.* = try copyTurn(out, turn);
     for (shown[earlier.turns.len..], turns[0..complete_end]) |*slot, turn| slot.* = .{
@@ -571,8 +548,6 @@ const First = struct { asked: Asked, prompt: Prompt, request_start: usize };
 /// written out. Scratch memory is from `scratch`; `out` owns the notes.
 fn askFirstNotes(alloc: Allocator, out: Allocator, scratch: Allocator, plan: Plan, request: Request, model: Model, known: ledger.Known) Error!First {
     if (request.conversation_room) |room| conversation: {
-        // The conversation keeps the agent's own instructions, so the
-        // compactor's come first in the request.
         var text: std.ArrayList(u8) = .empty;
         try text.appendSlice(scratch, system_prompt ++ "\n\n");
         const request_start = text.items.len;
@@ -758,7 +733,6 @@ const PendingTool = struct {
 };
 
 fn prepare(arena: Allocator, turn: Turn, continued: ?checkpoint.OpenTurn, is_open: bool, next_tool: *usize) Allocator.Error!Prepared {
-    // Pair every call with its result so both are saved as one numbered tool.
     const numbers = try arena.alloc(usize, turn.items.len);
     @memset(numbers, 0);
     var tools: std.ArrayList(PendingTool) = .empty;
@@ -783,7 +757,6 @@ fn prepare(arena: Allocator, turn: Turn, continued: ?checkpoint.OpenTurn, is_ope
         else => {},
     };
 
-    // A turn still in progress has no final reply yet.
     const final_index: ?usize = if (is_open) null else finalIndex(turn);
 
     var users: std.ArrayList([]const u8) = .empty;
@@ -884,8 +857,6 @@ fn dupeAll(alloc: Allocator, texts: []const []const u8) Allocator.Error![]const 
 fn userMessagesByTurn(alloc: Allocator, turns: []const Prepared) Allocator.Error![]const ledger.Message {
     var messages: std.ArrayList(ledger.Message) = .empty;
     for (turns) |turn| {
-        // Only a complete turn is numbered, and the first message of the
-        // turn in progress is not in its `users`.
         const in_progress = turn.number == 0;
         if (in_progress) try messages.append(alloc, .{ .turn = 0, .text = turn.source.user, .in_progress = true });
         for (turn.users) |user| try messages.append(alloc, .{ .turn = turn.number, .text = user, .in_progress = in_progress });
@@ -1079,7 +1050,6 @@ fn appendValues(alloc: Allocator, line: *std.ArrayList(u8), value: std.json.Valu
         .string => |text| try appendFlat(alloc, line, text),
         .object => |map| for (map.values()) |child| try appendValues(alloc, line, child, depth + 1),
         .array => |items| for (items.items) |child| try appendValues(alloc, line, child, depth + 1),
-        // Numbers, booleans and null rarely say what a call was for.
         else => {},
     }
 }
@@ -1241,7 +1211,6 @@ fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize, earlier_clip: usi
     var text: std.ArrayList(u8) = .empty;
     const earlier = plan.earlier;
     if (plan.fold) |folded| {
-        // It holds the entries so far and the summary before it.
         try text.print(alloc, "[The earlier compacted conversation, to summarize; it is saved whole as L{d}]\n{s}\n\n", .{ folded.ledger, try clipped(alloc, folded.text, earlier_clip, "") });
     } else {
         if (earlier.entries.len > 0) {
@@ -1298,8 +1267,6 @@ fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), plan: Plan, after_co
     try ledger.writeCandidates(alloc, text, plan.candidates, plan.saved);
 }
 
-// Tests
-
 const testing = std.testing;
 
 const sample_notes =
@@ -1348,7 +1315,6 @@ const FakeModel = struct {
             self.after_conversation_calls += 1;
             if (self.fail_after_conversation) return error.ModelFailed;
         }
-        // One reply per call when given, the last one repeated.
         if (self.replies.len > 0) return alloc.dupe(u8, self.replies[@min(self.calls, self.replies.len) - 1]);
         return alloc.dupe(u8, self.reply);
     }
@@ -1389,8 +1355,6 @@ test "user messages and final replies stay exact, beside notes and a line per to
     try testing.expectEqual(@as(usize, 1), result.compacted.entries.len);
     try testing.expectEqualStrings(sample_fact, result.compacted.entries[0].text);
 
-    // The agent sees each turn in order, then the entries; tool payloads and
-    // the assistant's own in-between words stay in the records.
     const expected =
         \\Turn 1
         \\User 1:
@@ -1434,7 +1398,6 @@ test "a reply that skips turns with work is asked once more for just those" {
     var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns }, model.model(), store.store());
     defer result.deinit();
 
-    // Turn 4 has no work in between, so it needs no notes.
     try testing.expectEqual(@as(usize, 2), model.calls);
     const follow_up = model.seen_user.items;
     try testing.expect(std.mem.startsWith(u8, follow_up, "[Turn 1]\n[User]\nfirst\n"));
@@ -1450,8 +1413,6 @@ test "a reply that skips turns with work is asked once more for just those" {
     try testing.expectEqual(@as(usize, 2), result.compacted.entries.len);
     try testing.expectEqualStrings("F2", result.compacted.entries[1].id);
 
-    // A reply with entries but no turn notes at all is asked once more for
-    // every turn with work.
     var facts = FakeModel{ .replies = &.{
         "Facts:\nF1 (T1): the first build printed one",
         "Turn 1\nIn between: Ran make.\n\nTurn 2\nIn between: Ran make again.\n\nTurn 3\nIn between: Ran make a third time.",
@@ -1465,8 +1426,6 @@ test "a reply that skips turns with work is asked once more for just those" {
     try testing.expectEqualStrings("Ran make again.", only_facts.compacted.turns[1].work);
     try testing.expectEqualStrings("F1", only_facts.compacted.entries[0].id);
 
-    // A reply in another form entirely stays the newest turn's notes, and
-    // the turns with work it did not note are asked once more.
     var prose = FakeModel{ .reply = "The builds ran." };
     defer prose.deinit();
     var other = try compact(testing.allocator, .{ .model = "m", .turns = &turns }, prose.model(), null);
@@ -1475,7 +1434,6 @@ test "a reply that skips turns with work is asked once more for just those" {
     try testing.expectEqualStrings("The builds ran.", other.compacted.turns[3].work);
     try testing.expectEqualStrings("The builds ran.", other.compacted.turns[2].work);
 
-    // When that newest turn is the only one with work, it is noted already.
     const single = [_]Turn{workedTurn("first", "call-1", "one")};
     var once = FakeModel{ .reply = "The build ran." };
     defer once.deinit();
@@ -1497,20 +1455,15 @@ test "after the conversation the model reads only the request, with every turn f
     try testing.expectEqual(@as(usize, 1), model.after_conversation_calls);
     try testing.expectEqualStrings("", model.seen_system);
     const seen = model.seen_user.items;
-    // The compactor's instructions lead, since the conversation keeps the
-    // agent's own; the turns themselves are not written out again.
     try testing.expect(std.mem.startsWith(u8, seen, system_prompt ++ "\n\nWrite the compaction notes for the turns of the conversation above that are listed below;"));
     try testing.expect(std.mem.find(u8, seen, "[Turn 1]") == null);
     try testing.expect(std.mem.find(u8, seen, "missing semicolon") == null);
     try testing.expect(std.mem.find(u8, seen, "Answer with text only and call no tools.") != null);
-    // Read as the user's next message, the request could end up in the notes.
     try testing.expect(std.mem.find(u8, seen, "This request comes from fx, not from the user") != null);
-    // Turn 2 has nothing in between but is listed for its number.
     try testing.expect(std.mem.find(u8, seen, "each followed by its notes:\n\n" ++
         "Turn 1 (T1), which begins \u{201c}Fix the build. It fails on main.\u{201d}\n  T1 shell: zig build\n" ++
         "Turn 2 (no tool calls), which begins \u{201c}thanks\u{201d}\n\n" ++
         "Under each heading above are the turn's tool calls in order") != null);
-    // The notes are read and saved the same way.
     try testing.expect(std.mem.find(u8, result.text, sample_fact) != null);
     try testing.expectEqualStrings("Ran the build and found the missing semicolon.", result.compacted.turns[0].work);
     try testing.expect(store.find(.tool, 1) != null);
@@ -1618,7 +1571,6 @@ test "the tool line says what code knows: the call, how it ended and its size" {
     try testing.expectEqualStrings(std.fmt.comptimePrint("shell zig build test (failed, exit 1, {d} bytes)", .{shell_output.len}), try codeLine(arena, .{ .number = 1, .name = "shell", .call = call, .result = .{ .call_id = "c", .name = "shell", .output = shell_output, .failed = true } }));
     try testing.expectEqualStrings("read_file src/a.zig (3 lines)", try codeLine(arena, .{ .number = 2, .name = "read_file", .call = .{ .id = "r", .name = "read_file", .arguments = "{\"path\":\"src/a.zig\"}" }, .result = .{ .call_id = "r", .name = "read_file", .output = "a\nb\nc" } }));
     try testing.expectEqualStrings("shell zig build test (no result)", try codeLine(arena, .{ .number = 3, .name = "shell", .call = call }));
-    // Long arguments are cut; the record keeps them whole.
     const long = try codeLine(arena, .{ .number = 4, .name = "write_file", .call = .{ .id = "w", .name = "write_file", .arguments = "{\"content\":\"" ++ text_utils.repeat("é", 200) ++ "\"}" } });
     try testing.expect(std.mem.endsWith(u8, long, "… (no result)"));
     try testing.expect(std.unicode.utf8ValidateSlice(long));
@@ -1644,9 +1596,7 @@ test "the model reads the new turns as they are and is asked only for their note
     try testing.expect(std.mem.find(u8, seen, "[Tool call T1: shell]\n{\"command\":\"zig build\"}\n") != null);
     try testing.expect(std.mem.find(u8, seen, "[Tool result T1: shell]\nerror: missing semicolon at src/a.zig:4\n") != null);
     try testing.expect(std.mem.find(u8, seen, "[Turn 2]\n[User]\nthanks\n") != null);
-    // A first compaction, with no entries so far.
     try testing.expect(std.mem.startsWith(u8, seen, "[Turn 1]\n"));
-    // Turn 2 is only its message and final reply, so it has no heading.
     try testing.expect(std.mem.find(u8, seen, "Write the compaction notes for the new turns above. ") != null);
     try testing.expect(std.mem.find(u8, seen, "each followed by its notes:\n\nTurn 1 (T1)\n\nUnder each heading:\n") != null);
     try testing.expect(std.mem.find(u8, seen, "Every tool call stays saved whole under its ID") != null);
@@ -1710,7 +1660,6 @@ test "turns with nothing to summarize need no model call" {
     defer result.deinit();
     try testing.expectEqual(@as(usize, 0), model.calls);
     try testing.expectEqual(@as(usize, 3), result.compacted.turns.len);
-    // Repeated identical messages are all kept.
     try testing.expectEqualStrings("yes", result.compacted.turns[2].users[0]);
     try testing.expectEqualStrings("ok", result.compacted.turns[2].final);
 }
@@ -1749,8 +1698,6 @@ test "a rule may quote the user's answer to a question, but not the question" {
 }
 
 test "a value read in the conversation that stays after the cut is not marked" {
-    // The newest tool call stays in the conversation, and the model writes
-    // what it showed into a fact about the compacted call.
     const kept = [_]Turn{.{ .user = "", .items = &.{
         .{ .tool_call = .{ .id = "k", .name = "shell", .arguments = "{\"command\":\"rg -n subagentStatusLine src\"}" } },
         .{ .tool_result = .{ .call_id = "k", .name = "shell", .output = "src/ui/status_line.zig:40:fn subagentStatusLine(" } },
@@ -1790,7 +1737,6 @@ test "a status that finishes an open entry closes it at the next compaction" {
     defer second_model.deinit();
     var second = try compact(testing.allocator, .{ .model = "m", .earlier = first.compacted, .turns = &tests_turn }, second_model.model(), store.store());
     defer second.deinit();
-    // The open entry stays, marked, until the next compaction.
     try testing.expect(std.mem.find(u8, second.text, "O1 (M1): run the tests after the fix (replaced by S1)\n") != null);
     try testing.expect(std.mem.find(u8, second.text, "S1 (T2): all 12 tests pass; replaces O1\n") != null);
 
@@ -1813,9 +1759,6 @@ test "compacting again saves the previous compaction whole and shows its summary
     var first = try compact(testing.allocator, .{ .model = "m", .turns = &sample }, first_model.model(), store.store());
     defer first.deinit();
 
-    // The model quotes one rule exactly and one not, rewrites F1, writes
-    // notes for a turn and a tool call this compaction does not have, and
-    // summarizes the first compaction.
     const notes =
         \\## Turn 3
         \\In between: none
@@ -1844,8 +1787,6 @@ test "compacting again saves the previous compaction whole and shows its summary
     var second = try compact(testing.allocator, .{ .model = "m", .earlier = first.compacted, .turns = &tests_turn }, second_model.model(), store.store());
     defer second.deinit();
 
-    // The model reads the first compaction whole, to summarize it, then the
-    // new turn.
     const seen = second_model.seen_user.items;
     const header = "[The earlier compacted conversation, to summarize; it is saved whole as L1]\n";
     try testing.expect(std.mem.startsWith(u8, seen, header));
@@ -1853,12 +1794,10 @@ test "compacting again saves the previous compaction whole and shows its summary
     try testing.expect(std.mem.find(u8, seen, "\n\n[Turn 3]\n[User]\nnow run the tests\n") != null);
     try testing.expect(std.mem.find(u8, seen, "each followed by its notes:\n\nTurn 3 (T2)\n\n") != null);
     try testing.expect(std.mem.find(u8, seen, "\nEarlier:\nthree to five sentences that stand in for the earlier compacted conversation shown above, which is saved whole as L1 ") != null);
-    // The summary covers only the folded compaction; later turns stay in view.
     try testing.expect(std.mem.find(u8, seen, " Cover only that conversation; the turns after it and any turn in progress stay in view with the user's messages word for word, so leave them out.") != null);
     try testing.expect(std.mem.find(u8, seen, " The highest IDs so far: F1. Number new entries after them.") != null);
 
     const compacted = second.compacted;
-    // Only the new turn is shown, numbered on, with its notes.
     try testing.expectEqual(@as(usize, 1), compacted.turns.len);
     try testing.expectEqual(@as(usize, 3), compacted.turns[0].number);
     try testing.expectEqual(@as(usize, 2), compacted.turns[0].first_tool);
@@ -1869,8 +1808,6 @@ test "compacting again saves the previous compaction whole and shows its summary
     try testing.expectEqual(@as(usize, 1), compacted.ledger_count);
     try testing.expectEqualStrings("The user asked to fix the build on main. A missing semicolon at src/a.zig:4 broke it (T1).", compacted.earlier);
 
-    // F1 stays only in L1, so the entry under its ID is kept under the next
-    // free ID; a rule may quote a folded turn.
     const ids = [_][]const u8{ "R1", "R2", "F3", "F2", "S1" };
     try testing.expectEqual(ids.len, compacted.entries.len);
     for (ids, compacted.entries) |id, entry| try testing.expectEqualStrings(id, entry.id);
@@ -1879,8 +1816,6 @@ test "compacting again saves the previous compaction whole and shows its summary
     try testing.expectEqualStrings("F3 (T2): a rewrite of an old fact", compacted.entries[2].text);
     try testing.expectEqual(@as(usize, 3), compacted.highest[1]);
 
-    // The first compaction is saved whole as L1 and leaves the text, which
-    // shows its summary and names L1.
     const title = "L1 earlier compaction, through turn M2 and tool call T1\n";
     const saved_ledger = store.find(.ledger, 1).?;
     try testing.expect(std.mem.startsWith(u8, saved_ledger, title));
@@ -1889,8 +1824,6 @@ test "compacting again saves the previous compaction whole and shows its summary
     try testing.expect(std.mem.find(u8, second.text, sample_fact) == null);
     try testing.expect(std.mem.find(u8, second.text, "Earlier compactions are saved whole as L1, with their exact messages, notes and entries; open one with read_tool_result when the work needs it. In short:\nThe user asked to fix the build on main.") != null);
     try testing.expect(std.mem.find(u8, second.text, "Saved word for word: turns M1–M3, tool calls T1–T2 and earlier compaction L1.") != null);
-    // The first compaction's two turns and tool call, then L1 and the new
-    // turn and tool call.
     try testing.expectEqual(@as(usize, 6), store.files.count());
 }
 
@@ -1908,8 +1841,6 @@ test "a third compaction keeps one summary, the rules, status and open entries s
     defer first.deinit();
     var second = try compact(testing.allocator, .{ .model = "m", .earlier = first.compacted, .turns = &tests_turn }, model.model(), store.store());
     defer second.deinit();
-    // The rule, status and open step stay word for word; the fact and the
-    // decision stay only in L1. S2 replaces S1.
     const after_second = [_][]const u8{ "R1", "S1", "O1", "S2" };
     try testing.expectEqual(after_second.len, second.compacted.entries.len);
     for (after_second, second.compacted.entries) |id, entry| try testing.expectEqualStrings(id, entry.id);
@@ -1918,19 +1849,15 @@ test "a third compaction keeps one summary, the rules, status and open entries s
     const thanks = [_]Turn{.{ .user = "thanks", .items = &.{.{ .assistant = "Anytime." }} }};
     var third = try compact(testing.allocator, .{ .model = "m", .earlier = second.compacted, .turns = &thanks }, model.model(), store.store());
     defer third.deinit();
-    // Plain turns need a model call once a compaction is folded, for its
-    // summary.
     try testing.expectEqual(@as(usize, 3), model.calls);
     const compacted = third.compacted;
     try testing.expectEqual(@as(usize, 2), compacted.ledger_count);
     try testing.expectEqualStrings("SUMMARY_TWO", compacted.earlier);
-    // S1, replaced, now stays only in L2.
     const kept = [_][]const u8{ "R1", "O1", "S2" };
     try testing.expectEqual(kept.len, compacted.entries.len);
     for (kept, compacted.entries) |id, entry| try testing.expectEqualStrings(id, entry.id);
     try testing.expectEqual(@as(usize, 1), compacted.turns.len);
     try testing.expectEqual(@as(usize, 4), compacted.turns[0].number);
-    // L2 holds the second compaction whole, with the summary of L1.
     const second_ledger = store.find(.ledger, 2).?;
     try testing.expect(std.mem.find(u8, second_ledger, "SUMMARY_ONE") != null);
     try testing.expect(std.mem.find(u8, second_ledger, "now run the tests") != null);
@@ -1939,8 +1866,6 @@ test "a third compaction keeps one summary, the rules, status and open entries s
     try testing.expect(std.mem.find(u8, third.text, "now run the tests") == null);
     try testing.expect(std.mem.find(u8, third.text, "\"It fails on main\"") != null);
 
-    // Without a summary from the model, it is asked once more for just that;
-    // when it still writes none, the one before it stays.
     var silent = FakeModel{ .reply = "Turn 5\nIn between: none" };
     defer silent.deinit();
     var fourth = try compact(testing.allocator, .{ .model = "m", .earlier = third.compacted, .turns = &thanks }, silent.model(), store.store());
@@ -1950,9 +1875,6 @@ test "a third compaction keeps one summary, the rules, status and open entries s
     try testing.expectEqualStrings("SUMMARY_TWO", fourth.compacted.earlier);
     try testing.expectEqual(@as(usize, 3), fourth.compacted.ledger_count);
 
-    // Plain turns need the model only for that summary, so when it fails the
-    // one before it stays and the compaction goes on. Turns with work still
-    // need their notes.
     var down = FakeModel{ .fail = error.ModelFailed };
     defer down.deinit();
     var fifth = try compact(testing.allocator, .{ .model = "m", .earlier = fourth.compacted, .turns = &thanks }, down.model(), store.store());
@@ -1962,7 +1884,6 @@ test "a third compaction keeps one summary, the rules, status and open entries s
     try testing.expect(store.find(.ledger, 4) != null);
     try testing.expectError(error.ModelFailed, compact(testing.allocator, .{ .model = "m", .earlier = fourth.compacted, .turns = &tests_turn }, down.model(), store.store()));
 
-    // Without a store nothing can be saved, so nothing is folded.
     var unsaved = try compact(testing.allocator, .{ .model = "m", .earlier = first.compacted, .turns = &tests_turn }, model.model(), null);
     defer unsaved.deinit();
     try testing.expectEqual(@as(usize, 3), unsaved.compacted.turns.len);
@@ -1979,7 +1900,6 @@ test "a fold after the conversation asks for the summary there, and damaged save
     defer first.deinit();
     try testing.expectEqual(@as(usize, 0), quiet.calls);
 
-    // A saved checkpoint read back from disk with one ID damaged.
     var damaged = first.compacted;
     damaged.entries = &.{ .{ .id = "R1x", .text = "R1x (M1): \"damaged\"" }, .{ .id = "R2", .text = "R2 (M1): \"answer in one line\"" } };
     damaged.highest = .{ 2, 0, 0, 0, 0 };
@@ -1989,15 +1909,12 @@ test "a fold after the conversation asks for the summary there, and damaged save
     defer model.deinit();
     var second = try compact(testing.allocator, .{ .model = "m", .earlier = damaged, .turns = &tests_turn, .conversation_room = 100_000 }, model.model(), store.store());
     defer second.deinit();
-    // Both requests follow the conversation, where the provider has the
-    // folded compaction cached; the second asks only for its summary.
     try testing.expectEqual(@as(usize, 2), model.after_conversation_calls);
     try testing.expect(std.mem.find(u8, model.seen_user.items, "Earlier:\nthree to five sentences that stand in for the earlier compacted conversation at the start of the conversation above, which is saved whole as L1 ") != null);
     try testing.expectEqualStrings("The user asked what 2+2 is; it is 4.", second.compacted.earlier);
     try testing.expectEqualStrings("ran the tests; all 12 pass", second.compacted.turns[0].tools[0].why);
     try testing.expectEqual(@as(usize, 1), second.compacted.entries.len);
     try testing.expectEqualStrings("R2", second.compacted.entries[0].id);
-    // The first compaction had no tool call, so its ledger names none.
     try testing.expect(std.mem.startsWith(u8, store.find(.ledger, 1).?, "L1 earlier compaction, through turn M1\n"));
 }
 
@@ -2015,7 +1932,6 @@ test "every turn stays, each long user message and final reply whole" {
         .{ .assistant = plan },
     };
     for (&turns) |*turn| turn.* = .{ .user = pasted, .items = &items };
-    // Even a request too small for one turn clips only what the model reads.
     var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = 2000 }, model.model(), store.store());
     defer result.deinit();
     const shown = result.compacted.turns;
@@ -2049,12 +1965,10 @@ test "only a text over its room clips its longest messages, whole in their saved
     try testing.expect(std.mem.startsWith(u8, final, "REPLY_START "));
     try testing.expect(std.mem.endsWith(u8, final, " REPLY_END"));
     try testing.expect(std.mem.find(u8, final, " bytes left out here; the whole text is saved in M1]") != null);
-    // Shorter texts stay whole, and the saved turn keeps the whole reply.
     try testing.expectEqualStrings("write the plan", result.compacted.turns[0].users[0]);
     try testing.expectEqualStrings("Sure.", result.compacted.turns[1].final);
     try testing.expect(std.mem.find(u8, store.find(.turn, 1).?, long_reply) != null);
 
-    // Within its room nothing is clipped.
     var roomy = try compact(testing.allocator, .{ .model = "m", .turns = &turns }, model.model(), null);
     defer roomy.deinit();
     try testing.expectEqualStrings(long_reply, roomy.compacted.turns[0].final);
@@ -2075,13 +1989,11 @@ test "after a compaction, a turn of only messages needs a model call only for th
     defer second.deinit();
     try testing.expectEqual(@as(usize, 1), summarizer.calls);
     try testing.expectEqualStrings("The build on main was fixed.", second.compacted.earlier);
-    // The fact stays in L1.
     try testing.expectEqual(@as(usize, 0), second.compacted.entries.len);
     try testing.expectEqual(@as(usize, 1), second.compacted.turns.len);
     try testing.expectEqualStrings("Glad it works.", second.compacted.turns[0].final);
     try testing.expectEqualStrings("", second.compacted.turns[0].work);
 
-    // Without a store nothing is folded, so the turn needs no model call.
     var unused = FakeModel{};
     defer unused.deinit();
     var unsaved = try compact(testing.allocator, .{ .model = "m", .earlier = first.compacted, .turns = &chat }, unused.model(), null);
@@ -2095,9 +2007,6 @@ test "the request overhead estimate covers the longest request" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // Every optional part: turns and tool calls with long numbers, a turn in
-    // progress, the highest IDs of every kind, and the summary of a folded
-    // compaction. Each turn's heading line is counted with the turn.
     const earlier: Compacted = .{ .entries = &.{
         .{ .id = "R99999", .text = "" }, .{ .id = "F99999", .text = "" }, .{ .id = "D99999", .text = "" },
         .{ .id = "S99999", .text = "" }, .{ .id = "O99999", .text = "" },
@@ -2116,7 +2025,6 @@ test "the request overhead estimate covers the longest request" {
         try testing.expect(std.mem.find(u8, text.items, "For the turn in progress, give its notes so far.") != null);
         try testing.expect(std.mem.find(u8, text.items, "O99999. Number new entries after them.") != null);
         try testing.expectEqual(folds, std.mem.find(u8, text.items, "saved whole as L99999 ") != null);
-        // A folded compaction's text comes with its label.
         const fold_label = if (folds) "[The earlier compacted conversation, to summarize; it is saved whole as L99999]\n" else "";
         const overhead: usize = request_overhead_tokens + @as(usize, if (folds) fold_overhead_tokens else 0);
         try testing.expect(tokens(&.{ text.items, fold_label }) <= overhead + plan.turns.len * item_label_tokens);
@@ -2150,12 +2058,9 @@ test "a turn in progress carries over and its saved turn is complete once it end
     const first_seen = first_model.seen_user.items;
     try testing.expect(std.mem.find(u8, first_seen, "[Turn in progress]\n[User, this message stays in the conversation after the summary]\nmigrate the db\n") != null);
     try testing.expect(std.mem.find(u8, first_seen, "each followed by its notes:\n\nTurn in progress (T1)\n\n") != null);
-    // The first user message stays in the conversation, so it is not shown.
     try testing.expect(std.mem.find(u8, first.text, "migrate the db") == null);
     try testing.expect(std.mem.find(u8, first.text, "Its tools so far:\n  T1 shell migrate --dry-run (18 bytes): dry run; 3 tables to change\n") != null);
 
-    // The same turn later ends; its first user message and the rest arrive
-    // as the next compaction's first turn.
     const finished = [_]Turn{.{ .user = "migrate the db", .items = &.{
         .{ .tool_call = .{ .id = "c2", .name = "shell", .arguments = "{\"command\":\"migrate --target staging\"}" } },
         .{ .tool_result = .{ .call_id = "c2", .name = "shell", .output = "migrated" } },
@@ -2166,8 +2071,6 @@ test "a turn in progress carries over and its saved turn is complete once it end
     var second = try compact(testing.allocator, .{ .model = "m", .earlier = first.compacted, .turns = &finished }, second_model.model(), store.store());
     defer second.deinit();
 
-    // The first compaction is summarized, then the rest of the turn follows
-    // what stays of its earlier part.
     const second_seen = second_model.seen_user.items;
     const header = "[The earlier compacted conversation, to summarize; it is saved whole as L1]\n";
     try testing.expect(std.mem.startsWith(u8, second_seen, header));
@@ -2181,14 +2084,12 @@ test "a turn in progress carries over and its saved turn is complete once it end
     try testing.expectEqualStrings("Migrated staging.", turn.final);
     try testing.expectEqual(@as(usize, 1), turn.first_tool);
     try testing.expectEqual(@as(usize, 2), turn.last_tool);
-    // The earlier part's notes and tool lines stay in L1; this part's show.
     try testing.expectEqualStrings("Migrated staging.", turn.work);
     try testing.expectEqual(@as(usize, 1), turn.tools.len);
     try testing.expectEqualStrings("shell migrate --target staging (8 bytes)", turn.tools[0].line);
     try testing.expectEqualStrings("migrated staging", turn.tools[0].why);
     try testing.expect(std.mem.find(u8, store.find(.ledger, 1).?, "Ran a dry run of the migration.") != null);
     try testing.expectEqualStrings("A dry run found 3 tables to change (T1).", second.compacted.earlier);
-    // The status stays word for word until the next compaction folds it.
     try testing.expectEqual(@as(usize, 2), second.compacted.entries.len);
     try testing.expect(second.compacted.open == null);
     try testing.expectEqualStrings(
@@ -2225,7 +2126,6 @@ test "a turn in progress compacted twice shows only its newest part, the rest sa
     try testing.expectEqualStrings("step two worked", open.tools[0].why);
     try testing.expectEqual(@as(usize, 1), open.first_tool);
     try testing.expectEqual(@as(usize, 2), open.last_tool);
-    // The saved turn will still be complete once the turn ends.
     try testing.expectEqualStrings("[T1 shell: step one]\n\n[T2 shell: step two]\n\n", open.text);
     try testing.expectEqual(@as(usize, 0), second.compacted.turn_count);
     try testing.expect(std.mem.find(u8, store.find(.ledger, 1).?, "T1 shell step one (2 bytes): step one worked") != null);
@@ -2265,17 +2165,13 @@ test "a checkpoint from before the entries is saved whole, its summary kept, and
     };
     var result = try compact(testing.allocator, .{ .model = "m", .earlier = before, .turns = sample[0..1] }, model.model(), store.store());
     defer result.deinit();
-    // The model reads it whole to summarize it; it is saved as L1.
     try testing.expect(std.mem.find(u8, model.seen_user.items, "fix it") != null);
     const ledger_text = store.find(.ledger, 1).?;
     for ([_][]const u8{ "Set up the repo.", "fix it", "Fixed the parser (T1).", "Tools: T1\n" }) |part| try testing.expect(std.mem.find(u8, ledger_text, part) != null);
-    // The model wrote no summary, so its summary stays.
     try testing.expectEqualStrings("Set up the repo.", result.compacted.earlier);
     try testing.expectEqual(@as(usize, 1), result.compacted.turns.len);
     try testing.expectEqual(@as(usize, 3), result.compacted.turns[0].number);
     try testing.expectEqual(@as(usize, 2), result.compacted.turns[0].first_tool);
-    // The new turn's tools show as lines. The model's notes name turn 1 and
-    // T1, which this compaction does not have.
     try testing.expect(std.mem.find(u8, result.text, "Tools:\n  T2 shell zig build (39 bytes)\n") != null);
     try testing.expectEqualStrings("", result.compacted.turns[0].work);
 }
@@ -2285,7 +2181,6 @@ test "the index line is built the same way for any tool" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Nested requests, multi-line text, and non-text values.
     try testing.expectEqualStrings(
         "run cd /repo && wc -l src/app.zig",
         try indexLine(arena, "{\"request\":{\"action\":\"run\",\"command\":\"cd /repo &&\\n  wc -l src/app.zig\",\"yield_time_ms\":300000}}"),
@@ -2294,7 +2189,6 @@ test "the index line is built the same way for any tool" {
     try testing.expectEqualStrings("", try indexLine(arena, "{}"));
     try testing.expectEqualStrings("not json at all", try indexLine(arena, "not   json\nat all"));
 
-    // Long arguments are cut to one short line without splitting a character.
     const long = try indexLine(arena, "{\"content\":\"" ++ text_utils.repeat("é", 300) ++ "\"}");
     try testing.expect(long.len <= max_index_bytes);
     try testing.expect(std.unicode.utf8ValidateSlice(long));
@@ -2353,8 +2247,6 @@ test "model and store failures return errors without leaking" {
 test "compaction survives every allocation failure" {
     const Run = struct {
         fn run(alloc: Allocator) !void {
-            // Notes for a turn and tool calls, a misquoted rule, a repeated
-            // entry, and a skill call.
             var model = FakeModel{ .reply = "Turn 2\nIn between: x\nT2: y\n\nRules:\n- R2 (M3): \"never push\"\n\nFacts:\nF1 (T2): z\nF1 (T2): z again" };
             defer model.deinit();
             const with_skill = [_]Turn{ sample[0], .{ .user = "Load the skill. Never skip it.", .items = &.{
@@ -2372,8 +2264,6 @@ test "compaction survives every allocation failure" {
                 defer store.deinit();
                 var result = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &with_skill }, model.model(), store.store());
                 result.deinit();
-                // Split into parts, every text clipped down to its note, in
-                // the requests and in the result.
                 var split_store = MemoryStore{ .alloc = testing.allocator };
                 defer split_store.deinit();
                 var split = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &with_skill, .max_prompt_tokens = 1, .max_text_tokens = 1 }, model.model(), split_store.store());
@@ -2411,7 +2301,6 @@ test "turns too large for one request go oldest first, each part adding to the o
     defer store.deinit();
     const output = text_utils.repeat("build output line ", 400);
     const turns = [_]Turn{ workedTurn("first", "call-1", output), workedTurn("second", "call-2", output), workedTurn("third", "call-3", output) };
-    // Room for one turn per request.
     const one = turnTokens(turns[0]);
     const room = request_overhead_tokens + tokens(&.{system_prompt}) + one + one / 2;
     var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
@@ -2419,27 +2308,21 @@ test "turns too large for one request go oldest first, each part adding to the o
 
     try testing.expectEqual(@as(usize, 3), model.calls);
     try testing.expect(model.largest <= room);
-    // The last request carries the entries of the parts before it, not their
-    // turns, and reads its own turn whole.
     const seen = model.seen_user.items;
     try testing.expect(std.mem.startsWith(u8, seen, "[Rules, facts, decisions and status so far]\nS1 (T1): make runs\n\n[Turn 3]\n"));
     try testing.expect(std.mem.find(u8, seen, "[Tool result T3: shell]\n" ++ output ++ "\n") != null);
     try testing.expect(std.mem.find(u8, seen, "[Turn 1]") == null);
     try testing.expect(std.mem.find(u8, seen, "[Turn 2]") == null);
-    // Every part keeps its exact messages; numbering runs through every
-    // part, and every turn and tool call is saved.
     try testing.expectEqual(@as(usize, 3), result.compacted.turns.len);
     for (result.compacted.turns, [_][]const u8{ "first", "second", "third" }, 1..) |turn, user, number| {
         try testing.expectEqual(number, turn.number);
         try testing.expectEqualStrings(user, turn.users[0]);
         try testing.expectEqualStrings("Done.", turn.final);
         try testing.expectEqual(number, turn.first_tool);
-        // Each part's notes are for its own turn only.
         try testing.expectEqualStrings("Ran make.", turn.work);
     }
     try testing.expectEqual(@as(usize, 3), result.compacted.turn_count);
     try testing.expectEqual(@as(usize, 3), result.compacted.tool_count);
-    // The later parts repeat S1, which the first part already added.
     try testing.expectEqual(@as(usize, 1), result.compacted.entries.len);
     for (1..4) |number| {
         try testing.expect(store.find(.turn, number) != null);
@@ -2511,7 +2394,6 @@ test "a request fits even when a turn has many texts too short to clip" {
     const seen = model.seen_user.items;
     try testing.expect(tokens(&.{ system_prompt, seen }) <= room);
     try testing.expect(std.mem.find(u8, seen, "[Tool result T300: shell]\n\n[1488 bytes left out here; the whole text is saved in T300]\n") != null);
-    // Texts shorter than their note stay whole.
     try testing.expect(std.mem.find(u8, seen, "[Tool call T300: shell]\n{\"command\":\"make\"}\n") != null);
     try testing.expect(std.mem.find(u8, store.find(.tool, 300).?, output) != null);
 }
@@ -2553,8 +2435,6 @@ test "the earlier summary is clipped only when the turns alone cannot make the r
     try testing.expect(std.mem.find(u8, seen, " bytes left out here]\n") != null);
     try testing.expect(std.mem.find(u8, seen, "EARLIER_END\n") != null);
     try testing.expect(std.mem.find(u8, seen, "[Tool result T2: shell]\nok\n") != null);
-    // Only the request was clipped: L1 keeps the earlier text whole, and
-    // without a new summary from the model the old one stays whole.
     try testing.expect(std.mem.find(u8, store.find(.ledger, 1).?, previous) != null);
     try testing.expectEqualStrings(previous, result.compacted.earlier);
     try testing.expect(std.mem.find(u8, result.text, "In short:\n" ++ previous ++ "\n") != null);

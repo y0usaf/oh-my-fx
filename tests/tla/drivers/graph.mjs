@@ -1,10 +1,6 @@
-// The state graphs tests/tla/sdk/check.sh has TLC write, as the drivers read them.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 
-// A TLA+ value as TLC prints it: numbers, strings, booleans, records (and
-// functions over names, which print as records), sequences, and sets, read
-// as arrays in TLC's order.
 export function parseValue(text) {
   let at = 0;
   const space = () => { while (/\s/.test(text[at] ?? "")) at += 1; };
@@ -85,7 +81,6 @@ export async function loadGraph(path) {
     if (node) {
       const [, id, label] = node;
       const state = {};
-      // One entry per variable; TLC wraps a long value over several lines.
       for (const entry of unescape(label).split(/\n(?=\/\\ )/)) {
         const match = /^\/\\ (\w+) = ([\s\S]*)$/.exec(entry.trim());
         if (match) state[match[1]] = parseValue(match[2].trim());

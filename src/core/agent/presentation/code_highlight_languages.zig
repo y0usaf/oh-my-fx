@@ -139,7 +139,6 @@ const profiles = [_]Profile{
         .label = "sh",
         .aliases = &.{ "sh", "bash", "zsh", "shell", "shellscript" },
         .line_comments = &.{"#"},
-        // Backticks are code, not strings, in shell.
         .quotes = double_single_quotes,
         .operators = "&|;<>*",
         .dollar_vars = true,
@@ -423,7 +422,6 @@ const profiles = [_]Profile{
         .keywords = &packWords(.{ "server", "location", "listen", "root", "proxy_pass", "set", "return", "rewrite", "if", "error_page", "access_log", "include", "upstream", "worker_processes", "events", "http" }),
     },
     .{
-        // Inline code spans color as strings; prose numbers stay plain.
         .label = "markdown",
         .aliases = &.{ "md", "markdown", "mdx" },
         .block_comment = .{ .start = "<!--", .end = "-->" },
@@ -431,7 +429,6 @@ const profiles = [_]Profile{
         .bare_numbers = false,
     },
     .{
-        // Explicit opt-out of highlighting; kept byte-identical.
         .label = "text",
         .aliases = &.{ "text", "txt", "plain", "plaintext" },
         .bare_numbers = false,
@@ -591,7 +588,6 @@ test "supported code fence labels resolve case insensitively" {
     };
     for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
     try std.testing.expect(resolve("") == null);
-    // text resolves to a deliberate plain profile; rendering stays byte-identical.
     try std.testing.expectEqualStrings("text", resolve("text").?.label);
 }
 

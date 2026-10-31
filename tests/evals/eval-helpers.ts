@@ -1,4 +1,3 @@
-// Model-backed eval helpers. Requires a built binary and AI_GATEWAY_API_KEY.
 import { expect } from "bun:test";
 import { execFileSync, execSync, spawn as nodeSpawn } from "node:child_process";
 import {
@@ -173,7 +172,6 @@ export function buildEvalProcessEnv(
 }
 
 export function buildEvalArgs(prompt: string, timeoutSec: number): string[] {
-  // fx reads --timeout in seconds.
   return [
     "ask",
     "--auto",
@@ -228,7 +226,6 @@ export async function runEval(
 
       let timedOut = false;
       const timer = setTimeout(() => {
-        // fx may have exited already with its close event still pending.
         timedOut =
           child.exitCode === null &&
           child.signalCode === null &&
@@ -459,8 +456,6 @@ export function assertFirstTerminalExecMatches(
   expect(first?.name).toBe("shell");
   expect(pattern.test(first?.command_result?.command ?? "")).toBe(true);
 }
-
-// Generic fx CLI runner for deterministic command coverage.
 
 export interface FxRunResult {
   stdout: string;

@@ -50,8 +50,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
-    // Whether this is a libfx artifact, which leaves out what only the fx
-    // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
 
     const exe = b.addExecutable(.{
@@ -90,14 +88,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
-    // Tests launch the installed fx binary, and the session boundary test
-    // walks the source tree.
     const test_paths = b.addOptions();
     test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     exe.root_module.addImport("test_paths", test_paths.createModule());
 
-    // The session manager's own tests, as fx compiles it (no hooks).
     const session_manager_tests = b.addTest(.{ .root_module = session_manager });
 
     const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
@@ -150,7 +145,6 @@ pub fn build(b: *std.Build) void {
     );
     build_mcp_dispatcher_e2e_step.dependOn(&mcp_dispatcher_e2e.step);
 
-    // --- file_index search benchmark ---
     const benchmark_exports_mod = b.createModule(.{
         .root_source_file = b.path("src/benchmark_exports.zig"),
         .target = target,
@@ -177,7 +171,6 @@ pub fn build(b: *std.Build) void {
     const run_bench_step = b.step("run-bench-file-index", "Build and run file_index search benchmark");
     run_bench_step.dependOn(&run_bench.step);
 
-    // --- UI activity progress benchmark ---
     const ui_activity_bench = b.addExecutable(.{
         .name = "ui-activity-progress-bench",
         .root_module = b.createModule(.{
@@ -206,7 +199,6 @@ pub fn build(b: *std.Build) void {
     );
     run_ui_activity_bench_step.dependOn(&run_ui_activity_bench.step);
 
-    // --- file-diff approval review benchmark ---
     const approval_review_bench = b.addExecutable(.{
         .name = "approval-review-bench",
         .root_module = b.createModule(.{
@@ -480,7 +472,6 @@ fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {
-    // The configure cache cannot see a new commit, so rerun configure.
     b.graph.poisonCache();
     const out = switch (b.runFallible(
         &.{ "git", "rev-parse", "--short=12", "HEAD" },

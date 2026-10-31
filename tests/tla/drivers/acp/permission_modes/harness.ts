@@ -1,12 +1,6 @@
-// Shared runtime bridge for the permission-mode bundle: an ACP stdio client
-// that declines permission requests, an isolated fx home and fake Gateway,
-// the client-visible projection of the mode option, the profile's saved
-// mode, and a prompt probe that shows how fx enforced the current mode.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-// ------------------------------------------------------------ observation --
 
 /// What a client sees of the mode setting in one response. `legacy` and
 /// `legacyListed` come from the older `modes` field; responses without it
@@ -33,7 +27,6 @@ export type Observation = {
 
 export const NO_VIEW: View = { current: "", legacy: "", listed: "", legacyListed: "", names: "", schemaOk: true };
 
-// The ACP schema's fields for a select value (session config options).
 const VALUE_KEYS = new Set(["value", "name", "description", "_meta"]);
 
 function flatValues(options: unknown): any[] {
@@ -77,8 +70,6 @@ export function storedMode(home: string): string {
   if (value === "yolo" || value === "full-access" || value === "full access") return "full-access";
   return `raw:${value}`;
 }
-
-// -------------------------------------------------------------- ACP client --
 
 export class Acp {
   private buffer = "";
@@ -144,8 +135,6 @@ export class Acp {
     while (true) {
       const message = await this.readLine();
       if ("method" in message && "id" in message) {
-        // Agent-to-client request. Permission requests are declined with the
-        // reject option fx offers, so an "ask" turn never runs the tool.
         if (message.method === "session/request_permission") {
           this.permissionRequests += 1;
           const options: any[] = message.params?.options ?? [];
@@ -178,8 +167,6 @@ export class Acp {
   }
 }
 
-// -------------------------------------------------------------- fx fixture --
-
 type Helpers = {
   startDynamicFakeGateway: (respond: (body: string) => Response, options: object) => any;
   fakeGatewayFinalText: (text: string) => Response;
@@ -190,7 +177,6 @@ export async function loadHelpers(worktree: string): Promise<Helpers> {
   return (await import(join(worktree, "tests", "e2e", "tmux-helpers.ts"))) as Helpers;
 }
 
-// Process overrides that would mask what the profile and ACP decide.
 const STRIPPED_ENV = [
   "VERCEL_OIDC_TOKEN", "FX_PROVIDER", "FX_MODEL", "FX_FAST", "FX_ULTRAFAST",
   "FX_PERMISSION_MODE", "FX_DEBUG_RECORD", "FX_SESSIONS_V2",

@@ -131,8 +131,6 @@ test "processQueuedPrompt pauses missing finish without synthesizing output" {
 
     var config = fixture.config();
     config.max_provider_attempts = 1;
-    // Missing finish retries autonomously now; park the turn with a lifecycle
-    // pause (the user's try-later) raised when the retry is scheduled.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.recovery_pause_flag = &pause_flag;
@@ -161,8 +159,6 @@ test "processQueuedPrompt pauses partial text without finish proof" {
 
     var config = fixture.config();
     config.max_provider_attempts = 1;
-    // Missing finish retries autonomously now; park the turn with a lifecycle
-    // pause (the user's try-later) raised when the retry is scheduled.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.recovery_pause_flag = &pause_flag;
@@ -192,8 +188,6 @@ test "processQueuedPrompt pauses tool calls without finish proof" {
     var config = fixture.config();
     config.agent_step_limit = 1;
     config.max_provider_attempts = 1;
-    // Missing finish retries autonomously now; park the turn with a lifecycle
-    // pause (the user's try-later) raised when the retry is scheduled.
     var pause_flag = std.atomic.Value(bool).init(false);
     hooks.pause_on_auto_retry_status = true;
     hooks.recovery_pause_flag = &pause_flag;
@@ -248,8 +242,6 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
 
         var config = fixture.config();
         config.max_provider_attempts = 1;
-        // Recoverable cases retry autonomously now; park the turn with a
-        // lifecycle pause (the user's try-later) when the retry is scheduled.
         var pause_flag = std.atomic.Value(bool).init(false);
         hooks.pause_on_auto_retry_status = true;
         hooks.recovery_pause_flag = &pause_flag;
@@ -417,7 +409,6 @@ test "processQueuedPrompt continues with steering queued before a repeated-malfo
     defer gateway.deinit();
     const steering = [_][]const u8{"stop repeating the broken call"};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    // Step-top boundaries are takes 1-3; the terminal-exit boundary is take 4.
     hooks.steering_messages = &steering;
     hooks.steering_take_at = 4;
     defer hooks.deinit();
@@ -425,8 +416,6 @@ test "processQueuedPrompt continues with steering queued before a repeated-malfo
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    // The turn continued instead of ending: the fourth request carries the
-    // queued steering, and the malformed-stop notice never rendered.
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 3, "user_steering");
     try expectBodyContains(&gateway, 3, "stop repeating the broken call");
@@ -449,7 +438,6 @@ test "processQueuedPrompt continues with steering queued before a length-limited
     defer gateway.deinit();
     const steering = [_][]const u8{"narrow the scope"};
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    // Step-top boundary is take 1; the length-limited terminal boundary is take 2.
     hooks.steering_messages = &steering;
     hooks.steering_take_at = 2;
     defer hooks.deinit();
@@ -1110,8 +1098,6 @@ test "common Stop later provider failure pauses with candidate still visible" {
 
     var config = fixture.config();
     config.max_provider_attempts = 1;
-    // The provider failure retries autonomously now; park the turn with a
-    // lifecycle pause (the user's try-later) when the retry is scheduled.
     var pause_flag = std.atomic.Value(bool).init(false);
     deps.pause_on_auto_retry_status = true;
     deps.recovery_pause_flag = &pause_flag;
@@ -1406,8 +1392,6 @@ test "common Stop HTTP failure pauses with candidate and partial still visible" 
 
     var config = fixture.config();
     config.max_provider_attempts = 2;
-    // HTTP status failures retry patiently forever now; park the turn with a
-    // lifecycle pause (the user's try-later) when the retry is scheduled.
     var pause_flag = std.atomic.Value(bool).init(false);
     deps.pause_on_auto_retry_status = true;
     deps.recovery_pause_flag = &pause_flag;

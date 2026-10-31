@@ -1,13 +1,3 @@
-// Connects behavior observed from the real fx binary to TLC.
-//
-// 1. ShellOracle prints the model's emission set and Record(e) for each one.
-//    Every modeled emission must have been observed, or the check is INCONCLUSIVE.
-// 2. The observations become ShellObserved.tla. ShellTrace replays them through
-//    ShellContract's own Process step. ACCEPTED requires TLC exit 12 on the
-//    NotAllMatched sentinel with every turn matched; a completed search is REJECTED.
-// 3. After acceptance, each design property is checked on the same replay.
-//
-// Strict verdicts: unreadable or missing evidence is never acceptance.
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
@@ -93,7 +83,6 @@ export function historyClass(design: Design, call: ObservedCall): string {
   if (!call.history.observed) return "unobserved";
   const input = call.history.input;
   if (call.executed && canonical(design, input)) return "canonical";
-  // Text that is not JSON cannot be replayed; fx shows {} so providers accept the history.
   if (!call.executed && call.shape === "invalid_json" && isDeepStrictEqual(input, {})) return "placeholder";
   const sent = tryParse(call.sent);
   if (sent.ok && isDeepStrictEqual(input, sent.value)) return `as_sent:${call.shape}`;
@@ -164,7 +153,6 @@ function stage(root: string, name: string, observed?: string): string {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   for (const module of MODULES) copyFileSync(join(tlaDir, module), join(dir, module));
-  // Only ShellTrace extends ShellObserved; TLC parses just the root module's imports.
   if (observed !== undefined) writeFileSync(join(dir, "ShellObserved.tla"), observed, { mode: 0o600 });
   return dir;
 }
@@ -177,7 +165,6 @@ export async function modelOracle(design: Design, reportRoot: string) {
   mkdirSync(reportRoot, { recursive: true, mode: 0o700 });
   const dir = stage(mkdtempSync(join(reportRoot, `oracle-${design}-`)), "oracle");
   const run = await runTlc(dir, "ShellOracle.tla", config(design, "INIT Init\nNEXT OracleNext"));
-  // TLC wraps long tuples across lines; join them before matching.
   const text = run.log.replace(/\n\s+/g, " ");
   const predictions = new Map<string, Prediction>();
   const line = /<<\s*"FXT_PREDICT",\s*"([a-z_]+)",\s*"([a-z_]+)",\s*(TRUE|FALSE),\s*"([a-z_]+)",\s*"([a-z_:]+)",\s*"([a-z_]+)"\s*>>/g;
@@ -237,7 +224,7 @@ export async function checkRuntime(turns: ObservedTurn[], design: Design, report
       return finish("TOOL_ERROR", `unexpected TLC result (exit ${conformance.exitCode}); see ${join(conformance.dir, "tlc.log")}`,
         { matchedTurns: matched.size });
     }
-    const index = matched.size;  // turns replay in order; this is the first unmatched one
+    const index = matched.size;
     const turn = turns[index]!;
     const differs = (call: ObservedCall) => {
       const p = oracle.predictions.get(`${call.intent}/${call.shape}`);

@@ -85,8 +85,6 @@ fn contains_name(names: []const []const u8, name: []const u8) bool {
 
 fn validate_name(name: []const u8) Error!void {
     if (name.len == 0 or name.len > max_name_bytes) return error.InvalidToolName;
-    // fx advertises dotted built-in names as well as MCP names. Keep those
-    // literal identities; do not invent aliases that core cannot resolve.
     for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return error.InvalidToolName;
 }
 
@@ -97,8 +95,6 @@ fn append_function(alloc: Allocator, functions: *std.ArrayList(Function), functi
     try functions.append(alloc, function);
 }
 
-// Provider-native advertisements are not Chat Completions function tools.
-// Omit only registered provider-executed tools; missing ordinary schemas fail.
 fn select_functions(alloc: Allocator, tools: stream_provider.ToolSelection, choice: types.ToolChoice) Error!std.ArrayList(Function) {
     var functions: std.ArrayList(Function) = .empty;
     errdefer functions.deinit(alloc);
@@ -110,7 +106,6 @@ fn select_functions(alloc: Allocator, tools: stream_provider.ToolSelection, choi
             if (registered.provider_executed) continue;
             return error.InvalidToolSelection;
         };
-        // A repeated definition must not be selected by accidental first match.
         var matches: usize = 0;
         for (tools.advertised_functions) |candidate| if (std.mem.eql(u8, candidate.name, name)) {
             matches += 1;
@@ -170,11 +165,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
-    // The vision tool runs through a separate provider request; inline image
-    // content on user and tool-result messages serializes natively below.
     if (request.vision_mode != .unavailable) return error.UnsupportedVision;
-    // Verified snapshots only flow through the vision executor's structured
-    // request, which this protocol rejects above via response_format.
     if (request.verified_images != null and request.verified_images.?.len != 0) return error.UnsupportedVision;
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     for (request.messages) |message| {
@@ -321,8 +312,6 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
 const reasoning_fields = [_][]const u8{ "reasoning", "reasoning_content" };
 const association_field = "_tool_call_ids";
 
-// The private association list never reaches the wire. Signed/encrypted metadata
-// is indivisible: filtering an associated call must drop the entire sequence.
 fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.json.Value) {
     if (raw.len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
     try check_json_depth(raw);
@@ -521,9 +510,6 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     try std.json.Stringify.value(request.model, .{}, writer);
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var count: usize = 0;
-    // Images from tool results buffer across each contiguous tool-message run
-    // and flush as one user message when the run ends, so tool messages stay
-    // adjacent to the assistant tool-call message they answer.
     var pending_names: std.ArrayList([]const u8) = .empty;
     defer pending_names.deinit(alloc);
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
@@ -531,7 +517,6 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
     for (lanes) |lane| {
         for (lane) |message| {
-            // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
             if (count != 0) try writer.writeByte(',');
@@ -572,7 +557,6 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                 }
             }
         }
-        // Lane boundary: flush before the next lane starts.
         try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
     }
     try writer.writeByte(']');
@@ -750,7 +734,6 @@ pub const Reducer = struct {
             return .{};
         }
         if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
-        // These fields carry semantics outside this codec's text/function subset.
         for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
         const reasoning_delta = try self.accept_reasoning(delta);
         const content_start = self.content.items.len;
@@ -914,7 +897,6 @@ pub const Reducer = struct {
             final_fields.output = final_fields.output or incoming.output_tokens != null;
             final_fields.total = final_fields.total or incoming_total != null;
         }
-        // Carried progress values are lower bounds, not current or final assertions.
         if (total) |tokens| {
             const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
             const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
@@ -974,8 +956,6 @@ pub const Reducer = struct {
             calls.deinit(self.alloc);
         }
         for (self.tools.items) |*tool| {
-            // finish() is terminal: ownership moves to the result and the
-            // emptied accumulators cost nothing at reducer deinit.
             const id = tool.id.?;
             tool.id = null;
             errdefer self.alloc.free(id);
@@ -1013,8 +993,6 @@ fn non_null(fields: std.json.ObjectMap, key: []const u8) ?std.json.Value {
 }
 
 fn integer(value: std.json.Value) Error!i64 {
-    // Keep opaque metadata numbers lossless, but retain integer-only counters
-    // and indexes with the same range as the ordinary JSON integer parser.
     return switch (value) {
         .integer => value.integer,
         .number_string => std.fmt.parseInt(i64, value.number_string, 10) catch error.InvalidChunk,
@@ -1939,7 +1917,6 @@ test "chat completions merges parallel tool images into one follow up after the 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    // two instructions + user + assistant + tool + tool + merged follow-up + user
     try std.testing.expectEqual(@as(usize, 8), messages.len);
     try std.testing.expectEqualStrings("tool", messages[4].object.get("role").?.string);
     try std.testing.expectEqualStrings("tool", messages[5].object.get("role").?.string);
@@ -1968,7 +1945,6 @@ test "chat completions withholds images from denied tool results" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    // two instructions + user + assistant + tool — no image follow-up for a denied call.
     try std.testing.expectEqual(@as(usize, 5), messages.len);
     for (messages) |message| {
         const content = message.object.get("content") orelse continue;
@@ -2316,7 +2292,6 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         var source = std.Io.Reader.fixed(wire);
         try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled));
     }
-    // A terminal delimiter is sufficient: never wait for a failing next read.
     var source = std.Io.Reader.failing;
     source.buffer = @constCast(wire);
     source.end = wire.len;

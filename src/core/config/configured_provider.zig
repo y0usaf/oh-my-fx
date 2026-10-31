@@ -285,8 +285,6 @@ fn required(value: std.json.Value, name: []const u8) ParseError!std.json.Value {
     return value.object.get(name) orelse error.MissingField;
 }
 
-// Named connection IDs are ASCII [A-Za-z][A-Za-z0-9_-]*. Built-in names are
-// reserved case-insensitively, matching the existing provider selector.
 pub fn validate_id(id: []const u8) error{ LimitExceeded, InvalidProviderId, ReservedProviderId }!void {
     if (id.len > max_id_bytes) return error.LimitExceeded;
     if (id.len == 0 or !std.ascii.isAlphabetic(id[0])) return error.InvalidProviderId;
@@ -318,8 +316,6 @@ fn validate_url(url: []const u8) ParseError![]const u8 {
     if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidBaseUrl;
     const host = (uri.host orelse return error.InvalidBaseUrl).percent_encoded;
     if (host.len == 0) return error.InvalidBaseUrl;
-    // Check the complete authority: Uri.parse alone accepts some malformed
-    // bracket suffixes and parseInt accepts signs/underscores in ports.
     const rest = url[uri.scheme.len + 1 ..];
     if (!std.mem.startsWith(u8, rest, "//")) return error.InvalidBaseUrl;
     const authority = rest[2 .. 2 + (std.mem.findScalar(u8, rest[2..], '/') orelse rest.len - 2)];
@@ -346,8 +342,6 @@ fn validate_url(url: []const u8) ParseError![]const u8 {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InsecureBaseUrl;
         if (!std.mem.eql(u8, host, "127.0.0.1") and !std.mem.eql(u8, host, "[::1]") and !std.ascii.eqlIgnoreCase(host, "localhost")) return error.InsecureBaseUrl;
     }
-    // Preserve encoded path bytes but reject malformed escapes and encoded
-    // controls so later HTTP construction cannot reinterpret unsafe bytes.
     const path = uri.path.percent_encoded;
     var index: usize = 0;
     while (index < path.len) : (index += 1) {

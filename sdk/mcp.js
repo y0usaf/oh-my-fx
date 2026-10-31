@@ -72,13 +72,9 @@ export async function createMcpAdapter(client, options = {}) {
       name,
       description: tool.description || "MCP tool",
       inputSchema: tool.inputSchema ?? { type: "object", properties: {} },
-      // The server's hints are not trusted: a call is never run twice on its
-      // own. A host that knows a tool is safe to repeat can set this to true.
       idempotent: false,
       async execute(input, { signal, observation }) {
         const correlationId = options.propagateCorrelation === true ? crypto.randomUUID() : undefined;
-        // Correlation is not progress reporting: progressToken requests remote
-        // notifications and some clients replace it with their JSON-RPC ID.
         const send = () => client.callTool({ name: tool.name, arguments: input, ...(correlationId === undefined ? {} : { _meta: { "libfx/correlationId": correlationId } }) }, undefined, { signal });
         const result = observation ? await observation.mcp({ server: serverName, tool: tool.name, correlationId }, send) : await send();
         const text = resultText(result);

@@ -434,11 +434,8 @@ tmuxTest(
 tmuxTest(
   "typed sentences wrap by word and continuation rows never start with a space",
   async () => {
-    // 20 cols, prefix "┃ " = 18 content cells per row.
     const active = await startFx(20, 24);
 
-    // "wrapping" (8 cells) does not fit after "hello world " (12 cells),
-    // so it moves whole to the next row.
     await typeLiteral(active, "hello world wrapping here");
     let footer = await waitForActiveFooter(
       active,
@@ -449,11 +446,8 @@ tmuxTest(
     const second = rowContaining(rows, "wrapping here");
     expect(second.index).toBe(first.index + 1);
     expect(first.line).not.toContain("wrapp");
-    // Continuation row starts at the prefix column, not a space.
     expect(second.line.indexOf("wrapping here")).toBe(2);
 
-    // A space landing exactly at the margin hangs there: the row after it
-    // still starts at the word.
     await active.sendKeys("C-u");
     await typeLiteral(active, "abcdefghijklmnopqr st");
     footer = await waitForActiveFooter(
@@ -468,8 +462,6 @@ tmuxTest(
     expect(next.index).toBe(full.index + 1);
     expect(next.line.indexOf("st")).toBe(2);
 
-    // Words wider than a full row still split per character: row 0 fills
-    // all 18 content cells and the remainder continues on the next row.
     await active.sendKeys("C-u");
     await typeLiteral(active, "ab cdefghijklmnopqrstuvwxyz");
     footer = await waitForActiveFooter(
@@ -553,7 +545,6 @@ tmuxTest(
     grid = await active.capturePaneGrid();
     const first = rowContaining(grid, "aaaaaa");
     const wrapped = rowContaining(grid, "Y");
-    // "XY" is a word: it wraps whole instead of splitting after "X".
     expect(first.line).not.toContain("X");
     expect(wrapped.index).toBe(first.index + 1);
     expect(wrapped.line.indexOf("XY")).toBe(2);
@@ -757,24 +748,19 @@ tmuxTest(
   async () => {
     const active = await startFx(80, 24, true);
 
-    // Kitty reports keypad keys as dedicated codes: KP_1, KP_6, KP_DIVIDE,
-    // KP_SUBTRACT. Every one of them must reach the composer.
     await active.sendHexBytes(hexSeq("\x1b[57400u"));
     await active.sendHexBytes(hexSeq("\x1b[57405u"));
     await active.sendHexBytes(hexSeq("\x1b[57410u"));
     await active.sendHexBytes(hexSeq("\x1b[57412u"));
     await waitForActiveFooter(active, (footer) => footer === "┃ 16/-");
 
-    // Keypad Left moves the caret instead of dropping the key.
     await active.sendHexBytes(hexSeq("\x1b[57417u"));
     await typeLiteral(active, "9");
     await waitForActiveFooter(active, (footer) => footer === "┃ 16/9-");
 
-    // Keypad Delete deletes forward.
     await active.sendHexBytes(hexSeq("\x1b[57426u"));
     await waitForActiveFooter(active, (footer) => footer === "┃ 16/9");
 
-    // A keypad slash opens the slash menu when it is the first character.
     await active.sendKeys("C-u");
     await active.sendHexBytes(hexSeq("\x1b[57410u"));
     await active.waitForPane(
@@ -787,7 +773,6 @@ tmuxTest(
       READY_TIMEOUT,
     );
 
-    // Keypad Enter submits the message.
     await active.sendKeys("C-u");
     await typeLiteral(active, "zz-numpad-enter");
     await active.sendHexBytes(hexSeq("\x1b[57414u"));
@@ -807,14 +792,12 @@ tmuxTest(
   async () => {
     const active = await startFx(80, 24, true);
 
-    // A terminal left in keypad application mode reports `ESC O <byte>`.
-    await active.sendHexBytes(hexSeq("\x1bOp")); // KP_0
-    await active.sendHexBytes(hexSeq("\x1bOy")); // KP_9
-    await active.sendHexBytes(hexSeq("\x1bOo")); // KP_DIVIDE
-    await active.sendHexBytes(hexSeq("\x1bOm")); // KP_SUBTRACT
+    await active.sendHexBytes(hexSeq("\x1bOp"));
+    await active.sendHexBytes(hexSeq("\x1bOy"));
+    await active.sendHexBytes(hexSeq("\x1bOo"));
+    await active.sendHexBytes(hexSeq("\x1bOm"));
     await waitForActiveFooter(active, (footer) => footer === "┃ 09/-");
 
-    // Keypad Enter submits under the same encoding.
     await active.sendHexBytes(hexSeq("\x1bOM"));
     await active.waitForPane(
       (pane) => pane.includes("history prompt complete"),
@@ -915,8 +898,6 @@ tmuxTest(
         READY_TIMEOUT,
       );
       expect(pane.split(response)).toHaveLength(2);
-      // The full transcript opens with session, context, and network records,
-      // so the resumed history marker sits above the initial tail viewport.
       let top = pane;
       for (let page = 0; page < 20 && !top.includes("zz-history"); page += 1) {
         await active.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -942,7 +923,6 @@ tmuxTest(
       expect(scrollback).not.toContain("zz-history");
     };
 
-    // Establish that the viewer has the response before clearing the display.
     await openRetainedTranscript();
     await active.sendKeys("C-o");
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
@@ -994,14 +974,12 @@ tmuxTest(
     await active.sendText("hello");
     await active.waitForText("history prompt complete", READY_TIMEOUT);
 
-    // The records never appear in the inline transcript.
     const inline = await active.capturePane();
     expect(inline).not.toContain("session: provider:");
     expect(inline).not.toContain("network: provider:");
 
     await active.sendKeys("C-o");
     await active.waitForText("full detail · ctrl+o close", READY_TIMEOUT);
-    // The records block sits at the top of the full transcript.
     let top = await active.capturePane();
     for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
       await active.sendKeys("PPage");
@@ -1526,8 +1504,6 @@ tmuxTest(
     expect(resized).toContain("[Image 2] second turn");
     expect(resized).not.toContain("[Image 1] second turn");
 
-    // The second request replays turn 1, so it carries both placeholders. What
-    // matters is that each turn's text is paired with its own image id.
     expect(localGateway.requests).toHaveLength(2);
     const firstBody = localGateway.requests[0]!.body;
     const secondBody = localGateway.requests[1]!.body;

@@ -75,7 +75,6 @@ pub const DirectoryList = union(enum) {
 pub fn loadDirectory(arena: Allocator, dir: std.Io.Dir, rule_dir: []const u8) Allocator.Error!DirectoryList {
     return switch (try bounded_read.readAt(arena, dir, ".gitignore", ignore.max_pattern_file_bytes)) {
         .content => |content| blk: {
-            // Built only here, since most folders have no `.gitignore`.
             const base = if (rule_dir.len == 0) "" else try std.mem.concat(arena, u8, &.{ rule_dir, "/" });
             const list = try arena.create(ignore.PatternList);
             list.* = try ignore.PatternList.parse(arena, base, content);
@@ -124,7 +123,6 @@ test "repository-wide ignore sources load in git's precedence and report unreada
     try std.testing.expectEqual(@as(usize, 1), partial.lists.len);
     try std.testing.expectEqual(@as(usize, 1), partial.unavailable.len);
 
-    // A linked excludes file is followed only when the user's config named it.
     tmp.dir.symLink(std.testing.io, "global-ignore", "linked-ignore", .{}) catch return error.SkipZigTest;
     var linked = settings;
     linked.excludes_file = try std.Io.Dir.path.join(arena, &.{ root, "linked-ignore" });

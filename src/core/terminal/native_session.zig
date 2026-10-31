@@ -992,7 +992,6 @@ const SupportedRegistry = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return self.failure(.start, launchFailureCode(err), null);
         };
-        // A start that raced `closeAllForExit` must not outlive it.
         if (self.isExiting()) {
             _ = session.hangUpForExit();
             session.killForExit();
@@ -1547,7 +1546,6 @@ const Session = struct {
     fn launch(self: *Session, request: contracts.StartRequest) !void {
         switch (request.backend) {
             .native => try self.launchNative(request),
-            // Only records written by earlier fx versions name tmux.
             .tmux => return error.UnsupportedBackend,
         }
     }

@@ -45,7 +45,6 @@ pub const State = struct {
         };
     }
 
-    // Gate for max-only sound points. Requires sound on and max selected.
     fn maxEnabled(self: *const State) bool {
         return self.soundEnabled() and self.max_enabled.load(.acquire);
     }
@@ -57,8 +56,6 @@ pub const State = struct {
         };
     }
 
-    // The /sound master switch moves both flags together, so turn_end stands
-    // in for "sound on" when playing cues without a turn/attention hook.
     fn soundEnabled(self: *const State) bool {
         return self.turn_end_enabled.load(.acquire);
     }
@@ -78,8 +75,6 @@ pub const State = struct {
     ) bool {
         return switch (notification.kind) {
             .turn_end => blk: {
-                // Turn notifications only ever carry success or error; bloom and
-                // press play directly via playCue, never through this queue.
                 if (notification.cue == .@"error") {
                     self.pending_turn_end_error +|= 1;
                 } else {
@@ -147,8 +142,6 @@ fn Runtime(comptime App: type) type {
             return app.notifications.preferences();
         }
 
-        // Whether max-only sound points should fire. Consulted by future
-        // trigger sites gated on the max level.
         pub fn maxEnabled(app: *const App) bool {
             return app.notifications.maxEnabled();
         }
@@ -159,8 +152,6 @@ fn Runtime(comptime App: type) type {
             }
         }
 
-        // Plays a cue immediately, bypassing the turn/attention queue. Used for
-        // one-off events (startup, cancellation) gated by the /sound switch.
         pub fn playCue(app: *App, cue: Cue) void {
             if (!app.notifications.soundEnabled()) return;
             const player = if (app.notifications.player) |*configured| configured else return;
@@ -168,7 +159,6 @@ fn Runtime(comptime App: type) type {
             player.play(cue);
         }
 
-        // Plays a cue for a max-only point: silent unless the level is max.
         pub fn playMaxCue(app: *App, cue: Cue) void {
             if (!app.notifications.maxEnabled()) return;
             const player = if (app.notifications.player) |*configured| configured else return;
@@ -233,7 +223,6 @@ fn Runtime(comptime App: type) type {
             const cue: Cue = switch (input.outcome) {
                 .completed => .success,
                 .failed => .@"error",
-                // Cancellation already plays the press cue; stay silent here.
                 .interrupted, .paused => return,
             };
             enqueue(app, .{ .kind = .turn_end, .cue = cue });
@@ -403,7 +392,6 @@ test "max gate requires both sound on and max selected" {
     try std.testing.expect(state.maxEnabled());
     try std.testing.expect(state.preferences().max);
 
-    // Sound off suppresses max even if the flag lingers.
     state.setPreferences(.{ .turn_end = false, .attention_required = false, .max = true });
     try std.testing.expect(!state.maxEnabled());
 }

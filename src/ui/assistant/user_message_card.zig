@@ -1,4 +1,3 @@
-// Renders submitted user turns and owns their row collection and wrapping.
 const std = @import("std");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -51,7 +50,6 @@ fn lastSpaceIn(slice: []const u8) ?usize {
     return null;
 }
 
-// Returns display-safe keep and skip boundaries, preferring whitespace.
 const WrapCut = struct { keep_bytes: usize, skip_bytes: usize };
 
 fn wrapCut(text: []const u8, row_budget: usize) WrapCut {
@@ -63,7 +61,6 @@ fn wrapCut(text: []const u8, row_budget: usize) WrapCut {
         return .{ .keep_bytes = sp, .skip_bytes = sp + 1 };
     }
 
-    // Force one display unit when no break point fits so the loop advances.
     if (prefix.len == 0) {
         var end: usize = 0;
         while (end < text.len and text[end] == 0x1b) {
@@ -151,8 +148,6 @@ pub fn buildUserPromptCardTailForTerminalPresentationInterruptible(
     max_rows: usize,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]u8 {
-    // The pending-frame path retains only the newest rows that fit its current
-    // transcript band; canonical formatting remains shared with ordinary turns.
     return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         alloc,
         text,
@@ -290,7 +285,6 @@ fn renderSkillTokensForCard(
     return try out.toOwnedSlice();
 }
 
-// Dupes `content` into the row list.
 fn appendRow(
     alloc: std.mem.Allocator,
     rows: *std.ArrayList([]const u8),
@@ -345,7 +339,6 @@ fn hyperlinkStateAfter(fragment: []const u8, initial: ?[]const u8) ?[]const u8 {
     return active;
 }
 
-// Wraps `text` onto rows and repeats the rail so adjacent rows stay connected.
 fn collectLogicalLinesWithFirstPrefix(
     alloc: std.mem.Allocator,
     rows: *std.ArrayList([]const u8),

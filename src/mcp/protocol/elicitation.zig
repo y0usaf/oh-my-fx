@@ -223,7 +223,7 @@ pub const Options = struct {
     elements: wire.Elements,
 
     pub fn init(o: *Options, field: *const Field) wire.DecodeError!void {
-        try o.elements.init(field.options.?); // read by `parse`
+        try o.elements.init(field.options.?);
     }
 
     pub fn next(o: *Options) ?Option {
@@ -427,8 +427,6 @@ fn digits(s: []const u8) ?u32 {
     return x;
 }
 
-// ---- tests ----
-
 const testing = std.testing;
 
 test "reads the spec's form and URL examples" {
@@ -441,7 +439,6 @@ test "reads the spec's form and URL examples" {
     try testing.expectEqualStrings("\"name\"", form.fields[0].key);
     try testing.expect(form.fields[0].required);
 
-    // No mode means form.
     _ = try parse(
         \\{"message":"m","requestedSchema":{"type":"object","properties":{"name":{"type":"string","description":"Your full name"},"email":{"type":"string","format":"email"},"age":{"type":"number","minimum":18}},"required":["name","email"]}}
     , &form);
@@ -506,7 +503,6 @@ test "refuses what the client can't show" {
         ,
     };
     for (cases) |params| try testing.expectError(error.Unreadable, parse(params, &form));
-    // HTTP to a loopback host is fine.
     _ = try parse(
         \\{"mode":"url","message":"m","url":"http://127.0.0.1:8080/x"}
     , &form);

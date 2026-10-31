@@ -63,9 +63,6 @@ const crc_tables: [8][256]u32 = blk: {
     break :blk tables;
 };
 
-// ---------------------------------------------------------------------------
-// Pure core: framing
-
 pub const FrameError = error{ OutOfMemory, TooLarge };
 
 /// Appends one complete line to `out`: the header, `body`, the checksum and
@@ -143,9 +140,6 @@ fn parseHex32(digits: *const [8]u8) ?u32 {
     }
     return value;
 }
-
-// ---------------------------------------------------------------------------
-// Pure core: scanning
 
 pub const Verdict = union(enum) {
     /// Every line is good and the file ends with a newline.
@@ -227,9 +221,6 @@ pub fn scanBytes(bytes: []const u8, base_offset: u64, next_seq: ?u64) struct { s
     const last_nl = if (std.mem.findScalarLast(u8, bytes, '\n')) |nl| nl + 1 else 0;
     return .{ .scanner = sc, .verdict = sc.finish(bytes.len - last_nl) };
 }
-
-// ---------------------------------------------------------------------------
-// Effectful shell: the log
 
 pub const Status = enum { open, writing, down };
 
@@ -422,7 +413,6 @@ fn inspectTail(gpa: std.mem.Allocator, s: storage.Storage, file: storage.File, l
     var newlines: usize = 0;
     while (start > 0 and newlines < 3) {
         if (window.items.len >= bound) {
-            // Lines longer than the cap: nothing here can be trusted.
             return .{ .scanner = .init(start, null), .verdict = .{ .corrupt = .{ .at = start } } };
         }
         const step: usize = @intCast(@min(start, block_bytes));
@@ -431,10 +421,9 @@ fn inspectTail(gpa: std.mem.Allocator, s: storage.Storage, file: storage.File, l
         try window.resize(gpa, old_len + step);
         @memmove(window.items[step..], window.items[0..old_len]);
         const n = try s.readAt(file, window.items[0..step], start);
-        if (n != step) return error.Io; // the file shrank under us
+        if (n != step) return error.Io;
         newlines += std.mem.count(u8, window.items[0..step], "\n");
     }
-    // Begin just after the third newline from the end: a line boundary.
     var skip: usize = 0;
     if (newlines >= 3) {
         var seen: usize = 0;
@@ -471,9 +460,6 @@ pub fn lastLineEnd(s: storage.Storage, file: storage.File, len: u64) ReadError!u
     }
     return 0;
 }
-
-// ---------------------------------------------------------------------------
-// Effectful shell: readers (lock-free; they never change the file)
 
 pub const ReadError = storage.Error || error{ OutOfMemory, Corrupt };
 
@@ -571,7 +557,6 @@ pub const ForwardReader = struct {
                 r.damaged_at = r.buf_offset + r.pos;
                 return error.Corrupt;
             }
-            // Drop consumed bytes, then read the next block.
             const unread = r.buf.items.len - r.pos;
             @memmove(r.buf.items[0..unread], r.buf.items[r.pos..]);
             r.buf.shrinkRetainingCapacity(unread);
@@ -612,7 +597,6 @@ pub const BackwardReader = struct {
 
     pub fn next(r: *BackwardReader) ReadError!?Line {
         if (r.pos == 0) return null;
-        // Forget the line returned last time: memory stays one line plus a block.
         r.buf.shrinkRetainingCapacity(@intCast(r.pos - r.buf_offset));
         while (true) {
             const have = r.buf.items[0..@intCast(r.pos - r.buf_offset)];
@@ -645,7 +629,6 @@ pub const BackwardReader = struct {
                 r.damaged_at = r.pos;
                 return error.Corrupt;
             }
-            // Prepend the previous block.
             const want: usize = @intCast(@min(block_bytes, r.buf_offset));
             try r.buf.resize(r.gpa, have.len + want);
             @memmove(r.buf.items[want..], r.buf.items[0..have.len]);
@@ -655,9 +638,6 @@ pub const BackwardReader = struct {
         }
     }
 };
-
-// ---------------------------------------------------------------------------
-// Tests
 
 const testing = std.testing;
 const Fault = storage.Fault;
@@ -683,7 +663,6 @@ test "a framed line checks, and its body comes back" {
     try testing.expectEqual(@as(u64, 3), h.seq);
     try testing.expectEqualStrings(",\"turn\":2", lineBody(out.items, h));
     try testing.expect(std.mem.endsWith(u8, out.items, "\"}\n"));
-    // The line is still valid JSON.
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
     parsed.deinit();
 }
@@ -722,31 +701,26 @@ test "scanner verdicts" {
     const l1_end = std.mem.findScalar(u8, good.items, '\n').? + 1;
     const l2_end = std.mem.findScalarPos(u8, good.items, l1_end, '\n').? + 1;
 
-    // Clean.
     const clean = scanBytes(good.items, 0, 1);
     try testing.expectEqual(Verdict.clean, clean.verdict);
     try testing.expectEqual(@as(u64, 3), clean.scanner.last_seq);
 
-    // Incomplete final line: torn, cut at the last boundary.
     const partial = scanBytes(good.items[0 .. good.items.len - 5], 0, 1);
     try testing.expectEqual(@as(u64, l2_end), partial.verdict.torn.cut_at);
 
     var damaged = try testing.allocator.dupe(u8, good.items);
     defer testing.allocator.free(damaged);
 
-    // Bad final complete line with nothing after it: torn.
     damaged[good.items.len - 20] ^= 1;
     try testing.expectEqual(@as(u64, l2_end), scanBytes(damaged, 0, 1).verdict.torn.cut_at);
     damaged[good.items.len - 20] ^= 1;
 
-    // Bad line before the final one: corrupt, good up to line 1.
     damaged[l1_end + 3] ^= 1;
     const mid = scanBytes(damaged, 0, 1);
     try testing.expectEqual(@as(u64, l1_end), mid.verdict.corrupt.at);
     try testing.expectEqual(@as(u64, l1_end), mid.scanner.good_end);
     damaged[l1_end + 3] ^= 1;
 
-    // Seq gap: corrupt.
     var gap: std.ArrayList(u8) = .empty;
     defer gap.deinit(testing.allocator);
     try frameOne(&gap, 1, .item, "");
@@ -867,7 +841,6 @@ test "a bad middle line opens read-only and keeps every byte" {
     try log.sync();
     const len = log.end;
     log.close();
-    // Damage line 3 of 4.
     const bytes = try t.tmp.dir.readFileAlloc(testing.io, "log.jsonl", testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(bytes);
     const line2_end = std.mem.findScalarPos(u8, bytes, std.mem.findScalar(u8, bytes, '\n').? + 1, '\n').? + 1;
@@ -996,7 +969,6 @@ const log_model_tests = struct {
 
         fn create(h: *Harness) !void {
             h.log = try Log.create(h.storageFor(), h.dir(), name, h.hook());
-            // The name is made durable, as the first-turn publish does.
             try h.storageFor().syncDir(h.dir());
         }
 
@@ -1012,11 +984,8 @@ const log_model_tests = struct {
             while (i < count) : (i += 1) {
                 try log_mod.appendLine(gpa, &batch, log.next_seq + i, 1, .item, ",\"turn\":1,\"data\":{}");
             }
-            // Recorded first: after a death part of the batch may be on disk,
-            // and recovery checks the file against a prefix of the history.
             try h.history.appendSlice(gpa, batch.items);
             log.append(batch.items, count) catch |err| switch (err) {
-                // An injected death: the harness records the crash.
                 error.Io => return h.crashed(),
                 else => return err,
             };
@@ -1077,7 +1046,6 @@ const log_model_tests = struct {
             const opened = try Log.open(gpa, h.storageFor(), h.dir(), name, .read_write, h.hook());
             h.log = opened.log;
             h.durable = opened.log.synced_lines;
-            // The file must now be exactly a prefix of what was written.
             const bytes = try h.readFile();
             defer gpa.free(bytes);
             try testing.expect(std.mem.startsWith(u8, h.history.items, bytes));
@@ -1098,7 +1066,6 @@ const log_model_tests = struct {
                 .clean, .torn => {},
                 .corrupt, .newer_version => return error.InvariantViolated,
             }
-            // Every acknowledged line is present and unchanged.
             try testing.expect(bytes.len >= h.acked_bytes);
             try testing.expectEqualSlices(u8, h.history.items[0..h.acked_bytes], bytes[0..h.acked_bytes]);
             try testing.expect(scan.scanner.last_seq >= h.acked_lines);
@@ -1155,7 +1122,6 @@ const log_model_tests = struct {
         var recoveries: usize = 0;
         var seed: u64 = 0;
         while (seed < 300) : (seed += 1) recoveries += try runSchedule(seed, null);
-        // The schedules really exercised recovery.
         try testing.expect(recoveries > 300);
     }
 
@@ -1179,14 +1145,11 @@ const log_model_tests = struct {
         const random = prng.random();
         try h.create();
         if (planted == .keep_torn_tail) {
-            // A torn tail must exist at the next recovery.
             try h.append(2);
             try h.sync();
             h.planMidWriteDeath(random);
             try h.append(1);
             try h.recover();
-            // The in-process check sees the bug too: the open log ends torn,
-            // which `OpenIsClean` forbids.
             const bytes = try h.readFile();
             defer gpa.free(bytes);
             try testing.expect(log_mod.scanBytes(bytes, 0, 1).verdict == .torn);

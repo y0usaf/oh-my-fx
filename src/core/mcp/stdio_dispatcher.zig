@@ -588,8 +588,6 @@ pub const StdioDispatcher = struct {
             error.McpRequestTimedOut => write_control = .timed_out,
             else => {
                 if (write_outcome.phase == .waiting) return err;
-                // A closed stdin means the child already ended; fail like the
-                // reader's end of stream so waiters see one consistent reason.
                 self.failConnection(if (err == error.BrokenPipe) error.McpConnectionClosed else err);
                 if (self.childMayBeRunning()) terminateChild(self.child_id);
             },
@@ -1103,7 +1101,6 @@ pub const StdioDispatcher = struct {
                 break;
             };
             self.dispatchFrame(frame) catch |err| {
-                // Record it before failing waiters so startup can report it.
                 if (err == error.McpInvalidJson) self.recordRejectedOutput(frame);
                 self.shared_allocator.free(frame);
                 terminal_error = err;
@@ -1115,8 +1112,6 @@ pub const StdioDispatcher = struct {
             self.reapChild();
             return;
         }
-        // Fail waiters first so no new request writes into the ended child.
-        // childDiagnostics waits for the reap and stderr below.
         self.failConnection(terminal_error orelse error.McpConnectionClosed);
         terminateChild(self.child_id);
         self.reapChild();
@@ -2920,7 +2915,6 @@ test "MCP stdio reports a write to a child that closed stdin as a closed connect
             .{ .timeout_ms = 5_000 },
         ),
     );
-    // fx ends a child it can no longer write to; the details still arrive.
     const diagnostics = dispatcher.childDiagnostics();
     try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, diagnostics.term orelse return error.TestExpectedExit);
     try std.testing.expectEqualStrings("stdin closed\n", diagnostics.stderr.headSlice());
@@ -2966,8 +2960,6 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     defer alloc.free(root);
     const pid_path = try alloc.print("{s}/descendant.pid", .{root});
     defer alloc.free(pid_path);
-    // The descendant publishes its pid only after leaving the process group,
-    // and it keeps the inherited stderr pipe open.
     const script = try alloc.print(
         "perl -MPOSIX -e 'setsid(); open(my $f, \">\", \"$ARGV[0].tmp\") or die; print $f \"$$\\n\"; close $f; rename(\"$ARGV[0].tmp\", $ARGV[0]) or die; sleep 30' \"{s}\" </dev/null >/dev/null &\nexec sleep 30",
         .{pid_path},
@@ -2996,7 +2988,6 @@ test "MCP stdio exit is not held by a detached descendant that keeps stderr open
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try expectProcessReaped(fixture.pid);
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
-    // Still alive: it escaped the group kill and held stderr the whole time.
     try std.posix.kill(descendant.?, @fromBackingInt(@intCast(0)));
 }
 

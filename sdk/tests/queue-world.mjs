@@ -1,21 +1,3 @@
-// A World whose queue delivers the way Vercel Queues does, over world-local's
-// runs, events and streams, for tests of a World that cannot tell whether a
-// lease's holder runs:
-//
-// - a delivery holds its message until its handler returns, and the message
-//   keeps its id across deliveries, each with the next attempt;
-// - a handler that returns `{ timeoutSeconds }` has the message's payload
-//   sent again that much later as a new message, as world-vercel does;
-// - one that throws gets the same message again shortly;
-// - `lapse(message)` delivers a message again while its delivery still runs,
-//   as the queue does once the process holding it died or lost it;
-//   `rerun(message)` runs its delivery again, attempt and all, as Vercel
-//   does when a function's process exits mid-delivery; and `adopt(message)`
-//   delivers here a message another of these Worlds held, as one queue
-//   shared by two processes hands a message on.
-//
-// The test starts the World and passes it to world(), so it stays the
-// test's: `closeQueueWorlds()` closes them after the agents.
 import { world } from "../durable/world.mjs";
 
 const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
@@ -25,11 +7,9 @@ function createBroker({ retryMs }) {
   const handlers = new Map();
   const inner = Symbol("handler");
   const timers = new Set();
-  // Messages not yet acknowledged, by id.
   const messages = new Map();
   const keys = new Map();
   const sent = [];
-  // Ids stay distinct across Worlds, so one can take another's message.
   const tag = crypto.randomUUID().slice(0, 8);
   let count = 0;
   let closed = false;
@@ -61,8 +41,6 @@ function createBroker({ retryMs }) {
     Promise.resolve()
       .then(() => handlers.get(prefix)(message.payload, { queueName: message.queueName, messageId: message.id, attempt }))
       .then((result) => {
-        // world-vercel sends the next message before it acknowledges this
-        // one, so a delivery the queue has since handed on still sends it.
         if (Number.isFinite(result?.timeoutSeconds)) void send(message.queueName, message.payload, { delaySeconds: result.timeoutSeconds });
         if (attempt === message.attempt) acknowledge(message);
       }, () => {
@@ -71,7 +49,6 @@ function createBroker({ retryMs }) {
   };
   return {
     sent,
-    // The messages not yet acknowledged whose libfx message matches.
     held(match = () => true) {
       return [...messages.values()].filter((message) => match(message.payload?.input ?? {}));
     },
@@ -104,13 +81,6 @@ function createBroker({ retryMs }) {
   };
 }
 
-// The in-band writer fence `@workflow/world` defines, for a world-local
-// without it: a count per run of the in-band writes it took, reported with
-// each listing, read before it, and a refusal, before anything is written,
-// of an in-band write that expects another count. A world-local with its own
-// fence keeps it. Either way it keeps what each create was asked, for tests.
-// `settleMs` holds an accepted write's count back that long after its event
-// is published, as world-local's count on disk lags its event.
 function withInBandFence(stored, { settleMs = 0 } = {}) {
   const own = stored.capabilities?.inBandFence === true;
   const counts = new Map();
@@ -179,10 +149,6 @@ export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, ...
     },
   };
   opened.push(instance);
-  // The broker keeps its messages in memory, so a message dies with the
-  // process and prompt() stores each prompt before it sends it.
-  // Every delivery comes from the queue unless a test asks for prompts to run
-  // in the request that sent them.
   return { durability: world(instance, { name: "queue", pollMs: 250, queueDurable: false, runInRequest: false, ...options }), broker, fence };
 }
 

@@ -815,7 +815,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
             defer image_occurrences.deinit(app.alloc);
 
-            // One mapping owns both placeholder IDs and attachment order.
             const visual_text = if (staged_images) |*images|
                 try mapSubmittedImages(
                     app.alloc,

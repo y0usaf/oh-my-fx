@@ -23,10 +23,6 @@ const ResumeOptions = types.ResumeOptions;
 const automatic_legacy_max_bytes = types.automatic_legacy_max_bytes;
 const StoreContext = types.StoreContext;
 
-// Temporary read-only compatibility boundary. Remove this module's v1-v3
-// decoders once the supported upgrade window no longer includes schema v3.
-// Current sessions never write any of these formats.
-
 pub const LegacyStoredSession = struct {
     id: []u8,
     workspace_root: ?[]u8 = null,
@@ -73,8 +69,6 @@ pub fn migrateLegacyLocked(
     return loaded;
 }
 
-// Keep fallible construction behind a noinline out-parameter boundary so
-// error returns do not materialize the full LoadedWritableSession payload.
 noinline fn migrateLegacyLockedInto(
     out: *LoadedWritableSession,
     ctx: StoreContext,

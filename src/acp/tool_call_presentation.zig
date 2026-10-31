@@ -183,7 +183,6 @@ test "shell result notice is read only from the result's own field" {
             &buffer,
         ).?,
     );
-    // Output that merely prints the key stays escaped inside its string.
     try std.testing.expect(shellResultNotice(
         "{\"output_delta\":\",\\\"notice\\\":\\\"x\\\"\"}",
         &buffer,

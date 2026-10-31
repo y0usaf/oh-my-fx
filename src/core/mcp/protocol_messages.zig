@@ -81,8 +81,6 @@ pub fn buildToolCallRequestForProtocol(
     try out.writer.writeAll("\"name\":");
     try std.json.Stringify.value(original_name, .{}, &out.writer);
     try out.writer.writeAll(",\"arguments\":");
-    // Models may pretty-print arguments; a raw newline would split the NDJSON
-    // frame, so compact them onto a single line before framing.
     try mcp_json.write_compact(&out.writer, arguments_json);
     if (continuation) |value| {
         try out.writer.writeAll(",\"inputResponses\":");

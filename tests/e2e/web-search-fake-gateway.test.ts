@@ -266,7 +266,6 @@ function startFakeGateway(
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
-      // Title generation side calls bypass the queued responses entirely.
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ body, headers: req.headers });
         return fakeGatewayTitleDefault();

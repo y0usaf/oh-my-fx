@@ -87,7 +87,6 @@ pub fn connectServer(
         .http => return connectServerHttp(alloc, server, tool_registry, used_tool_names, control),
         .stdio => {},
     }
-    // Fallbacks keep the caller's deadline and report this operation's span.
     const operation = control.withStartupSpan(
         std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
         server.config.startup_timeout_ms,
@@ -164,8 +163,6 @@ pub fn connectServer(
                 operation,
                 .v2024_11_05,
             ) catch |legacy_err| {
-                // The discovery launch stayed up, so not every launch ended
-                // on its own and a restart could still help.
                 if (err == error.McpRequestTimedOut and legacy_err == error.McpServerExitedDuringStartup) {
                     return error.McpInitFailed;
                 }
@@ -243,7 +240,6 @@ fn connectServerHttp(
     };
 
     var next_request_id: u64 = 1;
-    // Host-channel servers support only the modern stateless protocol.
     const host_channel = server.config.acp_server_id != null;
     if (!host_channel and try protocol_negotiation.startupMode(server.config.env, io_mod.getenv(protocol_negotiation.protocol_version_environment)) == .legacy) {
         _ = try server_auth.refreshSharedCredentials(alloc, server, post_control);
@@ -464,9 +460,6 @@ pub fn connectServerLegacyHttp(
         return err;
     };
     var client_owned = true;
-    // A cancelled connection starts no further round trips, so it leaves the
-    // session for the server to expire instead of sending a DELETE while the
-    // connection lock is still held.
     errdefer if (client_owned) {
         if (attempt_control.cancellation().cancelled()) {
             initialized.client.deinitWithoutSessionTermination();
@@ -763,9 +756,7 @@ fn connectServerLegacy(
         control,
         server.config.startup_timeout_ms,
     );
-    // startAt always fixes the span.
     const span_ms = attempt_control.startup_span_ms.?;
-    // Runs before callers disconnect, while the latest launch is attached.
     errdefer publishRejectedOutput(alloc, server);
     var offered_version = initial_version;
     var last_exit: stdio_dispatcher.ChildDiagnostics = undefined;
@@ -774,7 +765,6 @@ fn connectServerLegacy(
         last_exit_ptr = rememberChildExit(server, &last_exit) orelse last_exit_ptr;
         server.disconnectForced();
         connection_control.check(io_mod.getIo(), attempt_control) catch |err| {
-            // The deadline passed between launches; keep the exit that used it up.
             if (err == error.McpRequestTimedOut) publishStartupTimeout(
                 alloc,
                 server,
@@ -921,8 +911,6 @@ fn connectionAttemptControl(control: ConnectionControl, configured_timeout_ms: u
 }
 
 fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const u8) !void {
-    // Process exit waits for this launch to register its child, including any
-    // docker cleanup, before it kills every child.
     try stdio_dispatcher.beginChildLaunch();
     defer stdio_dispatcher.endChildLaunch();
     const generation = allocateGeneration();
@@ -1101,10 +1089,6 @@ fn connectServerBounded(
             operation,
         ) catch |err| {
             server.tool_catalog.deinit(alloc);
-            // A cancelled startup has no session state to flush; kill the
-            // child immediately so shutdown cannot stall in grace windows.
-            // Cancellation is the owner stopping this connection, not a
-            // startup failure, so it never earns a restart.
             if (err == error.Cancelled) {
                 server.disconnectImmediate();
                 return err;
@@ -1114,7 +1098,6 @@ fn connectServerBounded(
                     alloc,
                     server,
                     startupTimeoutLimit(
-                        // withStartupSpan always fixes the span.
                         operation.startup_span_ms.?,
                         server.config.startup_timeout_ms,
                         startupDeadlineSpent(operation),
@@ -1304,7 +1287,6 @@ fn formatStartupFailure(arena: Allocator, failure: StartupFailure) ![]const u8 {
         .rejected_output => |rejected| {
             try writer.writeAll("MCP server wrote output that is not an MCP message before completing startup");
             var line = try withoutAnsi(arena, rejected.line.slice());
-            // A secret cut at the capture limit is too short to be masked.
             if (rejected.line.truncated) line = withoutTrailingWord(line);
             const text = try displayPlain(arena, line);
             if (text.len > 0) try writer.print(": {s}", .{text});
@@ -1349,10 +1331,6 @@ fn displayStderr(arena: Allocator, capture: *const stdio_dispatcher.StderrCaptur
     if (!capture.omitted) {
         return displayPlain(arena, try withoutAnsi(arena, try std.mem.concat(arena, u8, &.{ capture.headSlice(), capture.tailSlice() })));
     }
-    // Strip each side on its own so an escape sequence cut at the gap cannot
-    // swallow the start of the tail. Then drop the words cut by the gap: a
-    // secret split there is too short to be masked. Cutting at ASCII
-    // whitespace also starts the tail on a UTF-8 boundary.
     const joined = try std.mem.concat(arena, u8, &.{
         withoutTrailingWord(try withoutAnsi(arena, capture.headSlice())),
         " ... ",
@@ -1471,7 +1449,6 @@ test "startup failure shows the stdout line fx rejected" {
         "MCP server wrote output that is not an MCP message before completing startup",
         try formatStartupFailure(arena, .{ .rejected_output = .{ .line = &blank, .stderr = &silent } }),
     );
-    // A secret cut at the capture limit is dropped rather than shown in part.
     var cut = testRejectedOutput("token=abcdefghijklmnop");
     cut.truncated = true;
     try std.testing.expectEqualStrings(
@@ -1510,7 +1487,6 @@ test "startup timeout names its limit and the most useful stderr" {
         "MCP server did not complete startup within 50 ms (startup_timeout_ms)",
         try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 50, .names_setting = true }, .earlier_exit = null, .live = &blank } }),
     );
-    // A shorter caller deadline set the limit, so the setting is not named.
     try std.testing.expectEqualStrings(
         "MCP server did not complete startup within 12345 ms",
         try formatStartupFailure(arena, .{ .timed_out = .{ .limit = .{ .ms = 12_345, .names_setting = false }, .earlier_exit = null, .live = &silent } }),
@@ -1518,15 +1494,10 @@ test "startup timeout names its limit and the most useful stderr" {
 }
 
 test "startup timeout names the limit that ran out" {
-    // An ordinary startup: the deadline and the request cap are the same limit.
     try expectTimeoutLimit(.{ .ms = 30_000, .names_setting = true }, startupTimeoutLimit(30_000, 30_000, true));
     try expectTimeoutLimit(.{ .ms = 30_000, .names_setting = true }, startupTimeoutLimit(30_000, 30_000, false));
-    // A crash-recovery relaunch keeps the tool call's longer deadline, so a
-    // hung request is stopped by the configured cap first.
     try expectTimeoutLimit(.{ .ms = 30_000, .names_setting = true }, startupTimeoutLimit(60_000, 30_000, false));
-    // Slow exits used up the tool call's deadline instead.
     try expectTimeoutLimit(.{ .ms = 60_000, .names_setting = false }, startupTimeoutLimit(60_000, 30_000, true));
-    // A shorter caller deadline ran out before the configured cap.
     try expectTimeoutLimit(.{ .ms = 2_000, .names_setting = false }, startupTimeoutLimit(2_000, 30_000, true));
 }
 
@@ -1563,11 +1534,9 @@ test "server stderr display keeps the first line and the end, bounded and masked
     hostile.append("\x98\xa9ok \xff caf\xc3\xa9\x1b]0;title\x07\n\n\t done\x07");
     try std.testing.expectEqualStrings("\\x98\\xa9ok \\xff caf\xc3\xa9 done\\x07", try displayStderr(arena, &hostile));
 
-    // The retained tail starts with the second byte of a cut character.
     var split = testOmittedCapture("head\n", "\xa9 tail");
     try std.testing.expectEqualStrings("head ... tail", try displayStderr(arena, &split));
 
-    // Neither half of a secret cut by the omitted gap is shown.
     var cut_secret = testOmittedCapture("auth failed: Bearer abcdefgh", "ijklmnopqrstuvwxyz rejected\n");
     const cut_display = try displayStderr(arena, &cut_secret);
     try std.testing.expect(std.mem.startsWith(u8, cut_display, "auth failed: Bearer"));
@@ -1575,7 +1544,6 @@ test "server stderr display keeps the first line and the end, bounded and masked
     try std.testing.expect(std.mem.find(u8, cut_display, "abcdefgh") == null);
     try std.testing.expect(std.mem.find(u8, cut_display, "ijklmnop") == null);
 
-    // An escape sequence cut at the gap cannot swallow the start of a token.
     const token = "ghp_" ++ text_utils.repeat("a1b2c3d4e5", 4);
     var cut_escape = testOmittedCapture("log line \x1b[ ", "xx " ++ token ++ " rejected\n");
     const escape_display = try displayStderr(arena, &cut_escape);

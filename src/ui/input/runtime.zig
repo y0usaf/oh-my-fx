@@ -2125,18 +2125,14 @@ test "input escape parser recognizes unmodified kitty Escape" {
     try expectEscapeAction("[27;1:1u", .escape);
     try expectEscapeAction("[27;1:2u", .escape);
     try expectEscapeAction("[27;1:3u", .ignore);
-    // Ghostty with Num Lock active sends modifier 128 (bit 7).
     try expectEscapeAction("[27;129u", .escape);
     try expectEscapeAction("[27;129:1u", .escape);
-    // Caps Lock (bit 6) should also be ignored.
     try expectEscapeAction("[27;65u", .escape);
     try expectEscapeAction("[27;65:1u", .escape);
 }
 
 test "input escape parser resolves unmodified kitty Backspace to a delete byte" {
-    // Plain Backspace under the Kitty protocol is single-parameter ESC[127u.
     try expectEscapeAction("[127u", .{ .remapped_byte = 127 });
-    // Modifier param is bitmask+1: ;1 = none, ;3 = Alt, ;9 = Super.
     try expectEscapeAction("[127;1u", .{ .remapped_byte = 127 });
     try expectEscapeAction("[127;3u", .delete_word_left);
     try expectEscapeAction("[127;9u", .delete_to_line_start);
@@ -2147,7 +2143,6 @@ test "input escape parser resolves unmodified kitty Backspace to a delete byte" 
 }
 
 test "input escape parser resolves unmapped single-parameter CSI u to ignore" {
-    // A null result would leave the leading ESC's pending-cancel armed.
     try expectEscapeAction("[49u", .ignore);
     try expectEscapeAction("[111u", .ignore);
 }
@@ -2161,11 +2156,9 @@ test "input escape parser preserves modified arrow intent" {
 }
 
 test "input escape parser maps kitty keypad keys to their main-row characters" {
-    // Kitty reports keypad keys as dedicated codes: KP_0..KP_9 = 57399-57408.
     try expectEscapeAction("[57399u", .{ .remapped_byte = '0' });
     try expectEscapeAction("[57408u", .{ .remapped_byte = '9' });
     try expectEscapeAction("[57400;1u", .{ .remapped_byte = '1' });
-    // Num Lock (bit 7) is a lock state, not a modifier.
     try expectEscapeAction("[57400;129u", .{ .remapped_byte = '1' });
     try expectEscapeAction("[57409u", .{ .remapped_byte = '.' });
     try expectEscapeAction("[57410u", .{ .remapped_byte = '/' });
@@ -2173,8 +2166,6 @@ test "input escape parser maps kitty keypad keys to their main-row characters" {
     try expectEscapeAction("[57412u", .{ .remapped_byte = '-' });
     try expectEscapeAction("[57413u", .{ .remapped_byte = '+' });
     try expectEscapeAction("[57415u", .{ .remapped_byte = '=' });
-    // Shift keeps the character; the main row has no text for the other
-    // modifiers, and Hyper/Meta must not start typing digits either.
     try expectEscapeAction("[57412;2u", .{ .remapped_byte = '-' });
     try expectEscapeAction("[57410;3u", .ignore);
     try expectEscapeAction("[57410;5u", .ignore);
@@ -2211,21 +2202,16 @@ test "input escape parser keeps keypad Enter, navigation, and Delete contracts" 
     try expectEscapeAction("[3;5~", .delete_word_right);
     try expectEscapeAction("[57426;9u", .delete_to_line_end);
     try expectEscapeAction("[3;9~", .delete_to_line_end);
-    // Keypad keys with no main-row equivalent stay unmapped.
     try expectEscapeAction("[57416u", .ignore);
     try expectEscapeAction("[57425u", .ignore);
     try expectEscapeAction("[57427u", .ignore);
 }
 
 test "input escape parser resolves keypad keys reported with an event type" {
-    // Ghostty can append the Kitty event type as a colon-qualified modifier.
     try expectEscapeAction("[57412;1:1u", .{ .remapped_byte = '-' });
     try expectEscapeAction("[57412;1:2u", .{ .remapped_byte = '-' });
     try expectEscapeAction("[57412;1:3u", .ignore);
-    // A multi-digit event type stays non-actionable instead of collapsing to
-    // its last digit.
     try expectEscapeAction("[57412;1:12u", .ignore);
-    // A colon-qualified report with no event type is not a press.
     try expectEscapeAction("[57412;1:0u", .ignore);
     try expectEscapeAction("[57414;1:0u", .ignore);
     try expectEscapeAction("[57410;1:1u", .{ .remapped_byte = '/' });
@@ -2234,7 +2220,6 @@ test "input escape parser resolves keypad keys reported with an event type" {
 }
 
 test "input escape parser decodes application-keypad SS3 keys" {
-    // A terminal left in keypad application mode reports `ESC O <byte>`.
     try expectEscapeAction("Op", .{ .remapped_byte = '0' });
     try expectEscapeAction("Oq", .{ .remapped_byte = '1' });
     try expectEscapeAction("Ox", .{ .remapped_byte = '8' });
@@ -2247,14 +2232,12 @@ test "input escape parser decodes application-keypad SS3 keys" {
     try expectEscapeAction("Oo", .{ .remapped_byte = '/' });
     try expectEscapeAction("OM", .{ .remapped_byte = '\r' });
     try expectEscapeAction("OX", .{ .remapped_byte = '=' });
-    // Arrows, Home, and End keep their existing SS3 mapping.
     try expectEscapeAction("OA", .cursor_up);
     try expectEscapeAction("OB", .cursor_down);
     try expectEscapeAction("OC", .cursor_right);
     try expectEscapeAction("OD", .cursor_left);
     try expectEscapeAction("OH", .home);
     try expectEscapeAction("OF", .end);
-    // F1-F4 and the keypad bytes with no main-row equivalent stay unmapped.
     try expectEscapeAction("OP", .ignore);
     try expectEscapeAction("OQ", .ignore);
     try expectEscapeAction("OR", .ignore);
@@ -2277,7 +2260,7 @@ test "input escape parser preserves double escape meta behavior" {
     var param: u16 = 0;
     var param2: u16 = 0;
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, 0x1b));
-    stage = 0; // timeout/reset between escape sequences clears Meta intent
+    stage = 0;
     stage = 1;
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
     try std.testing.expectEqual(@as(?InputEscapeAction, .cursor_up), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
@@ -2922,7 +2905,6 @@ test "input escape parser handles shift+tab sequences" {
 }
 
 test "input escape parser handles modifyOtherKeys shift+enter sequence" {
-    // ESC[27;2;13~ — modifyOtherKeys format for Shift+Enter
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3094,7 +3076,6 @@ test "input escape parser rearms on fresh escape after incomplete sequence" {
 }
 
 test "input escape parser handles ctrl+c csi u sequence" {
-    // ESC[99;5u — Kitty protocol for Ctrl+C (keycode 99='c', modifier 5=ctrl+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3113,7 +3094,6 @@ test "input escape parser handles ctrl+c csi u sequence" {
 }
 
 test "input escape parser handles ctrl+v csi u sequence" {
-    // ESC[118;5u — Kitty protocol for Ctrl+V (keycode 118='v', modifier 5=ctrl+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3171,7 +3151,6 @@ test "input escape parser ignores meta o" {
 }
 
 test "input escape parser rejects ctrl meta o csi u sequence" {
-    // ESC[111;7u is Ctrl+Meta+O. It must not reach the Ctrl-O action.
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3182,7 +3161,6 @@ test "input escape parser rejects ctrl meta o csi u sequence" {
 }
 
 test "input escape parser handles modifyOtherKeys ctrl o" {
-    // ESC[27;5;111~ is modifyOtherKeys Ctrl+O.
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3559,7 +3537,6 @@ test "input escape parser handles ESC f as word_right" {
 }
 
 test "input escape parser handles alt+arrow as word jump" {
-    // ESC[1;3D — Alt+Left
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3570,7 +3547,6 @@ test "input escape parser handles alt+arrow as word jump" {
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.word_left, false)), consumeInputEscapeByte(&stage, &param, &param2, 'D'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[1;3C — Alt+Right
     stage = 1;
     param = 0;
     param2 = 0;
@@ -3586,7 +3562,6 @@ test "input escape parser handles double-ESC as meta prefix for arrows" {
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
-    // ESC ESC [ A — Option+Up on terminals that send Meta as ESC prefix
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, 0x1b));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.paragraph_up, false)), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
@@ -3620,7 +3595,6 @@ test "input escape parser handles ESC 0x08 as delete_word_left" {
 }
 
 test "input escape parser handles alt+delete as delete_word_right" {
-    // ESC[3;3~ — Alt+Forward-Delete
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3853,7 +3827,6 @@ test "deleteWordRight removes the next word from input" {
 }
 
 test "input escape parser handles alt+backspace (kitty) as delete_word_left" {
-    // ESC[127;3u — Kitty protocol for Alt+Backspace (keycode 127, modifier 3=alt+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3868,7 +3841,6 @@ test "input escape parser handles alt+backspace (kitty) as delete_word_left" {
 }
 
 test "input escape parser handles cmd+backspace as delete_to_line_start" {
-    // ESC[127;9u — Kitty protocol for Cmd+Backspace (keycode 127, modifier 9=super+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3883,7 +3855,6 @@ test "input escape parser handles cmd+backspace as delete_to_line_start" {
 }
 
 test "input escape parser handles cmd+fn+delete as delete_to_line_end" {
-    // ESC[3;9~ — CSI for Cmd+Forward-Delete (keycode 3, modifier 9=super+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4807,7 +4778,6 @@ test "composer insertion inserts at cursor and advances" {
 }
 
 test "input escape parser handles cmd+arrow as home/end" {
-    // ESC[1;9D — Cmd+Left (modifier 9=super+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4818,7 +4788,6 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.line_start, false)), consumeInputEscapeByte(&stage, &param, &param2, 'D'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[1;9C — Cmd+Right
     stage = 1;
     param = 0;
     param2 = 0;
@@ -4829,7 +4798,6 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.line_end, false)), consumeInputEscapeByte(&stage, &param, &param2, 'C'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[1;9A — Cmd+Up
     stage = 1;
     param = 0;
     param2 = 0;
@@ -4840,7 +4808,6 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.draft_start, false)), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[1;9B — Cmd+Down
     stage = 1;
     param = 0;
     param2 = 0;
@@ -4853,7 +4820,6 @@ test "input escape parser handles cmd+arrow as home/end" {
 }
 
 test "input escape parser treats ctrl+enter as ordinary submit" {
-    // ESC[13;5u is Kitty's Ctrl+Enter encoding.
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4867,7 +4833,6 @@ test "input escape parser treats ctrl+enter as ordinary submit" {
 }
 
 test "input escape parser handles cmd+r as all-session resume picker" {
-    // ESC[114;9u - Kitty protocol for Cmd+R (keycode 'r'=114, modifier 9=super+1)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4882,7 +4847,6 @@ test "input escape parser handles cmd+r as all-session resume picker" {
 }
 
 test "input escape parser handles ctrl+a/ctrl+e via kitty protocol" {
-    // ESC[97;5u is Kitty's Ctrl+A encoding.
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4895,7 +4859,6 @@ test "input escape parser handles ctrl+a/ctrl+e via kitty protocol" {
     try std.testing.expectEqual(@as(?InputEscapeAction, .{ .remapped_byte = 1 }), ctrl_a);
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[101;5u is Kitty's Ctrl+E encoding.
     stage = 1;
     param = 0;
     param2 = 0;
@@ -4911,7 +4874,6 @@ test "input escape parser handles ctrl+a/ctrl+e via kitty protocol" {
 }
 
 test "input escape parser handles ctrl+arrow as word jump" {
-    // ESC[1;5D — Ctrl+Left
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4922,7 +4884,6 @@ test "input escape parser handles ctrl+arrow as word jump" {
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.word_left, false)), consumeInputEscapeByte(&stage, &param, &param2, 'D'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[1;5C — Ctrl+Right
     stage = 1;
     param = 0;
     param2 = 0;

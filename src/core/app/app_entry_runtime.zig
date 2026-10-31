@@ -256,8 +256,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             error.NoReadableSessions => {
-                // The unreadable sessions can belong to any workspace, so only
-                // the absence of a readable one is tied to this workspace.
                 writeStderr(deps, "fx: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n");
                 return .{ .exit = 1 };
             },
@@ -296,7 +294,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             else => {
-                // v2 names a storage fault (D29); v1 reports it as it always has.
                 if (session_adapter.enabled(launch.modifiers.sessions_v2)) {
                     if (v2StorageFaultMessage(err)) |message| {
                         writeStderr(deps, message);
@@ -394,7 +391,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             var argc: usize = 0;
             argv[argc] = request.executablePath();
             argc += 1;
-            // A v2 session resumes only with the flag that saved it.
             if (handoff.sessions_v2) {
                 argv[argc] = cli_surface.sessions_v2_arg;
                 argc += 1;
@@ -1452,7 +1448,6 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
         try std.testing.expectEqualStrings(case.message, capture.stderr.written());
     }
 
-    // Without the flag, v1 reports the bare error name as before.
     if (session_adapter.enabled(false)) return error.SkipZigTest;
     var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();

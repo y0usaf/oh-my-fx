@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-#
-# Startup latency benchmarks for fx.
-#
-# Measures wall-clock time for common CLI commands using hyperfine.
-# Results are written to benchmarks/results/ in JSON format for CI consumption.
-#
-# Usage:
-#   ./benchmarks/startup.sh              # run all benchmarks
-#   ./benchmarks/startup.sh --quick      # fewer iterations (20 runs)
-#   ./benchmarks/startup.sh --ci         # CI settings (100 runs, skip build)
-#
-# Requires: hyperfine (https://github.com/sharkdp/hyperfine)
 
 set -euo pipefail
 
@@ -80,8 +68,6 @@ echo "binary: $FX_BIN"
 echo "runs:   $RUNS (warmup: $WARMUP)"
 echo ""
 
-# Baseline: process launch floor on this host. This is reported for context;
-# the budget checker still enforces each fx command's raw wall-clock mean.
 echo "--- process baseline ---"
 HOME="$GENERAL_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \
@@ -93,7 +79,6 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 0: fx startup (CLI dispatch, no TTY needed)
 echo "--- fx (startup) ---"
 HOME="$GENERAL_FIXTURE_HOME" FX_BENCH=1 hyperfine \
   "${SHELL_OPTS[@]}" \
@@ -105,7 +90,6 @@ HOME="$GENERAL_FIXTURE_HOME" FX_BENCH=1 hyperfine \
 
 echo ""
 
-# Benchmark 1: fx help (minimal startup path)
 echo "--- fx help ---"
 HOME="$GENERAL_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \
@@ -117,7 +101,6 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 2: fx status --json (config load + JSON serialize)
 echo "--- fx status --json ---"
 HOME="$GENERAL_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \
@@ -129,7 +112,6 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 3: fx doctor --json (system checks)
 echo "--- fx doctor --json ---"
 HOME="$GENERAL_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \
@@ -141,7 +123,6 @@ HOME="$GENERAL_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Benchmark 4: fx sessions --json (file I/O path)
 echo "--- fx sessions --json ---"
 HOME="$SESSION_FIXTURE_HOME" hyperfine \
   "${SHELL_OPTS[@]}" \
@@ -153,7 +134,6 @@ HOME="$SESSION_FIXTURE_HOME" hyperfine \
 
 echo ""
 
-# Combine results into a single summary for CI
 echo "--- summary ---"
 python3 "${REPO_ROOT}/benchmarks/summarize.py"
 python3 "${REPO_ROOT}/benchmarks/check_budgets.py"

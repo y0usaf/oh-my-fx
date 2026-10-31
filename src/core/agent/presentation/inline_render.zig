@@ -115,16 +115,8 @@ fn tokenize(
     var i: usize = 0;
     var literal_start: usize = 0;
     var link_admission_suppressed_until: usize = 0;
-    // Every bracket construct starting at `i` ends at the first `]` at or
-    // after `i`, so that position is found once and shared: a `[` whose `]`
-    // is not followed by `(` cannot be a link or image, and a footnote label
-    // ends there too. Without this every `[` in a long run rescans to the
-    // same `]`.
     const last_close_bracket = std.mem.findScalarLast(u8, text, ']');
     var next_close_bracket: ?usize = null;
-    // End of the most recent delimiter run that can open emphasis. A bare URL
-    // may follow such a run directly, and the tokenizer owns that decision
-    // rather than a second flanking rule inside the URL parser.
     var opening_delimiter_end: usize = 0;
 
     while (i < text.len) {
@@ -144,7 +136,6 @@ fn tokenize(
                 literal_start = i;
                 continue;
             }
-            // A backtick run without a partner is literal text.
             i += backtickRunLength(text, i);
             continue;
         }
@@ -300,7 +291,6 @@ fn delimiterAt(text: []const u8, start: usize, end: usize) ?Delimiter {
     var can_open = left_flanking;
     var can_close = right_flanking;
     if (marker == '_') {
-        // Intraword underscores never delimit, so snake_case stays literal.
         can_open = left_flanking and (!right_flanking or before_punct);
         can_close = right_flanking and (!left_flanking or after_punct);
     }
@@ -352,8 +342,6 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
     var stack: std.ArrayList(StackEntry) = .empty;
     defer stack.deinit(alloc);
     var next_seq: u32 = 1;
-    // Sequence number of the top entry when a search for this closer kind
-    // last failed; entries at or below it stay unusable for that kind.
     var openers_bottom: [3][2][3]u32 = @splat(@splat(@splat(0)));
 
     for (tokens, 0..) |*token, token_index| {
@@ -364,9 +352,6 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
 
         if (closer.can_close) {
             const bottom = &openers_bottom[markerSlot(closer.marker)][@intFromBool(closer.can_open)][closer.orig_len % 3];
-            // Each part of the closer runs its own search: once a match pops
-            // the stack, the remainder searches again from the new top, and a
-            // failed remainder is cached like any other failed search.
             var matched_in_search = false;
             var depth = stack.items.len;
             while (closer.remaining > 0 and depth > 0) {
@@ -394,7 +379,6 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
                 opener.remaining -= use_len;
                 closer.remaining -= use_len;
 
-                // Everything above the opener sat between the pair.
                 const keep = if (opener.remaining == 0) depth else depth + 1;
                 stack.shrinkRetainingCapacity(keep);
                 depth = stack.items.len;
@@ -495,8 +479,6 @@ fn emitStyle(alloc: Allocator, out: *std.ArrayList(u8), style: Style, opening: b
     depth[slot] -= 1;
     if (!visible) return;
     try out.appendSlice(alloc, close_seq);
-    // Closing an inner span must not switch off an enclosing span of the
-    // same style.
     if (depth[slot] > 0) try out.appendSlice(alloc, open_seq);
 }
 
@@ -543,7 +525,6 @@ fn emitInlineLink(
     try out.appendSlice(alloc, link.destination_prefix);
     try out.appendSlice(alloc, link.url);
     try out.appendSlice(alloc, "\x1b\\");
-    // Link text carries the theme's link color in addition to the underline.
     const link_style = shared_theme.current().link_style;
     try out.appendSlice(alloc, link_style);
     try out.appendSlice(alloc, ansi.underline_open);
@@ -722,7 +703,6 @@ const max_entity_name_len = 8;
 /// Decodes the HTML entities models commonly emit plus numeric references.
 fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
     if (start >= text.len or text[start] != '&') return null;
-    // Bound the terminator search so a line full of ampersands stays linear.
     const window_end = @min(text.len, start + 1 + max_entity_name_len + 1);
     const semicolon = std.mem.findScalarPos(u8, text[0..window_end], start + 1, ';') orelse return null;
     const name = text[start + 1 .. semicolon];
@@ -734,8 +714,6 @@ fn decodeEntity(text: []const u8, start: usize) ?DecodedEntity {
         const digits = if (hex) name[2..] else name[1..];
         if (digits.len == 0) return null;
         const value = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch return null;
-        // Control characters would reach the terminal as real control bytes,
-        // so the reference stays literal instead of decoding.
         if (value != 0 and (value < 0x20 or (value >= 0x7F and value <= 0x9F))) return null;
         codepoint = if (value == 0 or (value >= 0xD800 and value <= 0xDFFF)) 0xFFFD else value;
     } else {
@@ -863,8 +841,6 @@ fn codeSpanUrlEnd(content: []const u8) ?usize {
     else
         return null;
 
-    // Only a sentence-final period is excluded; other suffixes can be URI bytes
-    // in literal code, including _, *, ~, !, ?, ;, :, and ,.
     const end = if (content.len > scheme_len and content[content.len - 1] == '.')
         content.len - 1
     else
@@ -948,8 +924,6 @@ test "emphasis after a truncated UTF-8 sequence renders instead of panicking" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     var link_id: u32 = 0;
-    // The delimiter follows a three-byte lead with only one continuation
-    // byte, so the code point before the run has a mismatched length.
     try writeInline(alloc, "\xe4\x80*bold*", &out, false, null, &link_id);
     try std.testing.expect(std.mem.find(u8, out.items, "bold") != null);
 }

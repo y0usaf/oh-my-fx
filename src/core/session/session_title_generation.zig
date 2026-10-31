@@ -71,8 +71,6 @@ pub fn sanitizeGeneratedTitle(alloc: Allocator, raw: []const u8) !?[]u8 {
     const trimmed = std.mem.trim(u8, first_line, " \t\r\"'`");
     if (trimmed.len == 0) return null;
 
-    // Cap before the strip loop so assume-capacity appends stay in bounds on
-    // unbounded model output.
     const bounded = capUtf8(trimmed, max_generated_title_bytes);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -434,7 +432,6 @@ test "promptExcerpt caps on a UTF-8 boundary" {
     const wide = try alloc.alloc(u8, max_prompt_excerpt_bytes + 2);
     defer alloc.free(wide);
     @memset(wide, 0);
-    // Fill with 2-byte codepoints so the raw byte cap lands mid-sequence.
     for (0..wide.len / 2) |index| {
         wide[index * 2] = 0xc3;
         wide[index * 2 + 1] = 0xa9;
@@ -487,8 +484,6 @@ test "sanitizeGeneratedTitle enforces the byte cap on a UTF-8 boundary" {
 
 test "sanitizeGeneratedTitle bounds oversized single-line model output" {
     const alloc = std.testing.allocator;
-    // A pathological title response can emit several KB on one line; the cap
-    // must hold without overrunning the pre-sized strip buffer.
     const oversized = text_utils.repeat("x", 4096);
     const capped = (try sanitizeGeneratedTitle(alloc, oversized)).?;
     defer alloc.free(capped);

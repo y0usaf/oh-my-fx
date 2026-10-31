@@ -146,7 +146,6 @@ pub fn activityBlinkVisible(stream: StreamState, now_ms: i64) ?bool {
 
 fn appendTurnElapsedSuffix(writer: *std.Io.Writer, stream: StreamState, now_ms: i64) !void {
     if (stream.turn_started_ms <= 0 or now_ms < stream.turn_started_ms) return;
-    // One displayed second spans exactly one on/off blink period.
     const ms_per_second = 2 * activity_blink_half_period_ms;
     const seconds = @divTrunc(turnClockNow(stream, now_ms) - stream.turn_started_ms, ms_per_second);
     try writer.writeAll(" (");
@@ -190,11 +189,8 @@ pub fn syncWaitingClock(stream: *StreamState, waiting: bool, now_ms: i64) void {
     stream.waiting_since_ms = 0;
 }
 
-// Width of the "• " marker every other activity row carries.
 const marker_indent = "  ";
 
-// The completed turn summary occupies the same marker column without retaining
-// the active phase label or blink.
 pub fn buildCompletedTurnLabel(buf: []u8, stream: StreamState) []const u8 {
     const progress = stream.token_progress;
     if (progress.input_tokens == 0 and progress.output_tokens == 0) return marker_indent;
@@ -381,7 +377,6 @@ test "buildTurnLabel renders elapsed seconds for the running turn" {
 
 test "buildTurnLabel renders elapsed minutes and seconds for long turns" {
     var buf: [64]u8 = undefined;
-    // 1080s of blink periods elapsed → 18m0s instead of a raw second count.
     const label = buildTurnLabel(&buf, .{
         .active = true,
         .turn_started_ms = 1_000,
@@ -391,7 +386,6 @@ test "buildTurnLabel renders elapsed minutes and seconds for long turns" {
 
 test "buildTurnLabel renders elapsed hours for very long turns" {
     var buf: [64]u8 = undefined;
-    // 3663s → 1h1m3s.
     const label = buildTurnLabel(&buf, .{
         .active = true,
         .turn_started_ms = 1_000,

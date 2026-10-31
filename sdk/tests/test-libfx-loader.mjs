@@ -39,7 +39,6 @@ await writeFile(highLevelAgentPath, `
   export function createFxEngine() { throw new Error("high-level createFxEngine invoked"); }
 `);
 
-// Complete the fixture directory before a runtime caches its module-resolution entries.
 const coreOnlyPath = resolve(dir, "core-only.mjs");
 await writeFile(coreOnlyPath, `
   export const libfxApiVersion = 4;

@@ -48,7 +48,6 @@ pub fn startUrl(alloc: std.mem.Allocator, bridge_origin: []const u8, authorize: 
     const state = param(query, "state") orelse return null;
     const challenge = param(query, "code_challenge") orelse return null;
     const client = param(query, "client_id") orelse return null;
-    // All three are already encoded for a query, as MCP-v2 wrote them.
     return try alloc.print("{s}/api/slack/auth?state={s}&challenge={s}&client_id={s}&scope={s}&port={d}", .{
         bridge_origin, state, challenge, client, scopes_query, port,
     });

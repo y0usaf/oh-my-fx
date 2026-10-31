@@ -289,7 +289,6 @@ test "session last skips a legacy child identified only by its first event" {
         .subagent_child = true,
     });
 
-    // `fx session last` names the session `--resume last` opens, not the child.
     var latest = try latestVisibleWorkspaceSummary(store, alloc);
     defer latest.deinit(alloc);
     try std.testing.expectEqualStrings("parent", latest.id);

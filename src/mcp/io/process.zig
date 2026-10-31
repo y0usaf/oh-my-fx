@@ -207,7 +207,7 @@ pub const Process = struct {
         while (true) {
             const posted = p.queue.getOne(p.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
-                error.Closed => unreachable, // only deinit closes the queue
+                error.Closed => unreachable,
             };
             if (posted == .wake) {
                 if (posted.wake == p.wake_id and timeout_ms != null) return .timeout;
@@ -298,7 +298,6 @@ pub const Process = struct {
                 .ready => {},
                 .lost => {
                     result.lost = true;
-                    // The process is gone, so its stdin is too.
                     if (p.stdin) |file| file.close(p.io);
                     p.stdin = null;
                 },
@@ -316,14 +315,12 @@ pub const Process = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
-            // A new process group, led by the server.
             .pgid = 0,
         });
         const pid = child.id.?;
         p.pid_lock.lockUncancelable(p.io);
         p.pid = pid;
         p.pid_lock.unlock(p.io);
-        // Started after `signalAllForExit` went through the list.
         if (everyone.exiting.load(.seq_cst)) p.signal(.term);
         p.stdin = child.stdin;
         errdefer p.stopSpawned(child.stdout.?, child.stderr.?);
@@ -353,8 +350,6 @@ pub const Process = struct {
             .term => .TERM,
             .kill => .KILL,
         };
-        // The whole group while its leader is unreaped, so the group id
-        // can't have been reused. If that fails, at least the server itself.
         std.posix.kill(-pid, sig) catch std.posix.kill(pid, sig) catch {};
     }
 
@@ -399,16 +394,12 @@ pub const Process = struct {
         defer line.deinit();
         while (true) {
             const got = lines.read(reader, &line, limit) catch return;
-            // An over-long stdout line is a connection error, and the
-            // server is about to be killed. Logs keep the start of the line.
             var at_end = got.at_end;
             if (got.too_long) switch (stream) {
                 .stdout => |g| return p.post(.{ .oversized = g }),
                 .stderr => at_end = lines.skipRest(reader) catch return,
             };
-            // At the end, a last stdout line without a newline is dropped.
             if (at_end and stream == .stdout) return;
-            // Empty lines are skipped.
             const bytes = got.bytes;
             if (bytes.len > 0 and stream == .stderr and p.options.stderr != null) {
                 const sink = p.options.stderr.?;
@@ -417,9 +408,6 @@ pub const Process = struct {
                 const owned = p.gpa.dupe(u8, bytes) catch return;
                 switch (stream) {
                     .stdout => |g| try p.post(.{ .line = .{ .generation = g, .bytes = owned } }),
-                    // Stderr is only logged and never blocks on the
-                    // queue, so a flood can't stall the server on a full pipe.
-                    // Lines that don't fit are counted in `stderr_dropped`.
                     .stderr => if ((p.queue.put(p.io, &.{.{ .stderr = owned }}, 0) catch 0) == 0) {
                         p.gpa.free(owned);
                         _ = p.stderr_dropped.fetchAdd(1, .monotonic);
@@ -434,7 +422,6 @@ pub const Process = struct {
         while (true) {
             p.pid_lock.lockUncancelable(p.io);
             const result = std.c.waitpid(pid, null, std.c.W.NOHANG);
-            // -1 means the pid is no longer ours to wait for; treat it as gone.
             const gone = result == pid or result == -1;
             if (gone) p.pid = null;
             p.pid_lock.unlock(p.io);
@@ -488,7 +475,6 @@ test "messages arrive, and a stop that closes stdin ends the server" {
 }
 
 test "a server starts in the directory it's given" {
-    // The server names its directory as a notification's method.
     const argv = shell("printf '{\"jsonrpc\":\"2.0\",\"method\":\"%s\"}\\n' \"$(pwd -P)\"; exec cat >/dev/null");
     var p: Process = undefined;
     initTest(&p, &argv);
@@ -502,9 +488,6 @@ test "a server starts in the directory it's given" {
 }
 
 test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignores that too" {
-    // The shell runs its TERM trap only once its `sleep` returns, so the one
-    // that exits on SIGTERM gets a long window: a slow machine still sees it
-    // exit before SIGKILL. The one that ignores SIGTERM keeps the short one.
     inline for (.{ .{ "trap 'exit 0' TERM; while :; do sleep 0.02; done", false, 5_000 }, .{ "trap '' TERM; while :; do sleep 0.02; done", true, test_config.term_ms } }) |case| {
         const argv = shell(case[0]);
         var config = test_config;
@@ -522,7 +505,6 @@ test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignore
 
 test "signalAllForExit sends SIGTERM to every server at once, even one that starts after it" {
     defer everyone.exiting.store(false, .seq_cst);
-    // Only SIGTERM ends it: it never reads stdin.
     const argv = shell("trap 'exit 0' TERM; while :; do sleep 0.02; done");
     var running: Process = undefined;
     initTest(&running, &argv);
@@ -537,7 +519,6 @@ test "signalAllForExit sends SIGTERM to every server at once, even one that star
     try late.start();
     inline for (.{ &running, &late }) |p| {
         try expectState(p, .backoff);
-        // The signal came from the exit, not from a stop.
         try testing.expect(!p.conn.term_sent);
     }
 }
@@ -549,7 +530,6 @@ test "a crashing server backs off, restarts on demand, then fails at the limit" 
     defer p.deinit();
     try p.start();
     try expectState(&p, .backoff);
-    // The dead process's stdin was closed, so restarts don't leak descriptors.
     try testing.expect(p.stdin == null);
     try expectState(&p, .idle);
     try p.start();
@@ -578,7 +558,6 @@ test "a spawn that works clears the last spawn error" {
     defer p.deinit();
     try p.start();
     try testing.expect(p.spawn_error != null);
-    // The command appears, as one npx is still installing would.
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = "#!/bin/sh\nexec cat >/dev/null\n", .flags = .{ .permissions = .executable_file } });
     try expectState(&p, .idle);
     try p.start();
@@ -619,8 +598,6 @@ test "stderr lines reach the host and never change the state" {
 }
 
 test "a stop signals the server's whole process group, so its children stop too" {
-    // The shell ignores closed stdin, so the stop escalates to SIGTERM. Its
-    // child sleep must die with it.
     const argv = shell("sleep 30 & echo $! >&2; wait");
     var p: Process = undefined;
     initTest(&p, &argv);

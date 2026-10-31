@@ -1,12 +1,3 @@
-// Exhaustive TLC checks of ProviderAuth, grouped by the pull request that
-// added each provider's credential edge.
-//
-//   bun tests/tla/drivers/provider_auth/run-all.ts <report-dir> [1210|1211|1212]...
-//
-// Each check fixes the model's constants and names the verdict every property
-// must reach. Designs the code implements must HOLD; planted bugs must be
-// VIOLATED, which shows each property can fail. A check whose verdicts differ
-// from the expectation fails the run.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { checkModel, hashes, PROPERTIES, type Property, type Setup, type Verdict } from "./tlc";
@@ -24,8 +15,6 @@ const holdsAll = Object.fromEntries(PROPERTIES.map((p) => [p, "HOLDS"])) as Reco
 
 function refreshableChecks(pr: string, provider: "codex" | "grok"): Check[] {
   const checks: Check[] = corners.map(([expiring, rejecting]) => {
-    // Both requests carry the rejected token; the later 401 refreshes the
-    // credential it used, whose refresh token the first refresh already spent.
     const lateRetry = rejecting && !expiring;
     return {
       pr, name: `${provider}-one-engine-${expiring ? "expiring" : "fresh"}-${rejecting ? "rejecting" : "accepting"}`,
@@ -65,8 +54,6 @@ function refreshableChecks(pr: string, provider: "codex" | "grok"): Check[] {
   return checks;
 }
 
-// The follow-up fix: one agent's engines share a memory, and a 401 retries on
-// newer credentials before it refreshes.
 function fixedChecks(provider: "codex" | "grok"): Check[] {
   const fixed = { ...base, provider, sharedMemory: true, recheck: true };
   const checks: Check[] = [];

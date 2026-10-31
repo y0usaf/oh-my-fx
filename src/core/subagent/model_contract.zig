@@ -38,11 +38,6 @@ pub fn matchCatalogModel(
             return .{ .matched = try alloc.dupe(u8, id) };
         }
     }
-    // Confident matches contain the query verbatim (case-insensitive). Every
-    // fuzzyModelScore band that may resolve (prefix, substring, suffix after
-    // the provider slash) requires substring membership, while its weaker
-    // token and subsequence bands can reach the same numeric scores without
-    // it, so a score threshold alone would let scrambled paraphrases resolve.
     var confident_best: i32 = 0;
     var confident_count: usize = 0;
     var confident_id: ?[]const u8 = null;
@@ -326,11 +321,6 @@ pub fn requestFingerprint(request: Request) [32]u8 {
             hash.update(value.message);
         },
     }
-    // Overrides extend the identity only when present so that override-less
-    // requests keep their pre-override fingerprints in persisted registries.
-    // The leading NUL is unambiguous: validated request text never contains
-    // NUL, so the override section cannot be confused with task or message
-    // content.
     const override = request.override();
     if (override.present()) {
         hash.update("\x00\x01");
@@ -478,7 +468,6 @@ test "creation overrides validate and participate in operation identity" {
     try std.testing.expectEqualStrings("medium", routed.run.effort.?.label());
     try std.testing.expect(plain.override().present() == false);
     try std.testing.expect(routed.override().present());
-    // Override-less requests keep their pre-override fingerprint.
     const plain_digest = requestFingerprint(plain);
     const expected_plain = comptime blk: {
         @setEvalBranchQuota(100_000);
@@ -545,8 +534,6 @@ test "model override catalog matching resolves, rejects, and suggests" {
 test "model override catalog matching never resolves token-only paraphrases" {
     const alloc = std.testing.allocator;
     const ids = [_][]const u8{ "openai/gpt-5.6-terra-fast", "anthropic/claude-fable-5.1" };
-    // Every query token appears in the target ID, but the query is not a
-    // substring of it: token-band scores must not resolve silently.
     const result = try matchCatalogModel(alloc, &ids, "gpt 5.6 terra fast");
     try std.testing.expectEqual(@as(usize, 1), result.unknown.len);
     try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", result.unknown[0]);
@@ -557,7 +544,6 @@ test "model override catalog matching never resolves token-only paraphrases" {
 test "model override catalog matching keeps weak matches as suggestions" {
     const alloc = std.testing.allocator;
     const ids = [_][]const u8{ "openai/gpt-6-astra", "openai/gpt-5.6-terra" };
-    // Subsequence-only scores never resolve silently; they become suggestions.
     const result = try matchCatalogModel(alloc, &ids, "ogpt");
     try std.testing.expectEqual(@as(usize, 2), result.unknown.len);
     try std.testing.expectEqualStrings("openai/gpt-6-astra", result.unknown[0]);

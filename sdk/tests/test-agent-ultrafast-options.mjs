@@ -34,8 +34,6 @@ const catalog = {
         },
       },
     },
-    // The capability must stay OpenAI-only even if another catalog entry
-    // advertises a positively priced tier with the same name.
     {
       id: "anthropic/gpt-6-astra",
       type: "language",
@@ -159,8 +157,6 @@ try {
     }
   };
 
-  // A catalog-verified OpenAI ultrafast model creates a session, advertises
-  // the ACP config option, and serializes the exclusive ultrafast provider route.
   {
     const gateway = mockGateway();
     const events = [];
@@ -183,7 +179,6 @@ try {
     }, events);
   }
 
-  // Unsupported catalog models reject during creation and never send a prompt.
   {
     const gateway = mockGateway();
     const events = [];
@@ -204,8 +199,6 @@ try {
     assert.deepEqual(events.filter((event) => event.type === "runtime.exit").map((event) => event.code), [0]);
   }
 
-  // Explicit false preserves the ordinary route and does not send ultrafast
-  // or fast provider options.
   {
     const gateway = mockGateway();
     await withAgent(gateway, {
@@ -222,7 +215,6 @@ try {
     });
   }
 
-  // A string model accepts the top-level option.
   {
     const gateway = mockGateway();
     await withAgent(gateway, { model: supportedModel, ultrafast: true }, async (agent) => {
@@ -233,7 +225,6 @@ try {
     });
   }
 
-  // False works with a string or omitted model without a creation-time fetch.
   for (const overrides of [
     { model: supportedModel, ultrafast: false },
     { ultrafast: false },
@@ -252,8 +243,6 @@ try {
     });
   }
 
-  // Omitted model means the kernel default, not automatic Ultra model selection.
-  // Neither an unsupported OpenAI model nor a priced non-OpenAI model can opt in.
   for (const [overrides, model] of [
     [{ ultrafast: true }, defaultModel],
     [{ model: "anthropic/gpt-6-astra", ultrafast: true }, "anthropic/gpt-6-astra"],
@@ -272,7 +261,6 @@ try {
     assert.deepEqual(events.filter((event) => event.type === "runtime.exit").map((event) => event.code), [0]);
   }
 
-  // Validation is strict on both option shapes and precedes runtime/transport.
   for (const overrides of [
     { model: supportedModel, ultrafast: 1 },
     { model: { id: supportedModel, ultrafast: "true" } },
@@ -288,8 +276,6 @@ try {
     assert.deepEqual(events, []);
   }
 
-  // Even false or an explicitly present undefined cannot mix a model object
-  // with top-level mode options; no precedence rule is invented for this shape.
   for (const overrides of [
     { model: { id: supportedModel }, ultrafast: true },
     { model: { id: supportedModel, ultrafast: true }, ultrafast: false },
@@ -306,8 +292,6 @@ try {
     assert.deepEqual(events, []);
   }
 
-  // Sol is eligible because its catalog has positive Ultra prices, including
-  // cache reads, not because of its name or an Astra-only allowlist.
   {
     const gateway = mockGateway();
     const events = [];
@@ -321,7 +305,6 @@ try {
     }, events);
   }
 
-  // Unconfirmed serving appends a warning to the streamed text.
   {
     const gateway = mockGateway(null);
     await withAgent(gateway, { model: supportedModel, ultrafast: true }, async (agent) => {
@@ -335,8 +318,6 @@ try {
     });
   }
 
-  // Both modes validate independently at creation. For a model supporting
-  // both, Ultra wins on the wire; disabling Ultra leaves explicit Fast intact.
   for (const ultrafast of [true, false]) {
     const gateway = mockGateway();
     await withAgent(gateway, { model: { id: solModel, fast: true, ultrafast } }, async (agent) => {

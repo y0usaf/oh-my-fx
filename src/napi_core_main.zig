@@ -32,7 +32,6 @@ const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
-// One attachment holds one prompt image or one kernel checkpoint, the larger.
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
 const max_inbound_attachments = 8;
 const max_inbound_attachment_bytes = 8 * 1024 * 1024;
@@ -40,7 +39,6 @@ const max_outbound_attachments = 4;
 const max_outbound_attachment_bytes = 8 * 1024 * 1024;
 const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
-// Matches types.ReasoningEffort.max_name_bytes.
 const max_effort_bytes = 64;
 const max_path_bytes = 16 * 1024;
 const max_url_bytes = 16 * 1024;
@@ -62,7 +60,6 @@ const ReadyNotifier = struct {
         errdefer for (pair) |fd| {
             _ = std.c.close(fd);
         };
-        // Darwin does not accept close-on-exec/nonblocking bits in socketpair's type.
         if (flags == 0) for (pair) |fd| {
             if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) != 0 or
                 std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true }))) != 0)
@@ -78,10 +75,8 @@ const ReadyNotifier = struct {
             if (written == 1) return;
             switch (std.posix.errno(written)) {
                 .INTR => continue,
-                // A full socket already has a wake pending; queue contents are authoritative.
                 .AGAIN => return,
                 else => {
-                    // Surface a broken notification channel as EOF instead of silently hanging.
                     _ = std.c.shutdown(self.writer, std.c.SHUT.WR);
                     return;
                 },
@@ -331,7 +326,6 @@ const AttachmentTable = struct {
         if (bytes.len > max_attachment_bytes or
             self.outbound.count() >= max_outbound_attachments or
             bytes.len > max_outbound_attachment_bytes - self.outbound_bytes) return error.AttachmentStoreFull;
-        // At most max_outbound_attachments ids are in use, so this ends quickly.
         var id = self.next_outbound;
         while (self.outbound.contains(id)) id = nextAttachmentId(id);
         self.next_outbound = nextAttachmentId(id);
@@ -372,7 +366,6 @@ const FetchBridge = struct {
     response: std.ArrayList(u8) = .empty,
     response_offset: usize = 0,
     phase: fetch_state.Phase = .idle,
-    // Logical consumption survives HTTP EOF, close, and normal runtime shutdown.
     last_consumed_handle: ?fetch_state.Handle = null,
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
@@ -421,7 +414,6 @@ const FetchBridge = struct {
         defer writer.deinit();
         try std.json.Stringify.value(request, .{}, &writer.writer);
         const metadata = writer.writer.buffered();
-        // The body travels raw beside its metadata, and both share one budget.
         if (metadata.len > max_fetch_request_bytes - body.len) return error.HostStreamBackpressure;
         self.clearPendingRequest();
         try self.request.appendSlice(std.heap.c_allocator, metadata);
@@ -492,10 +484,6 @@ const FetchBridge = struct {
             self.response.clearRetainingCapacity();
             self.response_offset = 0;
             if (terminal_kind != null) return 0;
-            // While no bytes arrive, the reader checks its request's cancel
-            // flag and deadline every pulse, so a cancel the core sets, such
-            // as a libfx steer cutting a reply short, does not wait for the
-            // model's next byte.
             self.wake.waitTimeout(io, &self.mutex, next_idle_wait) catch |err| switch (err) {
                 error.Timeout => return -3,
                 error.Canceled => return -2,
@@ -729,7 +717,6 @@ const Runtime = struct {
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
                 .provider_override = self.provider,
-                // The JS host adds provider credentials at its fetch edge.
                 .provider_auth_mode = .host_managed,
                 .configured_providers_json = self.configured_providers,
                 .model_override = self.model,
@@ -839,8 +826,6 @@ fn ensureThreadedIo() void {
     if (threaded_io_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
-        // Node.js owns the environment and may grow it at any time, which
-        // can move and free libc's array, so it is read at each use.
         io_mod.setLibcEnviron();
         threaded_io_state.store(2, .release);
         return;
@@ -987,7 +972,6 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidApiKey,
     };
     errdefer if (api_key) |value| alloc.free(value);
-    // The host authorizes every provider but Gateway, which needs its API key.
     const host_authorized = if (provider) |value| value != .gateway else false;
     if (api_key == null and !host_authorized) return error.InvalidApiKey;
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
@@ -1071,7 +1055,6 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
             else => return error.InvalidConfiguredProvider,
         };
         errdefer context.deinit(alloc);
-        // Saved sessions record the provider together with its binding.
         runtime.provider = provider.?.bind(context.registry) catch return error.InvalidConfiguredProvider;
         runtime.custom_context = context;
     }
@@ -1267,7 +1250,6 @@ fn takeCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.nap
     defer runtime.fetch.mutex.unlock(io);
     const decision = fetch_state.decide(runtime.fetch.phase, .take_request);
     if (decision.action != .applied) return nullValue(env);
-    // `request` is the JSON metadata record; `body` is the raw request body.
     var value: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_object(env, &value), "could not allocate fetch request")) return null;
     const request = bufferFromBytes(env, runtime.fetch.request.items, "could not allocate fetch request Buffer") orelse return null;

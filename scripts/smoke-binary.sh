@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Run a freshly built fx binary through quick commands. Each command must exit
-# zero, print to stdout, and leave stderr empty.
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then

@@ -911,8 +911,6 @@ test "bounded child identity reads stop at their limit" {
     });
     defer alloc.free(frame);
     try std.testing.expect(std.mem.endsWith(u8, frame, "}\n"));
-    // JSON whitespace keeps the padded event valid while pushing its newline
-    // past the limit.
     const limit: usize = 4096;
     const padded = try std.mem.concat(alloc, u8, &.{
         frame[0 .. frame.len - 2],
@@ -936,14 +934,12 @@ test "bounded child identity reads stop at their limit" {
     }
     var padded_file = try tmp.dir.openFile(io_mod.getIo(), "padded", .{});
     defer padded_file.close(io_mod.getIo());
-    // A limit of exactly the padded length decodes the whole event.
     try std.testing.expect(try readSubagentChildIdentityWithin(alloc, padded_file, padded.len));
     try std.testing.expectError(
         error.TruncatedEventFrame,
         readSubagentChildIdentityWithin(alloc, padded_file, limit),
     );
 
-    // Only the first line is decoded, whatever follows it in the read.
     var followed_file = try tmp.dir.openFile(io_mod.getIo(), "followed", .{});
     defer followed_file.close(io_mod.getIo());
     try std.testing.expect(try readSubagentChildIdentityWithin(alloc, followed_file, limit));

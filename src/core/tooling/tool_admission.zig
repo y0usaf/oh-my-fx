@@ -346,8 +346,6 @@ fn decodeFileMutationInput(
     const kind: file_mutation_contract.Kind = switch (tool.executor_kind) {
         .write_file => .write,
         .edit_file => .edit,
-        // A host tool may reuse the reserved names; it is not the builtin
-        // mutation, so the contract steps aside instead of failing the call.
         .host => return .not_file_mutation,
         else => return .{ .failure = try arena.dupe(
             u8,
@@ -598,8 +596,6 @@ pub fn preflightFileMutation(
         .workspace_root = request.workspace_root,
     })) {
         .tool_failure => |reason| return .{ .tool_failure = reason },
-        // The preflight contract only exists for the builtin file mutations;
-        // a host tool that reused the name cannot be preflighted through it.
         .not_file_mutation => return .{ .tool_failure = "file mutation preflight is unavailable for host tools" },
         .prepared => |value| value,
     };
@@ -818,7 +814,6 @@ fn shellInputReceiver(
         debug_trace.logf("permission", "event=shell_input_review_receiver_unavailable call_id={s} session_id={s} reason={s}", .{ call.id, session_id, @errorName(err) });
         return null;
     };
-    // The request borrows these owned slices for the admission arena's lifetime.
     return .{
         .session_id = snapshot.session_id,
         .launch_command = snapshot.launch_command,
@@ -1126,9 +1121,6 @@ fn resolveOrdinaryPermissionOutcome(
     if (permission_mode == .auto) {
         if (command_call) {
             const command = try runCommandContext(input, arena, call);
-            // A user-profile alias or function can redefine a routine name,
-            // so those commands go to review instead, as does every command
-            // while a failed capture hides which names are redefined.
             if (command.execution_mode == .captured and
                 !(command.environment == .user and
                     (shell_snapshot.processOwner().definesAnyWord(command.command) or
@@ -1260,10 +1252,6 @@ fn resolveFileMutationPreflightAdmission(
                 if (reviewed.decision != .permission_required) {
                     break :blk .{ .resolved = reviewed };
                 }
-                // Model ask carries auto_review_result. Without a prompter, keep
-                // that reviewed outcome instead of dropping the rationale on the
-                // prompt unavailable path. Bare reviewer-unavailable still falls
-                // through so site requirement tags are preserved.
                 if (input.permission_prompter == null and reviewed.auto_review_result != null) {
                     break :blk .{ .resolved = reviewed };
                 }
@@ -1315,10 +1303,6 @@ fn requestPermissionOutcomeResolved(
     local_grants: []const PermissionGrant,
 ) !command_admission.PermissionOutcome {
     if (file_mutation_contract.isToolName(call.name) and
-        // A host tool that reuses a reserved name executes through the host
-        // executor, not the builtin file mutation, so it follows the ordinary
-        // registered-tool permission path. A missing registry entry keeps the
-        // contract's own failure handling.
         (input.tool_registry.lookup(call.name) == null or
             input.tool_registry.lookup(call.name).?.executor_kind != .host))
     {
@@ -1374,12 +1358,8 @@ fn requestPermissionOutcomeResolved(
             .yolo,
         ), vision_path_authority);
     }
-    // Detect startup-file edits before matching remembered shell approvals,
-    // so a refresh asks again instead of reusing an approval from before it.
     const shell_grant_call = std.mem.eql(u8, permissions.permissionNameForTool(permission_name), "bash");
     if (shell_grant_call) shell_snapshot.processOwner().checkStartupFiles();
-    // A reload changes what the command means, so earlier approvals do not
-    // cover it.
     const grants_apply = !(shell_grant_call and shellCallRequestsReload(arena, call));
     var configured_ask = false;
     var all_targets_authorized_by_rule = true;
@@ -2106,9 +2086,6 @@ fn defaultRunCommandPermissionOutcome(
             .decision = .once,
             .execution_authority = .{ .run_command = .{ .direct_only = fingerprint } },
         },
-        // Review cannot see a repository's git config, and the routine-command
-        // rule would run plain git, so an automatic git command that fx could
-        // not make safe does not run at all.
         .approval_required => |reason| if (reason == .unsafe_git and permission_mode == .auto)
             .{ .tool_failure = unsafe_git_hold_output }
         else
@@ -2283,8 +2260,6 @@ pub fn preparePermissionStateAction(
         .access_scope = input.access_scope,
     })) {
         .prepared => |prepared| prepared,
-        // A host tool that reuses a reserved name never reaches this site
-        // through the file-mutation contract; treat it as unpreparable.
         .not_file_mutation => return error.PermissionStatePreparationFailed,
         .tool_failure => return error.PermissionStatePreparationFailed,
     };
@@ -2550,8 +2525,6 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         };
         return .{ .items = items };
     }
-    // A host tool that reuses a reserved file-mutation name has no typed
-    // mutation target; its permission target is its own name.
     if (tool.executor_kind == .host) {
         const items = try arena.alloc(permissions.PermissionCallTarget, 1);
         errdefer arena.free(items);
@@ -2600,8 +2573,6 @@ pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) !
     if (try isRunCommandCall(input, arena, call)) {
         return commandPermissionTarget(input, arena, call);
     }
-    // A host tool that reuses a reserved file-mutation name has no typed
-    // mutation target; its permission target is its own name.
     if (tool.executor_kind == .host) return arena.dupe(u8, call.name);
     return permissions.permissionTargetForCallInScope(
         arena,
@@ -3707,8 +3678,6 @@ test "file mutation decode steps aside for a host tool reusing a reserved name" 
         }
     };
 
-    // A host tool registered under the reserved name must not enter the
-    // builtin mutation contract at all.
     const host_tool = tool_dispatch.Tool{
         .name = "write_file",
         .description = "",
@@ -5729,7 +5698,6 @@ test "routine commands go to review while the snapshot has fallen back" {
 }
 
 test "known reversible auto commands bypass the reviewer" {
-    // An earlier test's snapshot could redefine a routine name.
     shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5795,8 +5763,6 @@ test "automatic git that safe git refuses is held instead of running plain git" 
     const arena = arena_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The repository config includes a file through a symlink, which fx's
-    // config reader refuses, so safe git cannot prepare and no git starts.
     try tmp.dir.createDirPath(std.testing.io, "workspace/.git/objects");
     try tmp.dir.createDirPath(std.testing.io, "workspace/.git/refs");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/.git/HEAD", .data = "ref: refs/heads/main\n" });
@@ -5827,7 +5793,6 @@ test "automatic git that safe git refuses is held instead of running plain git" 
         try std.testing.expect(held.execution_authority == null);
         try std.testing.expectEqualStrings(unsafe_git_hold_output, held.tool_failure.?);
 
-        // Ask mode keeps the normal approval prompt for the exact command.
         const asked = try requestPermissionOutcome(input, arena, call, .ask, &.{});
         try std.testing.expect(asked.tool_failure == null);
         try std.testing.expectEqual(ToolPermissionDecision.permission_required, asked.decision);

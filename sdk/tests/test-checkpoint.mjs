@@ -83,9 +83,6 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   const { port } = server.address();
 
-  // The kernel fetches the model catalog from the canonical gateway origin
-  // through the host fetch; redirect those GETs to the loopback server so
-  // capability resolution sees the fixture catalog on both backends.
   const loopbackFetch = (input, init) => {
     const url = new URL(String(input?.url ?? input));
     const method = String(init?.method ?? input?.method ?? "GET").toUpperCase();

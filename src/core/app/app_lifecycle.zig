@@ -57,7 +57,6 @@ var old_sighup_action: ?std.posix.Sigaction = null;
 /// Restores terminal state, installs the default disposition, and re-raises.
 /// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
-    // Signal context cannot recover from a failed async-signal-safe write.
     _ = std.c.write(
         std.posix.STDOUT_FILENO,
         restore.ptr,
@@ -266,8 +265,6 @@ pub const StartupState = struct {
         if (effort) |value| self.effort = value;
         if (fast) |value| {
             self.fast_mode = value;
-            // An explicit --fast is bound to the launch model selection so the
-            // footer indicator reflects it; --no-fast clears the binding.
             self.fast_mode_model_bound = value;
         }
         if (ultrafast) |value| {
@@ -679,14 +676,11 @@ fn loadStartupStateWithKeychainRead(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
-    // A malformed process override must never silently fall through to a
-    // potentially paid profile preference, regardless of credential mode.
     for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) {
             return error.InvalidUltrafastOverride;
         }
     }
-    // A rejected local profile cannot safely identify the destination of model data.
     if (auth_mode == .local) for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.layer != .user) continue;
         switch (diagnostic.cause) {
@@ -709,12 +703,8 @@ fn loadStartupStateWithKeychainRead(
         &.{},
         false,
     );
-    // Skill authority checks run across discovery, refresh, and the skill tool,
-    // so the profile setting is installed process-wide like the env var.
     try skill_runtime.setConfiguredSymlinkAuthorities(settings.skill_symlink_authorities orelse &.{});
 
-    // A launch --provider override must bind configured provider names against
-    // the registry just like the settings and FX_PROVIDER paths do.
     const bound_override = if (provider_override) |override|
         try override.bind(settings.providers orelse .{})
     else
@@ -892,8 +882,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         return error.RecordingStartFailed;
     };
 
-    // The shadow VT is load-bearing: frame commit diffs the target
-    // surface against it and records the accepted terminal state.
     try cfg.shell.enableShadowVt(cfg.alloc);
 
     const truecolor = ui_render.truecolorSupportedForValues(
@@ -901,10 +889,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         io_mod.getenv("TERM_PROGRAM"),
     );
     ui_render.setTruecolorSupport(truecolor);
-    // Theme selection: FX_THEME wins over the settings "theme" key; an empty
-    // FX_THEME counts as unset per the codebase convention. light/dark pin the
-    // builtin variant and skip the OSC 11 probe; any other value names a theme
-    // file under ~/.fx/themes.
     var configured_theme: ?[]const u8 = state.theme;
     if (io_mod.getenv("FX_THEME")) |value| {
         if (value.len > 0) configured_theme = value;
@@ -913,8 +897,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         switch (choice) {
             .pin_light, .pin_dark => {
                 const light = choice == .pin_light;
-                // The flag marks "pinned", not the direction: any configured
-                // pin locks live theme updates out.
                 shared_theme.setSource(null, true);
                 ui_render.initTheme(light, null);
             },
@@ -937,8 +919,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
         ui_render.initTheme(detected.light, detected.rgb);
     }
-    // Custom themes keep live monitoring: terminal mode flips re-resolve the
-    // theme pair. Only a configured light/dark pin locks updates out.
     state.theme_monitor_enabled = !ui_render.themeInputLocked();
 
     const cursor = cfg.terminal.queryCursorPosition() catch blk: {
@@ -960,8 +940,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.startup_min_body_rows,
         state.startup_scrollback,
     );
-    // Enable keyboard/paste protocol modes and disable autowrap for the
-    // interactive session. Shutdown restores each mode.
     try enableInteractiveTerminalModes(cfg.shell, cfg.metrics);
     try cfg.shell.initViewportWithReservedRows(cfg.metrics, launch_start_row, effective_startup_min_body_rows);
 
@@ -1464,7 +1442,6 @@ fn enterAlternateScreen(
 ) !void {
     if (terminal.alternate_screen_owner == owner) return;
     if (terminal.alternate_screen_owner != .none) return error.AlternateScreenAlreadyOwned;
-    // Keep the flag set if the write fails so shutdown still attempts a restore.
     terminal.alternate_screen_owner = owner;
     terminal.alternate_frame_layout = .{};
     try writeLifecycleTerminalBytes(shell, metrics, alternate_screen_enter);
@@ -1499,15 +1476,11 @@ fn setAlternateScreenMouseTracking(
         return;
     }
     if (enabled) {
-        // Keep the state armed on an enable write failure so leave/shutdown
-        // still attempts to restore the terminal mode.
         terminal.alternate_mouse_tracking_active = true;
         try writeLifecycleTerminalBytes(shell, metrics, alternate_mouse_tracking_enter);
         return;
     }
 
-    // Keep the state armed on a disable failure so leave/shutdown still
-    // attempts to restore the terminal mode.
     try writeLifecycleTerminalBytes(
         shell,
         metrics,
@@ -1648,7 +1621,6 @@ test "loadStartupState starts Codex from FX_PROVIDER and FX_MODEL without a save
     try std.testing.expectEqualStrings("gpt-env", state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
 
-    // A blank FX_MODEL is no model at all, so the setup error still surfaces.
     var blank_env = try TestEnv.install(std.testing.allocator, &.{
         .{ .key = "HOME", .value = home_root },
         .{ .key = "FX_PROVIDER", .value = "codex" },
@@ -1678,8 +1650,6 @@ test "loadStartupState seeds a provider without a saved model from the launch --
     });
     defer env.deinit();
 
-    // fx --provider codex --model gpt-flag from a Gateway-only profile: the
-    // flag outranks FX_MODEL as the seeded preference; callers apply it last.
     var state = try loadStartupStateFromOwnedWorkspace(
         alloc,
         oauth_transport.unavailable_provider,
@@ -2859,7 +2829,6 @@ test "only a Keychain-backed Gateway credential is deferred past the first frame
     try std.testing.expect(keychainReadDeferrable(true, false, .gateway, .fx_login, false));
     try std.testing.expect(keychainReadDeferrable(true, false, .gateway, .stored_key, true));
     try std.testing.expect(keychainReadDeferrable(true, false, .gateway, null, false));
-    // An environment credential wins automatic precedence without the Keychain.
     try std.testing.expect(!keychainReadDeferrable(true, false, .gateway, null, true));
     try std.testing.expect(!keychainReadDeferrable(true, false, .gateway, .ai_gateway_api_key, false));
     try std.testing.expect(!keychainReadDeferrable(true, false, .gateway, .vercel_oidc_token, false));
@@ -2883,7 +2852,6 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     defer alloc.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
-    // The real Keychain stays off; the fake store below reports it enabled.
     var env = try TestEnv.install(alloc, &.{
         .{ .key = "HOME", .value = home_root },
         .{ .key = "FX_PROVIDER", .value = "" },
@@ -2903,7 +2871,6 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
             try std.testing.expectEqual(@as(?credentials.Source, .fx_login), request.preferred);
             try std.testing.expectEqual(credentials.FxLoginReadStatus.not_attempted, state.fx_login_status);
         } else {
-            // Test builds keep the fx login in the profile, where it is absent.
             try std.testing.expect(state.deferred_credential == null);
             try std.testing.expectEqual(credentials.FxLoginReadStatus.absent, state.fx_login_status);
         }

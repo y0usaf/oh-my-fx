@@ -110,8 +110,6 @@ pub const Table = struct {
     pub fn step(t: *Table, event: Event, out: *Output) void {
         switch (event) {
             .asked => |a| {
-                // The model's Ask: only url ones carry an id, and a -32042
-                // error lists only those.
                 std.debug.assert(a.mode == .url or !a.eid);
                 std.debug.assert(a.origin == .request or (a.mode == .url and a.eid));
                 t.last += 1;
@@ -158,7 +156,6 @@ pub const Table = struct {
                         s.phase = .waiting;
                         return;
                     }
-                    // Its completion came first, so the host hears it now.
                     out.emit(.{ .complete = a.slot });
                 }
                 t.free(a.slot, out);
@@ -189,7 +186,6 @@ pub const Table = struct {
                 out.n = s.n;
                 out.slot = slot;
                 if (s.phase == .shown and s.mode == .url and s.eid) {
-                    // Kept for the host's acceptance.
                     s.early = true;
                     return;
                 }
@@ -232,7 +228,6 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
         .to = "",
         .data = &.{
             .{ .name = "ignored", .value = .{ .boolean = out.ignored } },
-            // TLC's integers are 32-bit; elicitations stay far below.
             .{ .name = "n", .value = .{ .int = @min(out.n, 1 << 30) } },
             .{ .name = "required", .value = .{ .boolean = if (asked) |a| a.origin == .required else false } },
             .{ .name = "url", .value = .{ .boolean = if (asked) |a| a.mode == .url else false } },
@@ -246,8 +241,6 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
         },
     });
 }
-
-// ---- tests ----
 
 const testing = std.testing;
 
@@ -263,7 +256,6 @@ const World = struct {
 
     fn check(w: *World, t: *const Table, before: *const Table, event: Event, out: *const Output) !void {
         if (out.n >= max_n) return;
-        // The host accepted a url one with an id, answered or not.
         if (event == .answered and !out.ignored and !out.refused and event.answered.action == .accept) {
             const slot = before.slots[event.answered.slot];
             if (slot.mode == .url and slot.eid) w.accepted_url[slot.n] = true;
@@ -271,7 +263,6 @@ const World = struct {
         for (out.effects()) |effect| switch (effect) {
             .show => |slot| {
                 const s = t.slots[slot];
-                // ModeGate: only a declared mode reaches the host.
                 try testing.expect(if (s.mode == .form) t.config.form else t.config.url);
                 if (s.origin == .required) w.required[s.n] = true;
             },
@@ -283,15 +274,14 @@ const World = struct {
             .send => |s| {
                 const a = event.answered;
                 const slot = before.slots[s.slot];
-                try testing.expectEqual(a.action, s.action); // HostDecides
-                try testing.expectEqual(a.action == .accept and slot.mode == .form, s.content); // ContentGate
-                try testing.expect(!s.content or a.valid); // ValidOnly
-                try testing.expect(!w.withdrawn[slot.n]); // NothingAfterWithdraw
-                try testing.expect(!w.required[slot.n]); // RequiredUnanswered
+                try testing.expectEqual(a.action, s.action);
+                try testing.expectEqual(a.action == .accept and slot.mode == .form, s.content);
+                try testing.expect(!s.content or a.valid);
+                try testing.expect(!w.withdrawn[slot.n]);
+                try testing.expect(!w.required[slot.n]);
                 w.sends[slot.n] += 1;
             },
             .withdraw => |slot| {
-                // NothingAfterWithdraw: only one the host still holds.
                 const n = before.slots[slot].n;
                 try testing.expectEqual(@as(u8, 0), w.sends[n]);
                 try testing.expect(!w.accepted_url[n]);
@@ -300,19 +290,17 @@ const World = struct {
             .complete => |slot| {
                 const n = before.slots[slot].n;
                 w.told[n] += 1;
-                try testing.expect(w.told[n] <= 1); // CompleteOnce
-                try testing.expect(w.accepted_url[n]); // CompleteOnlyAccepted
+                try testing.expect(w.told[n] <= 1);
+                try testing.expect(w.accepted_url[n]);
             },
             .release => {},
         };
         if (event == .completed and !out.ignored and before.slots[out.slot.?].phase == .shown) w.early[out.n] = true;
-        // EarlyCompletionTold.
         if (w.early[out.n] and w.accepted_url[out.n]) try testing.expectEqual(@as(u8, 1), w.told[out.n]);
-        for (w.sends) |count| try testing.expect(count <= 1); // AnsweredOnce
+        for (w.sends) |count| try testing.expect(count <= 1);
         var used: usize = 0;
         for (t.slots) |s| used += @intFromBool(s.used);
-        try testing.expect(used <= max_pending); // Bounded
-        // Where the model has no choice, the core must act.
+        try testing.expect(used <= max_pending);
         switch (event) {
             .asked => |a| {
                 var open = false;
@@ -473,13 +461,13 @@ test "a server's cancel and the session's end withdraw what the host holds" {
     }
     out = .{};
     t.step(.{ .server_cancelled = 1 }, &out);
-    try testing.expect(out.ignored); // a -32042 one has no request to cancel
+    try testing.expect(out.ignored);
     out = .{};
     t.step(.{ .server_cancelled = 0 }, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .withdraw = 0 }, .{ .release = 0 } }, out.effects());
     out = .{};
     t.step(.{ .answered = .{ .slot = 1, .action = .accept, .valid = true } }, &out);
-    try testing.expectEqual(@as(usize, 0), out.effect_count); // required: nothing to send, waits
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
     out = .{};
     t.step(.session_ended, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .release = 1 }, .{ .withdraw = 2 }, .{ .release = 2 } }, out.effects());

@@ -1,10 +1,4 @@
 #!/bin/sh
-# Prove the trace tooling can both accept and reject.
-#
-# Runs the Python stand-in log three ways and checks the verdicts:
-#   correct implementation            -> ACCEPTED
-#   recovery keeps a torn tail (bug)  -> REJECTED at step 8 (the Recover)
-#   one field changed in a good trace -> REJECTED at step 5 (acked 2 -> 3)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,7 +10,7 @@ python3 "$here/stand_in_log.py" "$tmp/bad.log" "$tmp/bad.ndjson" keep_torn_tail
 sed '5s/"acked": 2/"acked": 3/' "$tmp/good.ndjson" > "$tmp/tampered.ndjson"
 
 failures=0
-expect() { # name trace wanted_exit wanted_text
+expect() {
     set +e
     got=$("$here/validate.sh" SessionLog "$2" 2>&1)
     code=$?

@@ -136,8 +136,6 @@ pub const Chain = struct {
     }
 
     fn inputRequired(c: *Chain, requests: u8, state: bool, supported: bool, out: *Output) void {
-        // At least one of the two fields; the parser reports malformed
-        // otherwise, but the core doesn't rely on it.
         if (requests == 0 and !state) {
             out.action = "malformed";
             return c.end(.malformed, out);
@@ -151,8 +149,6 @@ pub const Chain = struct {
             c.phase = .asking;
             return out.push(.ask_host);
         }
-        // 50 ms doubling to 250 ms over rounds in a row that carry only
-        // a requestState, as rmcp does.
         c.phase = .backoff;
         out.push(.{ .arm_backoff = @min(@as(u32, 250), @as(u32, 50) << @intCast(@min(c.state_only, 3))) });
         c.state_only += 1;
@@ -198,10 +194,6 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, c: *const Chain, 
     });
 }
 
-// ---------------------------------------------------------------------------
-// Tests. The model's invariants are checked after every step of every event
-// sequence to a small depth; the ghost `brought` is kept beside the chain.
-
 const testing = std.testing;
 
 const World = struct {
@@ -216,18 +208,15 @@ const World = struct {
         for (out.effects()) |e| if (e == .send and before == .done) {
             w.sent_done = true;
         };
-        try testing.expect(c.round <= c.config.max_requests); // RoundCap
+        try testing.expect(c.round <= c.config.max_requests);
         if (c.phase == .sent) {
-            try testing.expectEqual(w.brought, c.sent_state); // StateEchoExact
-            try testing.expectEqual(c.requested, c.responded); // ResponsesExact
+            try testing.expectEqual(w.brought, c.sent_state);
+            try testing.expectEqual(c.requested, c.responded);
         }
-        if (c.phase == .asking) try testing.expect(c.supported); // NoAskUnsupported
-        if (c.phase == .backoff) try testing.expect(w.brought != 0); // BackoffNeedsState
-        try testing.expect(!w.sent_done); // NothingAfterEnd
-        // Cancel ends the chain wherever the model lets it.
+        if (c.phase == .asking) try testing.expect(c.supported);
+        if (c.phase == .backoff) try testing.expect(w.brought != 0);
+        try testing.expect(!w.sent_done);
         if (event == .cancel and (before == .sent or before == .asking or before == .backoff)) try testing.expectEqual(Phase.done, c.phase);
-        // Every send names the state of the round before, and the effect
-        // carries what the chain recorded.
         for (out.effects()) |e| if (e == .send) {
             try testing.expectEqual(c.sent_state, e.send.state);
             try testing.expectEqual(c.responded, e.send.responses);
@@ -280,7 +269,6 @@ test "a retry echoes the last requestState and answers every input request" {
     try testing.expectEqualSlices(Effect, &.{.ask_host}, out.effects());
     out = steps(&c, &.{.provided});
     try testing.expectEqualSlices(Effect, &.{.{ .send = .{ .round = 2, .state = 1, .responses = 2 } }}, out.effects());
-    // A round without a requestState: the next retry carries none.
     out = steps(&c, &.{ .{ .answered = .{ .input_required = .{ .requests = 1, .state = false, .supported = true } } }, .provided });
     try testing.expectEqualSlices(Effect, &.{.{ .send = .{ .round = 3, .state = 0, .responses = 1 } }}, out.effects());
 }
@@ -294,7 +282,6 @@ test "rounds with only a requestState back off 50, 100, 200, then 250 ms" {
         try testing.expectEqualSlices(Effect, &.{.{ .arm_backoff = ms }}, out.effects());
         _ = steps(&c, &.{.backoff_elapsed});
     }
-    // A round with input requests starts the backoff over.
     _ = steps(&c, &.{ .{ .answered = .{ .input_required = .{ .requests = 1, .state = true, .supported = true } } }, .provided });
     const out = steps(&c, &.{state_only});
     try testing.expectEqualSlices(Effect, &.{.{ .arm_backoff = 50 }}, out.effects());

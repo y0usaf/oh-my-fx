@@ -1,7 +1,6 @@
 import { strict as assert } from "node:assert";
 import { deflateSync, inflateSync } from "node:zlib";
 
-// Equivalent pixels with different transport sizes, both below image admission limits.
 export function equivalentPngEncodings(): Buffer[] {
   const width = 1024, height = 800, stride = width * 4 + 1;
   const pixels = Buffer.alloc(stride * height);
@@ -23,7 +22,6 @@ export function equivalentPngEncodings(): Buffer[] {
   });
 }
 
-// A decodable solid gray RGB PNG with a small byte size at any pixel size.
 export function solidPng(width: number, height: number): Buffer {
   const stride = width * 3 + 1;
   const pixels = Buffer.alloc(stride * height, 0x80);
@@ -37,7 +35,6 @@ export function solidPng(width: number, height: number): Buffer {
   ]);
 }
 
-// A JPEG signature and frame header: enough for type and pixel-size checks.
 export function jpegHeader(width: number, height: number): Buffer {
   const header = Buffer.from("ffd8ffc0001108000000000301220002110103110100", "hex");
   header.writeUInt16BE(height, 7);
@@ -45,14 +42,11 @@ export function jpegHeader(width: number, height: number): Buffer {
   return header;
 }
 
-// A PNG with a zero-filled ancillary chunk after IHDR, which adds bytes
-// without changing its pixels.
 export function paddedPng(png: Buffer, paddingBytes: number): Buffer {
   const ihdrEnd = 8 + 25;
   return Buffer.concat([png.subarray(0, ihdrEnd), pngChunk("zzPd", Buffer.alloc(paddingBytes)), png.subarray(ihdrEnd)]);
 }
 
-// Pixel size of a PNG, read from its header.
 export function pngPixelSize(png: Buffer): { width: number; height: number } {
   assert.ok(png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")), "expected a PNG");
   return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };

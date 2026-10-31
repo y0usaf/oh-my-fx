@@ -932,8 +932,6 @@ pub const Runtime = struct {
             const next = contract.transition(entry.state, entry.barrier, .stop_requested);
             entry.state = next.state;
             entry.barrier = next.barrier;
-            // Force only escalates: a later cooperative stop must not undo a
-            // force-kill already requested, such as the one at process exit.
             if (force) entry.force_cancel.store(true, .seq_cst);
             entry.cancel.store(true, .seq_cst);
             if (entry.active_waiter) |waiter_id| {
@@ -1668,8 +1666,6 @@ test "process-exit termination joins a command a cancelled foreground wait is al
     var cancel = std.atomic.Value(bool).init(false);
     var input = StartCapturedInput{
         .execution_id = "exit-while-cancelling",
-        // Ignoring TERM keeps the cancelled foreground wait inside its join
-        // for the whole cooperative termination grace.
         .command = "trap '' TERM; while :; do sleep 1; done",
         .cwd = "/tmp",
         .environment = .legacy,
@@ -1699,11 +1695,6 @@ test "process-exit termination joins a command a cancelled foreground wait is al
         if (io_mod.milliTimestamp() > admitted_deadline_ms) return error.TestUnexpectedResult;
         io_mod.sleep(5 * std.time.ns_per_ms);
     }
-    // Let the shell install its trap, then cancel the foreground wait so it
-    // parks in joinEntry behind the ignored TERM. Process-exit termination
-    // then joins the same thread; unserialized, glibc rejects the second
-    // pthread_join with EINVAL, and a join that races the first one's
-    // completion reuses a released handle.
     io_mod.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .seq_cst);
     io_mod.sleep(100 * std.time.ns_per_ms);
@@ -1712,7 +1703,6 @@ test "process-exit termination joins a command a cancelled foreground wait is al
     runtime.terminateForProcessExit();
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     foreground.join();
-    // Force escalation lands well inside the 800 ms cooperative grace.
     try std.testing.expect(elapsed_ms < 500);
 }
 

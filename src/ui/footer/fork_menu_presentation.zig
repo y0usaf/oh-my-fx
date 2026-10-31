@@ -121,7 +121,6 @@ test "fork menu lists prompts oldest first and opens on the newest at the bottom
         .{ .turn = 2, .prompt = @constCast("second") },
         .{ .turn = 3, .prompt = @constCast("third") },
     };
-    // As the menu opens: the newest selected, the window past the end.
     var projection: ForkMenuProjection = .{ .points = &points, .selected = 2, .window_start = std.math.maxInt(usize) };
     for ([_][]const u8{ "  first", "  second", "  third" }, 0..) |text, row_index| {
         const row = try testRow(projection, @intCast(row_index), 40, 3);
@@ -130,8 +129,6 @@ test "fork menu lists prompts oldest first and opens on the newest at the bottom
         try std.testing.expectEqual(row_index == 2, row.selected);
     }
 
-    // Two rows show the two newest; moving up keeps them until the selection
-    // passes the top, then the list scrolls by one.
     const steps = [_]struct { selected: usize, top: []const u8, bottom: []const u8 }{
         .{ .selected = 2, .top = "  second", .bottom = "  third" },
         .{ .selected = 1, .top = "  second", .bottom = "  third" },

@@ -238,9 +238,6 @@ pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Resul
                 } };
             },
             .not_file_mutation => {
-                // A host tool reuses a reserved file-mutation name; it belongs
-                // to ordinary registered-tool dispatch, not the builtin
-                // mutation contract.
                 break :blk switch (try prepareRegisteredApplicableTargets(alloc, config.workspace_root, config.access_scope, call, tool.*)) {
                     .prepared => |prepared| prepared,
                     .legacy_candidate => return .{ .candidate = .{ .kind = .legacy_target_resolution } },
@@ -340,10 +337,6 @@ fn prepareRegisteredApplicableTargets(
         ) };
     }
 
-    // Host tools own their effects; the kernel has no typed target contract
-    // for them. Skipping permission-target projection keeps a host tool that
-    // reuses a reserved name (e.g. write_file) out of the builtin mutation
-    // path entirely.
     if (tool.executor_kind == .host) return .{ .prepared = @constCast(&.{}) };
 
     var permission_targets = permissions.permissionTargetsForCallInScope(

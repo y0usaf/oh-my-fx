@@ -63,7 +63,6 @@ pub const Projection = struct {
                     var buffer: [max_id_bytes]u8 = undefined;
                     const candidate = try std.mem.print(&buffer, "fx_{s}_{d}", .{ &hex, attempt });
                     if (self.ids.contains(candidate)) {
-                        // Opaque state may refer to an alias from an earlier request.
                         if (opaque_history) return error.ProtectedToolCallId;
                         continue;
                     }

@@ -84,7 +84,6 @@ pub const State = struct {
 
     pub fn begin(self: *State, origin: Origin, turn_id: ?u64, now_ms: i64) OperationId {
         const id: OperationId = @fromBackingInt(@intCast(self.next_id));
-        // Neither counter is reused within a worker lifetime.
         self.next_id += 1;
         self.snapshot.operation = .{ .id = id, .turn_id = turn_id, .origin = origin, .started_at_ms = now_ms };
         self.snapshot.revision += 1;
@@ -198,7 +197,6 @@ test "compaction activity failure retains error and publication provenance" {
     try std.testing.expectEqual(Outcome.failed, uncertain.outcome);
     try std.testing.expectEqual(Publication.uncertain, uncertain.publication);
     try std.testing.expectEqual(error.SessionPersistenceUncertain, uncertain.err.?);
-    // A cooperative host can cancel transport before queued input sets the worker flag.
     try std.testing.expectEqual(Outcome.cancelled, failure(error.Cancelled, .summary, false).outcome);
     try std.testing.expectEqual(Outcome.cancelled, failure(error.Aborted, .publication, true).outcome);
     try std.testing.expectEqual(Outcome.failed, failure(error.Aborted, .publication, false).outcome);

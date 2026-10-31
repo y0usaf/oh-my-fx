@@ -88,8 +88,6 @@ const stubFetch = async (input, init = {}) => {
   }
   if (url.href === "https://api.vercel.com/login/oauth/revoke") return json({});
   if (`${url.origin}${url.pathname}` === "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
-    // Like AI Gateway, the catalog reads an fx login's team only from the
-    // teamId query value; the x-vercel-ai-gateway-team header is not enough.
     if (headers.get("authorization") === `Bearer ${accessToken}` && url.searchParams.get("teamId") !== teamId) {
       return json({ error: { message: "Authentication failed.", type: "authentication_error" } }, 401);
     }

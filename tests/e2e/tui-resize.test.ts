@@ -1493,7 +1493,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         const tracePath = join(root, "trace.log");
         const stderrPath = join(root, "stderr.log");
         writeFileSync(stderrPath, "");
-        // Never change the developer's tmux prefix, bindings, or server state.
         const socketName = `fx-resize-${mode}-${process.pid}-${Date.now()}`;
         const tmux = (...args: string[]) => execFileSync(
           "tmux",
@@ -1502,7 +1501,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ).trim();
         let client: ReturnType<typeof Bun.spawn> | undefined;
         try {
-          // Isolate configuration too: the shared helper expects window index 0.
           tmux("-f", "/dev/null", "new-session", "-d", "-s", "bootstrap", "sleep 120");
           session = await createResizeSession({
             isolated: true,
@@ -1554,7 +1552,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
             terminal: {
               cols: 120,
               rows: 40,
-              data() {}, // Drain client output; pane and trace helpers own assertions.
+              data() {},
             },
           });
           await waitForFormat("#{session_attached}", "1");
@@ -1571,8 +1569,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           await active.waitForText(draft, 5_000);
 
           const beforeMode = readTraceLines(tracePath).length - 1;
-          // send-keys bypasses the client's prefix table. These are real PTY
-          // keystrokes, so choose-tree -Zs also exercises its implicit zoom.
           terminal.write(mode === "choose-tree" ? "\x01s" : "\x01[");
           const paneMode = mode === "choose-tree" ? "tree-mode" : "copy-mode";
           await waitForFormat("#{pane_mode}", paneMode);
@@ -1585,12 +1581,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
           expect(attemptLine(settled, "tmux_clear_history_complete")).toBeDefined();
           expect(format("#{pane_mode}")).toBe(paneMode);
           expect(format("#{pane_in_mode}")).toBe("1");
-          // Also catch a delayed mode exit after the committed frame.
           await Bun.sleep(250);
           expect(format("#{pane_mode}")).toBe(paneMode);
 
-          // Leave intentionally, then prove neither the prefix nor the quit key
-          // leaked into the composer and that ordinary editing still works.
           const beforeExit = readTraceLines(tracePath).length - 1;
           terminal.write("q");
           await waitForFormat("#{pane_in_mode}", "0");
@@ -1623,7 +1616,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
               }
             }
           } finally {
-            // afterEach still owns the TmuxSession fixture and temporary files.
             try { tmux("kill-server"); } catch {}
           }
         }
@@ -1904,11 +1896,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
         })}\n\ndata: [DONE]\n\n`));
         streams[turn].close();
       };
-      // Bounded inert destinations consume the real cap without thousands of rows.
       const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
         `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
       ).join("") + "\n\n";
-      // Removing the old response must leave the collapsed group through a retention frame.
       const old = (id: number) => id === 0
         ? inertRow("RETAIN_OLD_0000")
         : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
@@ -2023,7 +2013,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         mkdirSync(workspace);
         writeFileSync(join(home, ".fx", "settings.json"), "{}");
         writeFileSync(stderrPath, "");
-        // Keep geometry and logical rows identical; only the old retained payload differs.
         writeFileSync(join(workspace, "old.txt"), "S".repeat(pressure ? 1_040_000 : 8_000) + "\n");
         writeFileSync(join(workspace, "new.txt"), "N".repeat(80_000) + "\n");
         writeFileSync(join(workspace, "probe.sh"), [
@@ -2121,7 +2110,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           for (let index = 0; index < labels.length; index++) {
             expect(lines.filter(line => line.includes(labels[index]!))).toEqual([paragraphs[index]!]);
           }
-          // Trim cell padding, never newlines: missing or added spacers must fail too.
           const normalized = lines.join("\n");
           for (let index = 1; index < oldParagraphs.length; index++) {
             expect(normalized).toContain(`${oldParagraphs[index - 1]}\n\n${oldParagraphs[index]}`);
@@ -2173,13 +2161,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
               .filter(entry => entry.isDirectory()).map(entry => entry.name);
             expect(ids).toHaveLength(1);
             const eventsPath = join(sessionsRoot, ids[0]!, "events.jsonl");
-            // The main composer and text tail are hidden. Wait for the actual saved
-            // assistant and its following completion record, not a viewer repaint.
             await session.waitForPane((pane) => {
               expect(session!.paneStatus().dead).toBe(false);
               expect(pane).toContain(fullFooter);
               const text = readFileSync(eventsPath, "utf8");
-              // A concurrent append may end mid-record; only parse terminated lines.
               const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
               const assistantIndex = records.findIndex(record =>
                 record.event.assistant?.text === laterResponse
@@ -2223,8 +2208,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const afterOutput = await capture("after-output");
           const boundary = readFileSync(tracePath, "utf8").slice(traceOffset);
           writeFileSync(join(root, "output-trace.log"), boundary);
-          // Scheduling can coalesce atomic append/status frames. Require actual pruning,
-          // not a particular frame reason; coordinator tests own those exact boundaries.
           check("retention boundary", () => {
             const prunes = boundary.match(/pruned (?:command output|entry)/g) ?? [];
             if (pressure) expect(prunes.length).toBeGreaterThan(0);
@@ -2724,7 +2707,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         "WRAP_REPRO_END",
         "",
       ].join("\n");
-      // Split both paragraph prefixes across deltas, including a spaces-only delta.
       const chunks = [
         "Recommended fix\n\n1. Continue polling while ready.\n ",
         "  ",
@@ -4292,8 +4274,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ["display-message", "-p", "-t", session.name, "#{pane_tty}"],
         { encoding: "utf8", stdio: "pipe" },
       ).trim();
-      // Drift the terminal position without updating fx's shadow grid. Tmux
-      // can then answer the resize probe while reconciliation is still blocked.
       writeFileSync(paneTty, "\x1b[3A");
       await session.resizeWindow(120, 40, 0);
       execFileSync("tmux", ["send-keys", "-t", session.name, "-l", "x"], {

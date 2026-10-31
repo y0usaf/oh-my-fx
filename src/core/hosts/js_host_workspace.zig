@@ -353,7 +353,6 @@ pub fn Adapter(comptime Host: type) type {
                 -2 => return error.HostUnreadable,
                 -4 => return error.UnsafePath,
                 else => {
-                    // Abort, deadline, host failure, and invalid UTF-8 all read as unreadable.
                     debug_trace.logf("workspace", "instruction_read_failed status={d} path=\"{f}\"", .{ status, std.zig.fmtString(path) });
                     return error.Unreadable;
                 },

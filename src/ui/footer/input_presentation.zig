@@ -182,8 +182,6 @@ test "steering rows visibly escape terminal control bytes" {
     try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "\x1b[2J") == null);
 }
 
-// Ordered widest-first; every fallback keeps the enter/esc controls so narrow
-// terminals never lose the submit and cancel instructions.
 const freeform_question_hints = [_][]const u8{
     "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
     "shift+↑↓ options · tab questions · enter answer · esc cancel",
@@ -227,8 +225,6 @@ fn questionInteractionHint(
         base = out.buffered();
     }
 
-    // Batch progress rides the hint row, right-aligned like the rest of the
-    // footer chrome; a lone question needs no counter.
     if (projection.entry_count > 1) {
         var counter_buf: [32]u8 = undefined;
         const counter = std.mem.print(
@@ -271,7 +267,6 @@ pub fn cappedInputRows(total_rows: usize, content_bottom: u16, input_visible: bo
 pub fn slashCompletionPickerPrefix(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) ?[]const u8 {
     if (ctx.input.picker.isInlinePickerSuppressed(.slash) or modal_active or show_model_query or show_file_query) return null;
     if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return null;
-    // Mid-turn bare `/model` owns the footer slot before the staged picker opens.
     if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return null;
     const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
     return if (prefix.len > 0) prefix else null;
@@ -515,9 +510,6 @@ pub fn composeHintRow(
 
     const width_usize: usize = width;
     const danger_text = dangerStatusText(approval_active, ctx, width);
-    // The armed interrupt hint shrinks through compact variants so narrow
-    // terminals still show the confirming-press cue; when no variant fits
-    // beside the left hint, the cue owns the whole row like ctrl+c does.
     const esc_interrupt_variants = [_][]const u8{
         "esc again to interrupt",
         "esc esc interrupt",
@@ -534,10 +526,6 @@ pub fn composeHintRow(
         }
         if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
     }
-    // The armed clear indicator outranks the question suppression: a
-    // freeform draft mid-question uses the same double-Esc contract as the
-    // composer and needs the same cue. The armed interrupt indicator outranks
-    // both: it guards an irreversible cancel of active work.
     const right_text: []const u8 = if (ctx.esc_interrupt_armed)
         esc_interrupt_hint
     else if (ctx.esc_clear_armed)
@@ -585,8 +573,6 @@ pub fn dangerStatusText(
     ctx: RenderContext,
     width: u16,
 ) []const u8 {
-    // Transient interaction hints own the whole row: the warning is placed at
-    // an absolute column and would overwrite them on narrow terminals.
     if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.esc_interrupt_armed or ctx.ctrl_c_pending) return "";
     if (ctx.danger_status.len > 0 and
         display_width.visibleWidth(ctx.danger_status) <= width)
@@ -1378,8 +1364,6 @@ test "footer tabs are modeled spaces and anchors use modeled columns" {
     var ctx = testRenderContext(&input);
     ctx.model_query_active = true;
     ctx.model_completion_anchor = 1;
-    // The tab consumes 6 cells, leaving 4 on row 0; "/model" (6 cells) word
-    // wraps whole onto row 1, so the anchor projects to column 3.
     const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, true, false);
     try std.testing.expectEqual(@as(u16, 3), geometry.picker_start_col);
 }
@@ -1659,8 +1643,6 @@ test "compose hint row prioritizes the armed interrupt hint and shrinks it on na
     try std.testing.expect(std.mem.find(u8, wide.items, "esc again to clear") == null);
     try std.testing.expect(std.mem.find(u8, wide.items, "danger") == null);
 
-    // Narrow widths fall back to compact variants instead of dropping the cue.
-    // The test context left hint is "ask · gpt-5.1" (13 columns).
     var compact = try composeHintRow(alloc, false, ctx, 32);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.items, "esc esc interrupt") != null);
@@ -1895,7 +1877,6 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     ctx.danger_status_compact = "Full access";
     ctx.ctrl_c_pending = true;
 
-    // Reported as unpainted so the warning's visible budget pauses.
     try std.testing.expectEqualStrings("", dangerStatusText(false, ctx, 60));
 
     var pending = try composeHintRow(std.testing.allocator, false, ctx, 60);

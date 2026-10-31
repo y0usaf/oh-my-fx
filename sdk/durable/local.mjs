@@ -1,6 +1,3 @@
-// Sessions kept in files on this machine, through Workflow's local World.
-// libfx bundles that World into this module when it is packaged, so an app
-// installs nothing more.
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 import { createWorld } from "@workflow/world-local";
@@ -18,10 +15,8 @@ export function local({ dir, maxDurationMs, reserveMs } = {}) {
   if (dir !== undefined && (typeof dir !== "string" || dir.length === 0)) throw new TypeError("local() dir must be a path");
   return world(() => createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false }), {
     name: "local",
-    // Each folder is a store of its own.
     store: `local:${dir === undefined ? "" : resolve(dir)}`,
     livenessKnown: true,
-    // world-local keeps its queue in memory, so a message dies with the process.
     queueDurable: false,
     pollMs: 250,
     maxDurationMs,

@@ -647,7 +647,6 @@ async function runStress(config: Config): Promise<Paths> {
     };
     writeFileSync(paths.metrics, `${JSON.stringify(report, null, 2)}\n`);
 
-    // These are local regression alarms, not product-level latency contracts.
     expect(report.transitions.open.p95Ms).toBeLessThan(2_000);
     expect(report.transitions.scope.p95Ms).toBeLessThan(2_000);
     expect(report.transitions.page.p95Ms).toBeLessThan(5_000);

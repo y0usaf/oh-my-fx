@@ -225,8 +225,6 @@ fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, N
     try hashing.writer.writeAll("fx.history-page-prefix.v2\x00");
     for (turns) |turn| {
         try session_codec.writeHistoryTurn(&hashing.writer, turn);
-        // Canonical JSON never contains a literal NUL, so this makes the
-        // concatenation unambiguous without introducing another serializer.
         try hashing.writer.writeByte(0);
     }
     try hashing.writer.flush();
@@ -245,9 +243,6 @@ fn mapHistoryPageLoadError(err: anyerror) LoadHistoryPageError {
         error.InvalidDurableBytes,
         error.InvalidSessionIndex,
         => error.CorruptSession,
-        // `loadReadOnly` intentionally has an inferred upstream error set.
-        // Its uncategorized I/O and replay failures are unavailable storage,
-        // never evidence that the committed session itself is corrupt.
         else => error.SessionStoreUnavailable,
     };
 }
@@ -406,9 +401,6 @@ pub const Store = struct {
     home_dir: []u8,
     workspace_root: []u8,
     canonical_root: session_log.Root,
-    // How many sessions one resume page yields before flagging `has_more`.
-    // Carried on the value so it propagates through the by-value page chain;
-    // the UI sets it from the visible screen height.
     resume_page_limit: usize = default_resume_page_limit,
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
@@ -485,7 +477,6 @@ pub const Store = struct {
 
     fn readRememberedSessionFile(alloc: Allocator, file: *std.Io.File) ![]u8 {
         const stat = try file.stat(io_mod.getIo());
-        // An atomic replacement can unlink the valid version already opened here.
         if (stat.kind != .file or stat.nlink > 1 or stat.permissions.toMode() & 0o777 != 0o600 or stat.size > 256) {
             return error.InvalidRememberedSession;
         }
@@ -1789,8 +1780,6 @@ pub const Store = struct {
         else
             classifyReadOnlyCandidate(alloc, &dir, session_id);
         var candidate = classified catch |err| switch (err) {
-            // A missing or undecodable manifest; every other failure is
-            // reported, not recovered.
             error.SessionNotFound, error.InvalidSessionFormat => (try discovery.recoverSchemaV3Candidate(alloc, &dir, session_id, cancelled)) orelse return err,
             else => return err,
         };
@@ -2513,8 +2502,6 @@ pub const Store = struct {
         return migrateSchemaV3Locked(self.ctx(), alloc, &writable);
     }
 
-    // Keep cold fallible constructors behind noinline out-parameter boundaries
-    // so error returns do not materialize the full LoadedWritableSession payload.
     noinline fn migrateLegacyForWriteInto(
         self: Store,
         out: *LoadedWritableSession,
@@ -4709,7 +4696,6 @@ pub fn writeSchemaV3Fixture(
     const padding = try alloc.alloc(u8, fixture.first_event_padding);
     defer alloc.free(padding);
     @memset(padding, ' ');
-    // The frame ends in "}\n"; the padding goes before the closing brace.
     const first = try std.mem.concat(alloc, u8, &.{
         started[0 .. started.len - 2],
         padding,
@@ -4773,8 +4759,6 @@ pub fn writeSchemaV3Fixture(
         .total_output_tokens = 0,
         .last_event_seq = if (fixture.stale_projection) 1 else 2,
         .event_log_bytes = projected_bytes,
-        // Staleness is decided by log size, so nothing reads this field; the
-        // schema-v3 import path writes zeros as well.
         .event_log_stat_fingerprint = @splat(0),
         .generation_base_seq = 1,
         .generation_base_bytes = first.len,
@@ -5627,7 +5611,6 @@ test "latest selection skips a bounded number of vanished candidates" {
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
 
-    // No candidate means no open attempt.
     var empty_control = ResumeInterleavingControl{};
     try std.testing.expectError(
         error.NoSavedSessions,
@@ -5650,9 +5633,6 @@ test "latest selection skips a bounded number of vanished candidates" {
         writable.deinit(alloc);
     }
 
-    // A candidate that vanished after the index read is retried once, then
-    // yields to the next one; one resume absorbs only a bounded number of
-    // such races.
     const retryable = [_]anyerror{
         error.SessionNotFound,
         error.FileNotFound,
@@ -6182,7 +6162,6 @@ test "recovery command replay allocation failures propagate without changing sou
     const before = try managedFileDigest(&source_file, replay.available.framed_bytes);
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(test_alloc: Allocator, input: *session_child_store.SessionChildCapability, output: *session_child_store.SessionChildCapability, value: core_types.CommandOutputReplay) !void {
-            // Each failure run starts from the same absent-target state.
             defer output.delete(.command_artifacts, value.available.handle) catch {};
             try std.testing.expect(!try copyRecoveredCommandReplay(test_alloc, input, output, value));
         }
@@ -7332,8 +7311,6 @@ test "writable last excludes newer child metadata and legacy owner markers" {
 
 test "a legacy child identified only by its first event stays out of listing and latest resume" {
     const alloc = std.testing.allocator;
-    // A current projection reaches the first-event check; a stale one learns
-    // the identity from its replay.
     for ([_]bool{ false, true }) |stale_projection| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -7357,7 +7334,6 @@ test "a legacy child identified only by its first event stays out of listing and
             defer catalog.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
             try std.testing.expectEqualStrings("parent", catalog.summaries.items[0].id);
-            // The exclusion is cached under the child's fingerprint.
             var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
             defer saved.deinit(alloc);
             try std.testing.expect(saved.contains("child"));
@@ -7366,7 +7342,6 @@ test "a legacy child identified only by its first event stays out of listing and
         var resumed = try ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{});
         defer resumed.deinit(alloc);
         try std.testing.expectEqualStrings("parent", resumed.active_id);
-        // Nothing opened the child for write, so nothing migrated it.
         const after = try readFixtureFile(alloc, ctx.store, "child", "session.json", 64 * 1024);
         defer alloc.free(after);
         try std.testing.expectEqualStrings(before, after);
@@ -7380,8 +7355,6 @@ test "a legacy first event past the listing bound stays listed but uncached" {
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
     try createHistoryPageFixture(alloc, ctx.store, "parent", ctx.workspace, 1, "parent");
-    // Listing reads a first event only within a fixed bound, so it never
-    // scans a large log for a newline.
     try writeSchemaV3Fixture(alloc, ctx.store, "child", .{
         .projected_workspace = ctx.workspace,
         .workspace = ctx.workspace,
@@ -7400,8 +7373,6 @@ test "a legacy first event past the listing bound stays listed but uncached" {
     defer saved.deinit(alloc);
     try std.testing.expect(saved.contains("parent"));
     try std.testing.expect(!saved.contains("child"));
-    // Loading the session reads the whole first event, so exact resume
-    // admission still sees the child.
     var loaded = try ctx.store.loadReadOnly(alloc, "child");
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.subagent_child);
@@ -7425,14 +7396,11 @@ test "a stale schema-v3 projection lists and resumes from its committed log" {
     {
         var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
         defer catalog.deinit(alloc);
-        // Both manifests still say /old-workspace at 10; the committed logs
-        // moved the sessions here at 20.
         try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
         for (catalog.summaries.items) |summary| {
             try std.testing.expectEqualStrings(ctx.workspace, summary.workspace_root.?);
             try std.testing.expectEqual(@as(i64, 20), summary.updated_at_ms);
         }
-        // A replayed row is settled, so the index reuses it until the session changes.
         var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
         defer saved.deinit(alloc);
         try std.testing.expect(saved.contains("rank-a"));
@@ -7451,7 +7419,6 @@ test "a stale schema-v3 projection lists and resumes from its committed log" {
     {
         var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
         defer catalog.deinit(alloc);
-        // A failed replay keeps the stale manifest listed, and never caches it.
         try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
         for (catalog.summaries.items) |summary| {
             const expected: []const u8 = if (std.mem.eql(u8, summary.id, "rank-a")) "/old-workspace" else ctx.workspace;
@@ -7501,13 +7468,9 @@ test "a schema-v3 session with a lost manifest lists and resumes from its commit
                 },
             }
         }
-        // The committed log is the authority, so a lost or unreadable manifest
-        // is recovered from it; an unsupported manifest, or one lost behind an
-        // interrupted upgrade, is not.
         const recoverable = mutation == .missing or mutation == .bad;
         var writer = (try catalog_cache.Writer.init(ctx.store)).?;
         defer writer.deinit();
-        // The second pass reads the recovered row back from the index.
         for (0..2) |_| {
             var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, &writer);
             defer catalog.deinit(alloc);
@@ -7581,7 +7544,6 @@ test "a FIFO in a session never blocks listing or latest resume" {
             const path = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, case.file }, 0);
             if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
         }
-        // A blocking open of the FIFO would wait for a writer that never comes.
         {
             var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
             defer catalog.deinit(alloc);
@@ -7617,7 +7579,6 @@ test "latest resume skips a stale session whose log cannot be replayed" {
                 .stale_projection = false,
             });
         }
-        // The stale manifest ranks the broken session newest in this workspace.
         try writeSchemaV3Fixture(alloc, ctx.store, "broken", .{
             .projected_workspace = ctx.workspace,
             .workspace = ctx.workspace,
@@ -7633,12 +7594,9 @@ test "latest resume skips a stale session whose log cannot be replayed" {
             var catalog = try catalog_cache.listActionableCatalog(ctx.store, alloc, null, null, null);
             defer catalog.deinit(alloc);
             try std.testing.expectEqualStrings("broken", catalog.summaries.items[0].id);
-            // Listing saw the replay fail, so latest resume skips the session
-            // without replaying the log again.
             try std.testing.expect(catalog.isUnreplayable("broken"));
             try std.testing.expect(!catalog.isUnreplayable("readable"));
         }
-        // Doctor names the session latest resume skips.
         {
             var inspection = try ctx.store.inspectForDoctorBounded(alloc, 10);
             defer inspection.deinit(alloc);
@@ -7674,11 +7632,9 @@ test "a copied schema-v3 session lists from its manifest without a replay" {
     {
         var dir = try ctx.store.openSessionDir("copied");
         defer dir.close();
-        // A copy or restore gives the log a new inode and ctime, same bytes.
         const log = try readFixtureFile(alloc, ctx.store, "copied", "events.jsonl", 64 * 1024);
         defer alloc.free(log);
         try io_mod.durableReplaceVerified(alloc, &dir, "events.jsonl", log);
-        // Any replay would now fail, so a cached row proves none ran.
         try io_mod.durableReplaceVerified(alloc, &dir, schema_v3_test_watermark, "{}");
     }
     var writer = (try catalog_cache.Writer.init(ctx.store)).?;
@@ -7702,7 +7658,6 @@ test "writable last reports unreadable sessions when nothing is resumable" {
     try std.testing.expectError(error.NoSavedSessions, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
     const path = try writeSessionFixture(alloc, ctx.store, "broken", "{\"schema_version\":1,");
     alloc.free(path);
-    // `fx session last` reports the same error for the same store.
     try std.testing.expectError(error.NoReadableSessions, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
 }
 

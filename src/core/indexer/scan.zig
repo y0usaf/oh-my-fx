@@ -196,14 +196,10 @@ const Shared = struct {
 /// Lists `root` (absolute). `alloc` must be safe to use from several threads;
 /// the result owns its memory.
 pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.atomic.Value(bool)) Error!Result {
-    // Taken before anything is read: a stamp is reusable only if its times
-    // are older than this by the granularity margin.
     const scan_started_ns = tree_mod.nowNs();
     var result_arena = std.heap.ArenaAllocator.init(alloc);
     errdefer result_arena.deinit();
     const arena = result_arena.allocator();
-    // The rules, the listings and their bookkeeping matter only while
-    // scanning; the tree keeps just what it returns.
     var scratch_arena = std.heap.ArenaAllocator.init(alloc);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
@@ -291,8 +287,6 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     const skipped_names = try arena.alloc([]const u8, options.skipped_names.len);
     for (options.skipped_names, skipped_names) |name, *copy| copy.* = try arena.dupe(u8, name);
 
-    // Every allocation comes before `result_arena` is copied into the result:
-    // a block the arena adds after the copy would be missing from it and leak.
     const root_copy = try arena.dupe(u8, root);
     return .{
         .arena = result_arena,
@@ -323,8 +317,6 @@ fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, r
             break :blk null;
         },
     };
-    // A `.git` appearing above the root changes which rules apply. Inside a
-    // repository only the folders up to its worktree root matter.
     const top = if (maybe_found) |found| found.worktree_root else "/";
     var ancestor = root;
     while (true) {
@@ -346,8 +338,6 @@ fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, r
 
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;
     try lists.appendSlice(arena, wide.lists);
-    // `.gitignore` files above the root, from the worktree root down. The
-    // root's own file is read by its job.
     if (found.prefix.len > 0) {
         var ancestors: std.ArrayList([]const u8) = .empty;
         try ancestors.append(arena, "");
@@ -369,7 +359,6 @@ fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, r
                 .unavailable => incomplete.* = true,
             }
         }
-        // Below an ignored root, plain rules apply.
         if (ignore.isPathExcluded(lists.items, found.prefix, true, settings.ignore_case)) {
             debug_trace.logf("indexer", "scan uses plain rules reason=ignored_root root={s}", .{root});
             return null;
@@ -458,8 +447,6 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     } else |_| shared.incomplete.store(true, .release);
 
     var lists = job.lists;
-    // Below an excluded folder everything is excluded, as in git, which stops
-    // reading `.gitignore` files there.
     if (!job.excluded) {
         const loaded = try sources.loadDirectory(arena, dir, job.rule_path);
         if (loaded != .absent) listing.ignore_file = try std.Io.Dir.path.join(arena, &.{ shared.root_abs, job.rel, ".gitignore" });
@@ -478,7 +465,6 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
         }
     }
 
-    // At and below the repository root the rule path is the same string.
     const shares_rule_path = !rules.repository or std.mem.eql(u8, job.rule_path, job.rel);
     var files: std.ArrayList([]const u8) = .empty;
     var child_entries: std.ArrayList(Child) = .empty;
@@ -500,8 +486,6 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
 
         const rel = try joinPath(arena, job.rel, entry.name);
         const rule_path = if (shares_rule_path) rel else try joinPath(arena, job.rule_path, entry.name);
-        // A path over the limit is not listed, but it still exists and is not
-        // ignored, so its folder stays visible.
         const overlong = rel.len > rules.max_path_bytes;
         var kind = entry.kind;
         if (kind == .unknown) {
@@ -535,12 +519,10 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
                 try children.append(arena, .{ .rel = rel, .rule_path = rule_path, .lists = lists, .excluded = excluded, .tracked = tracked });
                 try child_entries.append(arena, .{ .rel = rel, .state = .entered });
             },
-            // FIFOs, sockets and devices are never listed or opened.
             else => {},
         }
     }
 
-    // An untracked folder with its own repository is a boundary, as in git.
     if (rules.repository and saw_dot_git and !job.tracked and job.rel.len > 0) {
         const absolute = try std.Io.Dir.path.join(arena, &.{ shared.root_abs, job.rel });
         if (try layout_mod.hasOwnRepository(arena, absolute)) {
@@ -576,7 +558,6 @@ fn assemble(arena: Allocator, scratch: Allocator, listings: []const *const Listi
     try by_path.ensureTotalCapacity(scratch, @intCast(listings.len));
     for (listings, 0..) |listing, index| by_path.putAssumeCapacity(listing.rel, index);
 
-    // Deeper folders first, so each folder sees its children's visibility.
     const order = try scratch.alloc(usize, listings.len);
     for (order, 0..) |*slot, index| slot.* = index;
     std.mem.sortUnstable(usize, order, listings, struct {
@@ -592,7 +573,6 @@ fn assemble(arena: Allocator, scratch: Allocator, listings: []const *const Listi
             if (listing.files.len > 0 or listing.unlisted) break :blk true;
             for (listing.children) |child| {
                 if (child.state == .boundary) break :blk true;
-                // A folder that could not be read counts as visible, as in git.
                 const child_index = by_path.get(child.rel) orelse break :blk true;
                 if (visible[child_index]) break :blk true;
             }
@@ -600,8 +580,6 @@ fn assemble(arena: Allocator, scratch: Allocator, listings: []const *const Listi
         };
     }
 
-    // Reserve exactly once: growing the list inside the arena would leave every
-    // smaller copy behind.
     var count: usize = 0;
     for (listings, 0..) |listing, index| {
         if (!visible[index]) continue;
@@ -755,14 +733,12 @@ test "repository scan follows git: index, ignore rules, folder rules and boundar
         .{ .path = "nested", .kind = .directory },
     });
 
-    // Scanning a subfolder applies the rules above it, with paths relative to it.
     try tree.file("repo/.hidden/skip.log", "s");
     var sub = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/.hidden" }), .{}, null);
     defer sub.deinit();
     try std.testing.expect(sub.tree.repository);
     try expectEntries(sub, &.{.{ .path = "h.txt", .kind = .file }});
 
-    // A root that is itself ignored is listed with plain rules.
     var ignored_root = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/dist" }), .{}, null);
     defer ignored_root.deinit();
     try std.testing.expect(!ignored_root.tree.repository);
@@ -842,23 +818,17 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
         try std.testing.expect(entryLessThan({}, earlier, later));
     }
 
-    // The cap counts files only: 180 files and 240 folder rows fit a cap of
-    // 180, though the entries outnumber it.
     var exact = try scan(std.testing.allocator, root, .{ .candidate_cap = 180 }, null);
     defer exact.deinit();
     try std.testing.expect(!exact.tree.incomplete and !exact.tree.cap_reached);
     try std.testing.expectEqual(serial.tree.entries.len, exact.tree.entries.len);
-    // Within the collection limit the cap keeps the sorted prefix that holds
-    // the first files, ending just before the next file.
     var capped = try scan(std.testing.allocator, root, .{ .candidate_cap = 120 }, null);
     defer capped.deinit();
-    // Below it the walk read everything, so only the cap was reached.
     try std.testing.expect(!capped.tree.incomplete and capped.tree.cap_reached);
     try std.testing.expectEqual(@as(usize, 120), testFileCount(capped.tree.entries));
     const kept = capped.tree.entries.len;
     for (capped.tree.entries, serial.tree.entries[0..kept]) |a, b| try std.testing.expectEqualStrings(b.path, a.path);
     try std.testing.expectEqual(Kind.file, serial.tree.entries[kept].kind);
-    // Past it, reading stops early: still capped, sorted and incomplete.
     var tiny = try scan(std.testing.allocator, root, .{ .candidate_cap = 10 }, null);
     defer tiny.deinit();
     try std.testing.expect(tiny.tree.incomplete and tiny.tree.cap_reached);
@@ -867,7 +837,6 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
 
     var short = try scan(std.testing.allocator, root, .{ .max_path_bytes = 6 }, null);
     defer short.deinit();
-    // Folders whose only files are over the limit stay listed.
     try std.testing.expectEqual(@as(usize, 60 * 4), short.tree.entries.len);
     for (short.tree.entries) |entry| try std.testing.expectEqual(Kind.directory, entry.kind);
     try std.testing.expectEqual(@as(usize, 60 * 3), short.tree.skipped_overlong);
@@ -912,7 +881,6 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
     }
     const future: std.Io.Timestamp = .{ .nanoseconds = @as(i96, tree_mod.nowNs()) + 3600 * std.time.ns_per_s };
     try tree.tmp.dir.setTimestamps(std.testing.io, "future/docs", .{ .modify_timestamp = .{ .new = future } });
-    // Folders above a searched one that have no `.gitignore` yet.
     const first_rules = [_][]const u8{ "root_rules", "parent_rules" };
     for (first_rules) |name| {
         try tree.repo(arena, name, &.{.{ .path = "a/b/x.txt" }});
@@ -920,7 +888,6 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
         try tree.file(try arena.print("{s}/a/b/y.secret", .{name}), "y");
     }
 
-    // A tree scanned right after its files changed is never reused.
     {
         const root = try std.Io.Dir.path.join(arena, &.{ tree.root, "unchanged" });
         var racy = try scan(std.testing.allocator, root, .{}, null);
@@ -955,9 +922,7 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
     try tree.tmp.dir.rename("replaced", tree.tmp.dir, "replaced-old", std.testing.io);
     try tree.repo(arena, "replaced", &.{.{ .path = "src/a.txt" }});
 
-    // A change in `src` leaves a check of `docs` alone.
     try std.testing.expect(tree_mod.isCurrent(&results[1].tree, roots[1], &default_skipped_names, "docs"));
-    // A first `.gitignore` above a searched folder makes it stale.
     try tree.file("root_rules/.gitignore", "*.secret\n");
     try tree.file("parent_rules/a/.gitignore", "*.secret\n");
     for (&rule_results, rule_roots, first_rules) |*result, root, name| {
