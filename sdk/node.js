@@ -55,7 +55,6 @@ function bundledAssetUrl(asset) {
       !asset.href.startsWith(__webpack_public_path__)) {
     throw new TypeError("Bundled asset URL has no filesystem mapping");
   }
-  // Webpack's relative URL is a public asset address, not a Node URL instance.
   return new URL(asset.href.slice(__webpack_public_path__.length), __webpack_base_uri__);
 }
 
@@ -76,7 +75,6 @@ async function loadNativeCandidate(candidate) {
   if (candidate instanceof URL) {
     if (candidate.protocol === "") candidate = bundledAssetUrl(candidate);
     if (candidate.protocol === "file:" && candidate.pathname.endsWith(".node")) {
-      // Bundlers trace the asset URL; Node must load the native file at runtime.
       return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
     }
     const imported = await import(candidate.href);
@@ -94,7 +92,6 @@ async function loadNativeCandidate(candidate) {
 }
 
 function defaultNativeCandidate() {
-  // Local path bindings let deployment tracers retain these assets in the generated CommonJS entry.
   if (process.platform === "linux" && process.arch === "x64") {
     const asset = new URL("./libfx.linux-x64.node", import.meta.url);
     if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
@@ -403,7 +400,6 @@ function createNativeCoreRuntime(addon, options) {
       state.active = addon.coreFetchActive(core, state.handle);
       return;
     }
-    // One native lock observes consumption and retirement together.
     const disposition = addon.coreFetchDisposition(core, state.handle);
     if (disposition !== 0 && disposition !== 1 && disposition !== 2) {
       throw new Error(`invalid native fetch disposition ${disposition}`);
@@ -546,7 +542,6 @@ function createNativeCoreRuntime(addon, options) {
         if (action === "drain") beginDrain(fetchState);
         if (action === "abort") fetchState.controller.abort();
       } else {
-        // The core hands over JSON metadata and the raw request body separately.
         const fetchRequest = addon.takeCoreFetch(core);
         if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.request.toString("utf8")), fetchRequest.body);
       }
@@ -584,7 +579,6 @@ function createNativeCoreRuntime(addon, options) {
   readySocket.on("end", () => { drainReady(); if (!settled) finish(1); });
   readySocket.on("error", () => finish(1));
   readySocket.on("close", () => { if (!settled) finish(1); });
-  // Some runtimes defer descriptor adoption until connect().
   if (readySocket.pending) {
     try { readySocket.connect({ fd: readyFd }); } catch (error) { finish(1); throw error; }
   }
@@ -593,7 +587,6 @@ function createNativeCoreRuntime(addon, options) {
     exited,
     get error() { return outputError; },
     write(data) { addon.writeCore(core, Buffer.from(data)); },
-    // The addon copies attachment bytes before returning.
     writeAttachment(id, bytes) {
       addon.writeCoreAttachment(core, id, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
     },
@@ -672,13 +665,6 @@ export async function createFxEngine(options = {}) {
   );
 }
 
-// The durability a session gets when the caller names none: Vercel's World
-// on Vercel, otherwise files in the temporary directory. Each is its own
-// module, loaded only here: a bundler copies the file the URL names and
-// leaves the import itself to Node.
-// Agents created without a durability share one for each place sessions
-// live, as agents passed one durability do, so they can send each other's
-// prompts on.
 const environments = new Map();
 function environmentDurability() {
   const dir = process.env.VERCEL ? null : process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions");
@@ -693,7 +679,7 @@ function environmentDurability() {
 }
 
 async function chooseEnvironmentDurability(dir) {
-  const load = (asset) => import(/* webpackIgnore: true */ /* turbopackIgnore: true */ (asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
+  const load = (asset) => import((asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
   if (dir === null) {
     const { vercel } = await load(new URL("./durable/vercel.mjs", import.meta.url));
     return vercel();
@@ -710,12 +696,9 @@ export const createFxAgent = createDurableAgentFactory({
   name: "createFxAgent",
   label: "fx agent",
   defaultDurability: environmentDurability,
-  // One durability per environment, so agents created without one share it.
   defaultShared: true,
   harness: fxHarness({
     createEngine: createFxEngine,
-    // An explicit key, then the durability's own credential, such as a
-    // Vercel deployment's OIDC token, then the one in the environment.
     defaultApiKey: async (durability) => process.env.AI_GATEWAY_API_KEY ||
       (await Promise.resolve(durability?.gatewayKey?.()).catch(() => undefined)) ||
       process.env.VERCEL_OIDC_TOKEN || undefined,
